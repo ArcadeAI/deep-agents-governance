@@ -50,6 +50,8 @@ export interface LoanSummary {
  * and there would be nothing left to demonstrate.
  */
 export interface LoanRecord extends LoanSummary {
+  /** Where the borrower gets the outcome: the agent emails it here through Gmail. */
+  contact_email: string;
   credit_score: number;
   annual_revenue: number;
   years_in_business: number;
@@ -74,6 +76,7 @@ const loanFixtureSchema = z.object({
   status: z.enum(["pending", "approved", "denied"]),
   purpose: z.string(),
   submitted_at: z.string(),
+  contact_email: z.string().email(),
   credit_score: z.number(),
   annual_revenue: z.number(),
   years_in_business: z.number(),
@@ -102,6 +105,7 @@ const SCHEMA = `
     status              TEXT    NOT NULL CHECK (status IN ('pending', 'approved', 'denied')),
     purpose             TEXT    NOT NULL,
     submitted_at        TEXT    NOT NULL,
+    contact_email       TEXT    NOT NULL DEFAULT '',
     credit_score        INTEGER NOT NULL,
     annual_revenue      INTEGER NOT NULL,
     years_in_business   INTEGER NOT NULL,
@@ -161,11 +165,11 @@ export function openLoanBook(path: string): Database {
  * The schema revision this build writes, recorded in `PRAGMA user_version`.
  * Bump it in the same commit as any change to `SCHEMA` or to `upgradeSchema`.
  *
- * Version 1 is the schema at #60. Databases written before this existed read
+ * Version 1 is the schema at #60. Version 2 adds `loans.contact_email`. Databases written before this existed read
  * back 0 — the SQLite default — which is exactly the "needs the upgrade path"
  * answer, so no disk has to be touched by hand to adopt this.
  */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 /** The schema revision recorded on disk. 0 on anything written before #60. */
 export function readSchemaVersion(db: Database): number {
@@ -215,7 +219,9 @@ export class SchemaTooNewError extends Error {
  * never a side effect of booting. `CREATE TABLE IF NOT EXISTS` in particular
  * does not reshape a table that already exists; it only creates a missing one.
  *
- * No inserts. The rows on this disk are the state the demo is in.
+ * No inserts. The rows on this disk are the state the demo is in. The one
+ * write is filling a column added since, from the fixture, on rows that have
+ * it empty: that adds a fact the loan always had and changes no decision.
  */
 function upgradeSchema(db: Database, path: string): void {
   const found = readSchemaVersion(db);
@@ -230,6 +236,19 @@ function upgradeSchema(db: Database, path: string): void {
     // Added on #34: who recorded the decision, read off the caller's token.
     if (!hasColumn(db, "loan_decisions", "decided_by")) {
       db.exec("ALTER TABLE loan_decisions ADD COLUMN decided_by TEXT");
+    }
+
+    // Added for Gmail in the core flow: where the borrower gets the outcome.
+    if (!hasColumn(db, "loans", "contact_email")) {
+      db.exec("ALTER TABLE loans ADD COLUMN contact_email TEXT NOT NULL DEFAULT ''");
+    }
+    const fill = db.prepare<unknown, NamedBindings>(
+      "UPDATE loans SET contact_email = $contact_email WHERE loan_id = $loan_id AND contact_email = ''",
+    );
+    try {
+      for (const { loan_id, contact_email } of fixtureLoans()) fill.run(bind({ loan_id, contact_email }));
+    } finally {
+      fill.finalize();
     }
 
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
@@ -305,11 +324,11 @@ export function seed(db: Database, loans: LoanSeed[]): void {
     // not fighting open statements over tables it is about to drop.
     const insertLoan = db.prepare<unknown, NamedBindings>(`
       INSERT INTO loans (
-        loan_id, borrower_name, amount, status, purpose, submitted_at,
+        loan_id, borrower_name, amount, status, purpose, submitted_at, contact_email,
         credit_score, annual_revenue, years_in_business,
         bank_account_number, tax_id, underwriter_notes
       ) VALUES (
-        $loan_id, $borrower_name, $amount, $status, $purpose, $submitted_at,
+        $loan_id, $borrower_name, $amount, $status, $purpose, $submitted_at, $contact_email,
         $credit_score, $annual_revenue, $years_in_business,
         $bank_account_number, $tax_id, $underwriter_notes
       )

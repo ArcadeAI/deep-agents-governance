@@ -7,8 +7,9 @@ Run the whole story on your own build, end to end, from `ask.py`:
 > Approve the loan for Northwind at $95K and double-check your work.
 
 Watch the panel. Access hid a tool from Bob earlier; pre refuses Alice and routes to
-Charlie; post masks the identifiers and strips the note. Then ask Alice's agent to email
-the borrower the outcome, through Gmail on the same gateway and under the same hooks. Then edit one rule on stage — `bun run users set-clearance`, or an
+Charlie; post masks the identifiers and strips the note. Once Charlie approves and the
+retry lands, the agent emails the borrower the outcome from Alice's own Gmail, on the same
+gateway and under the same hooks. Then edit one rule on stage — `bun run users set-clearance`, or an
 `UPDATE output_rules` in `governance.db` — and run the prompt again.
 
 ## Fork it

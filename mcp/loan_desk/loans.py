@@ -174,7 +174,7 @@ async def get_loan(
     context: Context,
     loan_id: LoanId,
 ) -> Annotated[dict[str, Any], "The complete loan application record."]:
-    """Read one loan application's complete file by ID. Returns everything the loan book holds on it: borrower details, the requested amount and purpose, credit score, annual revenue and years in business, the underwriter's notes, the borrower's bank account number and tax ID, and every approval or denial already recorded against it, oldest first."""
+    """Read one loan application's complete file by ID. Returns everything the loan book holds on it: borrower details including the contact email the outcome is sent to, the requested amount and purpose, credit score, annual revenue and years in business, the underwriter's notes, the borrower's bank account number and tax ID, and every approval or denial already recorded against it, oldest first."""
     return await _call(context, "GET", f"/loans/{loan_id}")
 
 

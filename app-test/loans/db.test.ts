@@ -25,6 +25,7 @@ const ONE_LOAN: LoanSeed = {
   status: "pending",
   purpose: "Working capital",
   submitted_at: "2026-01-01",
+  contact_email: "owner@placeholder.example",
   credit_score: 700,
   annual_revenue: 100_000,
   years_in_business: 1,

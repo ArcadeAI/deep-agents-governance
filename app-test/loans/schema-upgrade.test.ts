@@ -97,6 +97,49 @@ describe("opening a loans.db written by an earlier schema", () => {
   });
 });
 
+/** Version 1: the current tables without `loans.contact_email`, holding the demo loan and one the fixture does not know. */
+const SCHEMA_AT_V1 = `
+  CREATE TABLE loans (
+    loan_id TEXT PRIMARY KEY, borrower_name TEXT NOT NULL, amount INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'denied')),
+    purpose TEXT NOT NULL, submitted_at TEXT NOT NULL, credit_score INTEGER NOT NULL,
+    annual_revenue INTEGER NOT NULL, years_in_business INTEGER NOT NULL,
+    bank_account_number TEXT NOT NULL, tax_id TEXT NOT NULL, underwriter_notes TEXT NOT NULL
+  );
+  CREATE TABLE loan_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, loan_id TEXT NOT NULL REFERENCES loans(loan_id),
+    decision TEXT NOT NULL CHECK (decision IN ('approved', 'denied')),
+    amount INTEGER, reason TEXT, decided_by TEXT, decided_at TEXT NOT NULL
+  );
+  INSERT INTO loans VALUES ('LN-2291', 'Northwind Bakery LLC', 95000, 'approved', 'Second location build-out',
+    '2026-08-19', 712, 2340000, 8, '0000000000000000', '00-0000000', 'Decided on stage.');
+  INSERT INTO loans VALUES ('LN-0001', 'Not In The Fixture Co', 1000, 'pending', 'Legacy',
+    '2026-01-01', 700, 100000, 3, '0000000000000000', '00-0000000', '');
+  PRAGMA user_version = 1;
+`;
+
+describe("opening a version 1 loans.db", () => {
+  test("adds contact_email, filled from the fixture, and keeps every row as it was", () => {
+    withPath("v1", (path) => {
+      const legacy = new Database(path, { create: true });
+      legacy.exec(SCHEMA_AT_V1);
+      legacy.close();
+
+      const db = openLoanBook(path);
+      try {
+        expect(readSchemaVersion(db)).toBe(SCHEMA_VERSION);
+        const northwind = getLoan(db, "LN-2291");
+        expect(northwind?.contact_email).toBe("owner@northwindbakery.example");
+        expect(northwind?.status).toBe("approved");
+        expect(getLoan(db, "LN-0001")?.contact_email).toBe("");
+        expect(countLoans(db)).toBe(2);
+      } finally {
+        db.close();
+      }
+    });
+  });
+});
+
 /** A fresh directory per test; the caller removes it. */
 function tempPath(tag: string): string {
   const path = join(tmpdir(), `cg-loans-${tag}-${crypto.randomUUID()}`, "loans.db");
@@ -208,6 +251,7 @@ describe("a seed that fails", () => {
         status: "pending" as const,
         purpose: "Working capital",
         submitted_at: "2026-01-01",
+        contact_email: "owner@duplicate.example",
         credit_score: 700,
         annual_revenue: 100_000,
         years_in_business: 3,
