@@ -1,0 +1,571 @@
+/**
+ * #155's two claims that a render cannot make, measured against the real Next
+ * server in a real browser.
+ *
+ * `app-test/home-screen.test.tsx` asserts on markup through each component's own
+ * props, which is the right shape for everything about *what is drawn*. Two of
+ * this slice's acceptance criteria are not about that:
+ *
+ * 1. **"No `cg-` class in the served HTML."** A component test renders the
+ *    components a test file chose. The served page is whatever `app/page.tsx`,
+ *    the App Router and the client bundle between them produce, which is a
+ *    strictly larger thing — and the criterion is written about the larger
+ *    thing on purpose.
+ * 2. **"`/` opens no SSE connection to the hooks `GET /events` stream"**, to be
+ *    asserted "on the rendered client tree / network in a test, not by reading
+ *    the code". So: the network. Every request the page makes is recorded off
+ *    `Network.requestWillBeSent` and the governance timeline's is looked for by
+ *    address.
+ *
+ * ## What "no SSE" means here, exactly
+ *
+ * Two consumers shared the hooks `/events` URL once: the panel's
+ * governance-timeline subscription and #20's approval-notice listener, which
+ * lived in the chat. The panel left `/` with #155 and the listener left with
+ * the chat, when the assistant became the Deep Agent in `agent/`. So the
+ * measurement is made twice, and both runs expect the same thing:
+ *
+ * - `GOVERNANCE_STREAM` unset: **no** request to the hooks host at all.
+ * - `GOVERNANCE_STREAM=hooks`, pointed at a stand-in that really holds an SSE
+ *   socket open: still **no** connection. A stand-in that answers is what
+ *   makes "none" mean something.
+ *
+ * ## Viewports
+ *
+ * 1920x1080 and 1440x900, the two the issue names, via
+ * `Emulation.setDeviceMetricsOverride` so the measurement does not depend on
+ * the window the machine happened to give us.
+ *
+ * Local-only, like `home-loan-next-browser.test.ts` and for the same reason: on
+ * Required wherever a browser can be had, which since #152 includes CI: it
+ * resolves one through `chrome.ts`, so a missing browser is a failure there and
+ * a skip that says where it looked on a developer machine without one. A
+ * measurement that silently does not run is the control-that-matches-nothing
+ * this project is organised against.
+ */
+import { expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import type { Subprocess } from "bun";
+
+import { chunk, chunkName, seal } from "../auth/seal.ts";
+import { SESSION_COOKIE } from "../auth/session.ts";
+import { DANA, SESSION_SECRET, startAgentHarness, type AgentHarness } from "./agent-harness.ts";
+import { browserRequired, missingBrowserMessage, resolveChrome } from "./chrome.ts";
+import { browserTarget, Cdp, evaluate, serveOnFreePort, startChrome, stopProcess, waitFor } from "./cdp.ts";
+import { freePort, spawnChild } from "./child.ts";
+
+const WEB = join(import.meta.dir, "..");
+const chromeResolution = resolveChrome();
+const REQUIRED = browserRequired();
+if (chromeResolution.path === null && !REQUIRED) console.warn(missingBrowserMessage(chromeResolution));
+
+/**
+ * What the co-branded frame takes off the top (#177).
+ *
+ * `app/layout.tsx` now draws a 34px bar above every surface and hands the rest
+ * of the viewport to the stage below it, so `.bank` fills the viewport *less
+ * the frame* rather than the viewport. What this file asserts is unchanged —
+ * the bank is full-screen, with nothing beside it and nothing under it — and
+ * the arithmetic moved by exactly one constant, which is the point of naming
+ * it. `app-test/frame.test.ts` measures the bar itself, on all three surfaces.
+ */
+const FRAME_BAR = 34;
+
+/** The two viewports the issue names, less the frame. */
+const FULL_SCREEN = [
+  { width: 1920, height: 1080, bank: { width: 1920, height: 1080 - FRAME_BAR } },
+  { width: 1440, height: 900, bank: { width: 1440, height: 900 - FRAME_BAR } },
+];
+
+interface Seen {
+  url: string;
+  headers: Record<string, string>;
+}
+
+/** One connection to the stand-in's `/events`, and what it asked for. */
+interface StreamConnection {
+  headers: Record<string, string>;
+  url: string;
+}
+
+interface HooksStandIn {
+  /** HOST form, as `APP_PUBLIC_HOST` takes it. */
+  host: string;
+  connections: StreamConnection[];
+  /** Push one frame to every connected browser. */
+  push: (event: string, data: unknown, id?: string) => void;
+  /** Close every open socket, so every live consumer reconnects. */
+  drop: () => void;
+  stop: () => void;
+}
+
+/**
+ * The hook server's `/events`, reduced to the one thing this test needs: a
+ * socket that stays open and a record of who opened it.
+ *
+ * It has to really answer. A refused connection would put both consumers into a
+ * reconnect loop and make "how many are there" unanswerable — which is how the
+ * first draft of this test measured eight connections and concluded nothing.
+ */
+const CORS: Record<string, string> = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-headers": "accept, cache-control, last-event-id",
+  "access-control-expose-headers": "*",
+};
+
+function startHooksStandIn(): HooksStandIn {
+  const connections: StreamConnection[] = [];
+  const open = new Set<ReadableStreamDefaultController<Uint8Array>>();
+  const encoder = new TextEncoder();
+
+  const server = Bun.serve({
+    port: 0,
+    fetch(request) {
+      const url = new URL(request.url);
+      // Under `/hooks` since #4, as the app serves it.
+      if (url.pathname !== "/hooks/events") return new Response(null, { status: 404 });
+      // The page is on a different port, so both consumers' `cache-control`
+      // header makes this a preflighted cross-origin request. Answer it, and do
+      // not count it: an `OPTIONS` is the browser asking permission, not a
+      // consumer opening a stream. `apps/hooks` allows the same.
+      if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
+      connections.push({
+        url: request.url,
+        headers: Object.fromEntries(
+          [...request.headers.entries()].map(([name, value]) => [name.toLowerCase(), value]),
+        ),
+      });
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          open.add(controller);
+          controller.enqueue(encoder.encode(": connected\n\n"));
+        },
+        cancel(this: void) {
+          // The browser went away. Controllers are dropped on stop().
+        },
+      });
+      return new Response(stream, {
+        headers: { ...CORS, "content-type": "text/event-stream", "cache-control": "no-cache" },
+      });
+    },
+  });
+
+  return {
+    host: `127.0.0.1:${server.port}`,
+    connections,
+    push(event, data, id) {
+      const frame =
+        (id === undefined ? "" : `id: ${id}\n`) + `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+      for (const controller of open) {
+        try {
+          controller.enqueue(encoder.encode(frame));
+        } catch {
+          open.delete(controller);
+        }
+      }
+    },
+    drop() {
+      for (const controller of open) {
+        try {
+          controller.close();
+        } catch {
+          // already gone
+        }
+      }
+      open.clear();
+    },
+    stop() {
+      this.drop();
+      server.stop(true);
+    },
+  };
+}
+
+interface Measured {
+  /** Every request the page made, in order. */
+  requests: Seen[];
+  /** `document.documentElement.outerHTML` after the client tree has hydrated. */
+  html: string;
+  /** What `1920x1080` and `1440x900` each gave the bank's root element. */
+  viewports: Array<{ width: number; height: number; bank: { width: number; height: number } }>;
+  /** The two columns, per viewport, so the 2/3 split is a number. */
+  columns: Array<{
+    width: number;
+    records: number;
+    assistant: number;
+  }>;
+}
+
+/** Boot Next and Chrome, load `/` as Dana, and report what happened. */
+async function measureHome(options: {
+  governanceStream: string | null;
+  hooksHost?: string;
+  /**
+   * The identity provider the app's loan module presents bearers to
+   * (`IDENTITY_HOST`), HOST-form. The loan book is in the app since #5, so
+   * this is the one address its answer depends on; until #5 the option was the
+   * loan API's own address.
+   *
+   * Defaults to a port this process bound and released, so the module cannot
+   * say who the bearer is and the loan book comes back `unavailable` — the
+   * state the default always produced. It may **not** default to the
+   * worktree's own `IDENTITY_HOST`: that is whatever `.env.local` says, and
+   * the page would then depend on what else happens to be running.
+   */
+  loanIdpHost?: string;
+  /** Run once per page load, after the client tree has settled. */
+  afterLoad?: (cdp: Cdp) => Promise<void>;
+}): Promise<Measured> {
+  let harness: AgentHarness | undefined;
+  let next: Subprocess | undefined;
+  let chrome: Subprocess | undefined;
+  let cdp: Cdp | undefined;
+  let profile: string | undefined;
+  try {
+    const agents = (harness = await startAgentHarness());
+    const loanIdpHost = options.loanIdpHost ?? `localhost:${freePort()}`;
+    const environment = (webPort: number): Record<string, string> => {
+      const env: Record<string, string> = {
+        ...(process.env as Record<string, string>),
+        NODE_ENV: "development",
+        PORT: String(webPort),
+        // The app mounts the control plane since #4; a throwaway one, not
+        // a governance.db in the repo.
+        GOVERNANCE_DB_PATH: ":memory:",
+        ARCADE_API_URL: agents.gateway.url,
+        ARCADE_API_KEY: "arcade-key-for-full-screen-browser",
+        ARCADE_GATEWAY_ID: "cg-demo-us",
+        ARCADE_TOOLKIT: "LoanDesk",
+        SESSION_SECRET,
+        // The session below is sealed by hand, so nothing here signs in: the
+        // identity provider is the app's own since #6, and it gets a throwaway
+        // idp.db rather than `./idp.db`, which is the developer's.
+        IDP_DB_PATH: ":memory:",
+        IDP_CLIENT_ID: "web",
+        IDP_CLIENT_SECRET: "not-used-by-this-test",
+        APPROVALS_STORE_TOKEN: "store-token-for-agent-tests",
+        // A throwaway loan book: it may not default to `./loans.db`, which is
+        // the developer's own.
+        LOANS_DB_PATH: ":memory:",
+        IDENTITY_HOST: loanIdpHost,
+      };
+      // The app's origin since #6 — its issuer and every redirect_uri — and the
+      // panel's stream host. A case with a control plane of its own points it
+      // there, which is the one thing that case is about; nothing in it signs
+      // in, so the issuer naming that host is never followed.
+      env["APP_PUBLIC_HOST"] = options.hooksHost ?? `127.0.0.1:${webPort}`;
+      // Server-side reads of the control plane go here since #4.
+      if (options.hooksHost !== undefined) env["CONTROL_PLANE_HOST"] = options.hooksHost;
+      else delete env["CONTROL_PLANE_HOST"];
+      if (options.governanceStream === null) delete env["GOVERNANCE_STREAM"];
+      else env["GOVERNANCE_STREAM"] = options.governanceStream;
+      return env;
+    };
+
+    // Each child gets its port inside `serveOnFreePort` / `startChrome`, which
+    // start it again on a new one if another process took it first (#9).
+    const web = await serveOnFreePort((webPort) =>
+      spawnChild({
+        // `--bun`: the app runs on Bun since #4, because the control plane it
+        // mounts opens governance.db with bun:sqlite (`scripts/next.ts`).
+        cmd: ["bun", "--bun", "run", "next", "dev", "--port", String(webPort)],
+        cwd: WEB,
+        env: environment(webPort),
+        stdout: "pipe",
+        stderr: "pipe",
+      }),
+    );
+    next = web.child;
+    const origin = `http://127.0.0.1:${web.port}`;
+
+    profile = mkdtempSync(join(tmpdir(), "cg-full-screen-chrome-"));
+    const browser = await startChrome((debugPort) => [
+      chromeResolution.path as string,
+      "--headless=new",
+      "--no-sandbox",
+      "--disable-gpu",
+      "--disable-dev-shm-usage",
+      `--user-data-dir=${profile}`,
+      `--remote-debugging-port=${debugPort}`,
+      "about:blank",
+    ]);
+    chrome = browser.child;
+    const debugPort = browser.port;
+
+    // A real post-#157 browser: the gateway bearer for hop 1, and the IdP
+    // access token the bank's own screens are read with. Before #176 this
+    // fixture carried only the first, which is the shape of a cookie sealed
+    // before #157 shipped — so every page load in this file went down
+    // `readLoanBook`'s "carries no loan-system token" branch and the served
+    // page was, unremarked, in exactly the self-contradicting state #176 is
+    // about. It is measured deliberately below instead.
+    const session = {
+      email: DANA,
+      signed_in_at: Date.now(),
+      gateway: {
+        access_token: harness.gateway.issueToken(DANA),
+        expires_at: Date.now() + 3_600_000,
+        client_id: "full-screen-browser",
+      },
+      idp: {
+        access_token: "idp-token-for-full-screen-browser",
+        expires_at: Date.now() + 3_600_000,
+      },
+    };
+    const sealed = await seal(session, SESSION_SECRET);
+    const cookies = chunk(sealed).map((value, index) => ({
+      name: chunkName(SESSION_COOKIE, index),
+      value,
+      domain: "127.0.0.1",
+      path: "/",
+      httpOnly: true,
+      secure: false,
+      sameSite: "Lax" as const,
+    }));
+
+    cdp = new Cdp((await browserTarget(debugPort)).webSocketDebuggerUrl);
+    await cdp.command("Page.enable");
+    await cdp.command("Runtime.enable");
+    await cdp.command("Network.enable");
+    if (options.hooksHost !== undefined) {
+      // APP_PUBLIC_HOST names the stand-in here, so a page served on
+      // 127.0.0.1 correctly shows the origin banner (#9) — and its scrollbar.
+      // A real browser arrives through the tunnel, which forwards the public
+      // host; this does the same. Scoped to the app's own origin with Fetch
+      // rather than Network.setExtraHTTPHeaders, which would also add the
+      // header to the cross-origin EventSource to the stand-in and trigger a
+      // CORS preflight it does not answer.
+      const forwardedHost = options.hooksHost;
+      const client = cdp;
+      client.on("Fetch.requestPaused", (params) => {
+        const request = params.request as { headers: Record<string, string> };
+        void client.command("Fetch.continueRequest", {
+          requestId: params.requestId,
+          headers: [
+            ...Object.entries(request.headers).map(([name, value]) => ({ name, value })),
+            { name: "x-forwarded-host", value: forwardedHost },
+          ],
+        });
+      });
+      await client.command("Fetch.enable", { patterns: [{ urlPattern: `${origin}/*`, requestStage: "Request" }] });
+    }
+    await cdp.command("Network.setCookies", { cookies });
+
+    const requests: Seen[] = [];
+    cdp.on("Network.requestWillBeSent", (params) => {
+      const request = (params.request ?? {}) as { url?: string; headers?: Record<string, string> };
+      if (request.url !== undefined) requests.push({ url: request.url, headers: request.headers ?? {} });
+    });
+
+    const viewports: Measured["viewports"] = [];
+    const columns: Measured["columns"] = [];
+    for (const [width, height] of [
+      [1920, 1080],
+      [1440, 900],
+    ] as const) {
+      await cdp.command("Emulation.setDeviceMetricsOverride", {
+        width,
+        height,
+        deviceScaleFactor: 1,
+        mobile: false,
+      });
+      await cdp.command("Page.navigate", { url: origin });
+      await waitFor(`the bank at ${width}x${height}`, async () =>
+        evaluate<boolean>(cdp as Cdp, `document.querySelector('.bank') !== null`),
+      );
+      // Hydration, so the recorded network covers the client tree's effects and
+      // not only the server's HTML. Through `BankPane`'s own `data-hydrated`
+      // marker (#152, moved here by #155): the server-rendered HTML says
+      // nothing about React.
+      await waitFor(`hydration at ${width}x${height}`, async () =>
+        evaluate<boolean>(
+          cdp as Cdp,
+          `document.querySelector('.bank[data-hydrated="true"]') !== null`,
+        ),
+      );
+      await Bun.sleep(1_500);
+      await options.afterLoad?.(cdp);
+      viewports.push({
+        width,
+        height,
+        bank: await evaluate<{ width: number; height: number }>(
+          cdp,
+          `(() => { const r = document.querySelector('.bank').getBoundingClientRect(); return { width: Math.round(r.width), height: Math.round(r.height) }; })()`,
+        ),
+      });
+      columns.push({
+        width,
+        ...(await evaluate<{ records: number; assistant: number }>(
+          cdp,
+          `(() => {
+            const at = (selector) => Math.round(document.querySelector(selector).getBoundingClientRect().width);
+            return {
+              records: at('.bank-column-records'),
+              assistant: at('.bank-column-assistant'),
+            };
+          })()`,
+        )),
+      });
+    }
+
+    const html = await evaluate<string>(cdp, `document.documentElement.outerHTML`);
+    return { requests, html, viewports, columns };
+  } finally {
+    cdp?.close();
+    await stopProcess(chrome);
+    await stopProcess(next);
+    await harness?.stop();
+    if (profile !== undefined) rmSync(profile, { recursive: true, force: true });
+  }
+}
+
+test.skipIf(chromeResolution.path === null && !REQUIRED)(
+  "with no control plane configured, / is whole and touches the hook server not at all",
+  async () => {
+    if (chromeResolution.path === null) throw new Error(missingBrowserMessage(chromeResolution));
+    const measured = await measureHome({ governanceStream: null });
+
+    // The bank fills both viewports the issue names, less #177's frame. `dvh` in
+    // a headless Chrome with no browser chrome is the full height, so this is
+    // exact rather than approximate.
+    expect(measured.viewports).toEqual(FULL_SCREEN);
+
+    // No control-plane column. The panel's whole namespace, absent from the
+    // served document — server HTML and hydrated client tree together.
+    expect(measured.html).not.toMatch(/class="[^"]*\bcg-[a-z]/);
+    expect(measured.html).toContain("Loan Desk");
+    expect(measured.html).toContain("Signed in as");
+    expect(measured.html).toContain(DANA);
+    // And the strip #176 cut down to two entries, both of which navigate, in
+    // the served document rather than in a render this file chose.
+    expect(measured.html).toContain(`href="/loans"`);
+    expect(measured.html).not.toMatch(/<span[^>]*class="bank-tab"/);
+    expect(measured.html).not.toContain("Sign in as");
+
+    // Two columns.
+    expect(measured.html).toContain("bank-column-records");
+    expect(measured.html).toContain("bank-column-assistant");
+
+    // **Two thirds to the loan files.** The 2026-09-18 gate gave two thirds
+    // to the chat; the chat is gone, the assistant column is a pointer to the
+    // Deep Agent, and the records are what the room reads. A ratio rather than
+    // two pixel counts, because the counts depend on padding and the gap.
+    for (const column of measured.columns) {
+      const share = column.records / (column.records + column.assistant);
+      expect({ width: column.width, twoThirds: Math.abs(share - 2 / 3) < 0.01 }).toEqual({
+        width: column.width,
+        twoThirds: true,
+      });
+    }
+
+    // And no SSE at all was opened: with nothing to watch, this page opens
+    // nothing, which is what "no longer depends on `panel_stream`" means.
+    expect(measured.requests.filter((request) => request.url.includes("/events"))).toEqual([]);
+    expect(
+      measured.requests.filter((request) => request.url.includes("/api/governance/fixture-stream")),
+    ).toEqual([]);
+  },
+  240_000,
+);
+
+test.skipIf(chromeResolution.path === null && !REQUIRED)(
+  "with a live control plane, / opens no connection to it",
+  async () => {
+    if (chromeResolution.path === null) throw new Error(missingBrowserMessage(chromeResolution));
+    const hooks = startHooksStandIn();
+    try {
+      const measured = await measureHome({ governanceStream: "hooks", hooksHost: hooks.host });
+
+      // The approval listener went with the chat: the assistant is the Deep
+      // Agent in `agent/` now, and nothing on this page waits on an approval.
+      // A control plane that answers is still not something `/` subscribes to.
+      expect(hooks.connections).toEqual([]);
+      expect(
+        measured.requests.filter((request) => request.url.includes("/api/governance/fixture-stream")),
+      ).toEqual([]);
+
+      expect(measured.html).not.toMatch(/class="[^"]*\bcg-[a-z]/);
+      expect(measured.html).not.toContain("FIXTURE REPLAY");
+      expect(measured.html).not.toContain("LIVE ·");
+
+      // Still whole, with a control plane configured.
+      expect(measured.html).toContain("Loan Desk");
+      expect(measured.viewports).toEqual(FULL_SCREEN);
+    } finally {
+      hooks.stop();
+    }
+  },
+  240_000,
+);
+
+/**
+ * #176's third complaint, measured on the served page rather than on a render.
+ *
+ * The human photographed `/` on 2026-09-19 with three claims on it at once: the
+ * chrome said `SIGNED IN AS bob@megaforce.tech`, the assistant said every tool
+ * call is made as that person, and the loan book between them said the bank had
+ * not accepted that sign-in. Two of the three were true.
+ *
+ * `app-test/home-stale-session.test.tsx` drives the same state through
+ * `readLoanBook` against a real 401 and asserts on the components. This is the
+ * other half of that claim and the one a component render cannot make: the
+ * *page* — App Router, server component, client bundle, hydrated — in front of a
+ * real browser, with a loan book that really refuses a real bearer. A page that
+ * agreed with itself in a test file and not in Chrome would be the shape of
+ * every failure surface this repo has had to fix twice.
+ *
+ * Since #5 the loan book is the app's own module, and it is real here too: the
+ * stand-in is only the identity provider it asks, which refuses every bearer,
+ * so the module answers the 401 itself. The half that says the module really
+ * answers 401 to a bearer the real IdP refuses is measured in
+ * `app-test/api-loans.test.ts`. Until #5 the stand-in was the loan API.
+ */
+test.skipIf(chromeResolution.path === null && !REQUIRED)(
+  "with the loan book refusing this browser's bearer, the whole page says so once",
+  async () => {
+    if (chromeResolution.path === null) throw new Error(missingBrowserMessage(chromeResolution));
+
+    // The identity provider the loan module asks, refusing every bearer the
+    // way `apps/idp` refuses one it did not issue.
+    const refusing = Bun.serve({
+      port: 0,
+      fetch: () => new Response("invalid_token", { status: 401 }),
+    });
+
+    try {
+      const measured = await measureHome({
+        governanceStream: null,
+        loanIdpHost: `localhost:${refusing.port}`,
+      });
+
+      // The chrome. Not "Signed in as" anywhere on the document — the line the
+      // audience reads first may not be the one that is wrong.
+      expect(measured.html).toContain(`data-session="stale"`);
+      expect(measured.html).toContain("Sign-in stale");
+      expect(measured.html).not.toContain("Signed in as");
+
+      // The assistant column, which was the second of the three claims, makes
+      // none now: the assistant is the Deep Agent, signed in to on its own.
+      expect(measured.html).not.toContain("every tool call is made as this person");
+
+      // Who it is about is still named — the email is the join key, and a
+      // screen that hid it would trade one kind of unhelpful for another.
+      expect(measured.html).toContain(DANA);
+
+      // And none of it became a refusal. A stale bearer that looked like
+      // governance working is the one mistake this page may not make.
+      expect(measured.html).toContain("Nothing was refused by policy");
+      expect(measured.html).not.toMatch(/\bdenied\b|CHECK_FAILED|\[ref evt_/i);
+
+      // Still whole: the bank fills the viewport and the columns are the ones
+      // the 2026-09-18 gate asked for. A stale sign-in is not an outage.
+      expect(measured.html).toContain("Loan Desk");
+      expect(measured.viewports).toEqual(FULL_SCREEN);
+    } finally {
+      refusing.stop(true);
+    }
+  },
+  240_000,
+);

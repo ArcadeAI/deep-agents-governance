@@ -1,0 +1,8 @@
+# `bun test` from the repo root (#46). `scripts/test-globals.ts` fails the run
+# when a test file leaves a DOM or a replaced global behind for the files after
+# it. `scripts/test-shards-record.ts` writes down what CI's shards ran, and only
+# when `CG_SHARD_RECORD` names a file; it comes first because preloads'
+# `afterAll`s run in this order, and its END line must be written before the
+# globals check throws.
+[test]
+preload = ["./scripts/test-shards-record.ts", "./scripts/test-globals.ts"]

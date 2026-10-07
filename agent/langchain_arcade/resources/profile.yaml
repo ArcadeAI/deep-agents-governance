@@ -1,0 +1,199 @@
+# Default discovery profile.
+#
+# Every string the model ever sees lives in this file — the system prompt, the
+# four meta-tool definitions, and each runtime message template. Nothing here is
+# referenced by name from Python: the code binds to the *roles* below
+# (select / search / schema / execute), so a profile may rename any tool,
+# rewrite any description, or reword any message without a code change.
+#
+# Override by layering another YAML file on top; see `load_profile`. Overlays
+# deep-merge, so a file that sets only `system_prompt` inherits everything else.
+#
+# Templates use $name substitution (string.Template), not str.format, so JSON
+# braces in prompt text pass through untouched.
+
+version: "1.0.0"
+
+# Execution model this profile is written for. `promotion` means discovered
+# tools are advertised as real tool definitions and called by name. A profile
+# written for the `envelope` model (route every call through the execute tool,
+# thread query_id) is NOT interchangeable — the loader refuses a mismatch.
+mode: promotion
+
+defaults:
+  max_promoted: 16
+  select_limit: 5
+  search_limit: 10
+  digest_description_limit: 160
+  max_candidate_hints: 5
+
+system_prompt: |
+  ## External tools (Arcade)
+
+  You reach external services — Slack, Gmail, GitHub, Google Calendar, Notion,
+  Linear, Drive, and more — by discovering tools first. ALWAYS check the catalog
+  before saying a capability is unavailable.
+
+  - **Have a task** → `$select_tool(tasks=["<plain-English task>"])`. The
+    selected tools become ordinary tools on your next turn; call them directly
+    by name. This is the default path.
+  - **Browsing a domain** → `$search_tool(query=...)` for names and descriptions
+    only. It does not make tools callable. Do not chain search into select
+    reflexively — select directly when you know the task.
+
+  Writing the task description:
+  - One task per workflow. Fold the sub-steps into a single description ("find
+    the #eng channel id and post a status update"), don't fragment them.
+  - Multiple tasks only when they are genuinely unrelated — different service,
+    different data, no shared context.
+
+  After selecting, call the tools by name like any other tool. `$execute_tool`
+  is a fallback for when a tool has dropped off your tool list;
+  `$schema_tool(names=[...])` brings one back.
+
+  Re-select when the domain shifts or the first result missed. Tools discovered
+  earlier in the conversation stay available — you don't need to rediscover them.
+
+  If a call returns a sign-in URL, give the URL to the user and wait. Do not
+  retry until they confirm they've signed in.
+
+tools:
+  select:
+    name: arcade_select_tools
+    description: |
+      Find the external tools needed for a task, and make them callable.
+
+      The selected tools become available as regular tools on your next turn —
+      call them directly by name. Do not route them through $execute_tool.
+
+      Write one task per workflow, in plain English, combining its steps ("find
+      the #eng channel id and post a status update"). Use several tasks only
+      when they are genuinely unrelated. Re-select when the domain shifts or the
+      first result missed.
+    input_schema:
+      type: object
+      properties:
+        tasks:
+          type: array
+          items:
+            type: string
+          description: Plain-English task descriptions, one per workflow.
+        limit:
+          type: integer
+          description: Maximum tools per task. Defaults to the configured limit.
+      required:
+        - tasks
+
+  search:
+    name: arcade_search_tools
+    description: |
+      Browse the catalog by keyword. Returns names and descriptions only.
+
+      Use this to survey what exists in a domain. It does not make tools
+      callable — $select_tool does that. Prefer selecting directly when you
+      already know the task; do not chain search into select reflexively.
+    input_schema:
+      type: object
+      properties:
+        query:
+          type: string
+          description: Free-form query.
+        limit:
+          type: integer
+          description: Maximum results. Defaults to the configured limit.
+      required:
+        - query
+
+  schema:
+    name: arcade_tool_schema
+    description: |
+      Re-expose already-discovered tools that are no longer callable.
+
+      Only needed when a tool you discovered earlier has dropped off your tool
+      list because newer selections displaced it.
+    input_schema:
+      type: object
+      properties:
+        names:
+          type: array
+          items:
+            type: string
+          description: Advertised tool names, as previously reported.
+      required:
+        - names
+
+  execute:
+    name: arcade_use_tool
+    description: |
+      Execute a discovered tool by name. Fallback path.
+
+      Prefer calling discovered tools directly by name. Use this only when the
+      tool is not in your current tool list.
+    input_schema:
+      type: object
+      properties:
+        tool_name:
+          type: string
+          description: The tool's advertised name.
+        inputs:
+          type: object
+          description: Inputs matching the tool's schema.
+      required:
+        - tool_name
+        - inputs
+
+templates:
+  # Appended to a promoted tool's description when Arcade flags it as needing
+  # a user grant.
+  auth_caveat: |-
+
+    Requires user authorization. If the call returns a sign-in URL, give the URL
+    to the user and wait — do not retry until they confirm.
+
+  # One catalog entry, rendered into $digest below.
+  digest_line: "- $name$params — $description$auth_flag"
+  digest_params: "($required)"
+  digest_auth_flag: " [needs authorization]"
+
+  # Result of a successful selection. $digest is the joined digest_line list.
+  promotion_result: |-
+    $count tool(s) are now callable directly by name:
+    $digest
+    Call them as ordinary tools — do not use $execute_tool.$trailer
+
+  # Selection matched nothing.
+  no_match: >-
+    No tools matched: $tasks. Try one plain-English task describing the whole
+    workflow, or $search_tool to browse the domain.
+
+  search_result: |-
+    $count tool(s) matching $query:
+    $digest
+
+    Call $select_tool with a task description to make one callable.
+
+  search_no_match: "No tools matched $query."
+
+  # Model named something not in the catalog, and nothing looks close.
+  unknown_tool: >-
+    Not in the discovered catalog: $names. Call $select_tool with a task
+    description to discover it.
+
+  # Model named something ambiguous; $candidates lists the near matches.
+  did_you_mean: >-
+    Not in the discovered catalog: $names. Did you mean: $candidates?
+
+  auth_required: |-
+    Authorization required for $toolkit. Give this URL to the user and wait for
+    them to confirm before retrying:
+    $auth_url
+
+  discovery_unavailable: >-
+    Tool discovery is temporarily unavailable, so no search could be run. This
+    is an outage, not an empty catalog — do not conclude the capability is
+    missing and do not tell the user it does not exist. Say that tool discovery
+    is briefly unavailable and stop; do not retry this turn.
+
+  tool_error: "Error from $name: $error"
+
+  empty_output: "Done. The tool returned no output."

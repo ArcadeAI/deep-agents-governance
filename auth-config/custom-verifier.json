@@ -1,0 +1,4 @@
+{
+  "verifier_url": "https://<APP_PUBLIC_HOST>/api/arcade/verify",
+  "unsafe_skip_verification": false
+}

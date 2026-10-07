@@ -1,0 +1,28 @@
+[project]
+name = "loan-desk-agent"
+version = "0.1.0"
+description = "The loan desk's Deep Agent on Managed Deep Agents, with Sam Partee's langchain_arcade vendored in langchain_arcade/."
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "managed-deepagents==0.8.0",
+    "deepagents>=0.7.0,<0.8.0",
+    "arcadepy>=1.0.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Only for a real model. The scripted one needs none of these.
+anthropic = ["langchain-anthropic>=1.0"]
+
+[dependency-groups]
+dev = ["pytest>=8.0.0"]
+
+[tool.uv]
+package = false
+
+[tool.mda]
+python-version = "3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

@@ -1,0 +1,510 @@
+/**
+ * `idp.db` — the people. Better Auth's own tables (`user`, `session`,
+ * `account`, `verification`) plus the OAuth provider plugin's (`oauthClient`,
+ * tokens, consents).
+ *
+ * The identity module knows who someone is and nothing else: no titles, no
+ * limits, no loans. Authority lives in the control plane; the loan book lives
+ * in the loan module. Everything here is identity.
+ */
+import { Database } from "bun:sqlite";
+import { hashPassword } from "better-auth/crypto";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+import { z } from "zod";
+
+// Generated from the installed Better Auth by `scripts/generate-schema.ts`;
+// `test/schema.test.ts` fails when it is stale. Checked in rather than built
+// at boot because the seed has to create the schema itself, inside the seed
+// transaction — see `seed`. Kept byte-identical to what the library compiles,
+// so `generate:check` stays a real comparison; `idempotentSchema` below is
+// what actually runs.
+import GENERATED_SCHEMA from "./schema.sql" with { type: "text" };
+
+// Parsed rather than trusted: a caller's typo fails with a field path instead
+// of surfacing as somebody who quietly cannot log in.
+const personSchema = z.object({
+  name: z.string().min(1),
+  email: z.string().email(),
+  password: z.string().min(8),
+});
+
+/**
+ * One person to seed: who they are and the password they sign in with.
+ *
+ * **Nobody is seeded by default** (#33). There is no shipped cast and no
+ * shipped password: a fresh `idp.db` holds nobody, and `bun run users add` or
+ * `bun run users seed-demo` adds each person with a password of their own. A
+ * caller that seeds (a test, with its own throwaway password) passes them.
+ */
+export type PersonSeed = z.infer<typeof personSchema>;
+
+/** What the service tells about a person. Name and email — that is the whole record. */
+export interface Person {
+  id: string;
+  name: string;
+  email: string;
+}
+
+/**
+ * Each seed parsed, with its address lowercased.
+ *
+ * **Every address is lowercased on the way in** (#58). Better Auth lowercases
+ * the address before it looks a user up, and SQLite compares text
+ * case-sensitively, so a row stored as `Alice@…` can never be signed in
+ * as — and the login page reports the same "did not match" it gives a wrong
+ * password, so nothing on screen says why. Normalising here means
+ * `insertPeople` can only ever write a lowercase row; `schema.sql`'s
+ * `collate nocase` on the column is the second line of defence, for a row
+ * this function did not write.
+ */
+function normalise(people: PersonSeed[]): PersonSeed[] {
+  return people.map((person) => {
+    const parsed = personSchema.parse({ ...person, email: person.email.trim() });
+    return { ...parsed, email: parsed.email.toLowerCase() };
+  });
+}
+
+/**
+ * Tables that hold a person's *state* — how they are signed in, what they
+ * consented to — in an order that respects the foreign keys. `resetPeople`
+ * empties every one of them, for everybody. Two tables are off the list on
+ * purpose:
+ *
+ *   - `oauthClient` — the credentials Arcade holds. Rotating them breaks OAuth
+ *     right after a reset, at the authorize step, where no hook fires and
+ *     nothing on screen says why.
+ *   - `jwks` — the ID-token signing keys (#70). Clearing them mints a new key
+ *     pair on the next signature, and an Arcade User Source that had cached
+ *     the old key set would reject the ID token. Same failure, one layer down.
+ *
+ * `user` and `account` — who somebody *is*, and their password — are not here
+ * either: since #33 the reset deletes nobody (see `resetPeople`).
+ */
+const STATE_TABLES = [
+  "oauthAccessToken",
+  "oauthRefreshToken",
+  "oauthConsent",
+  "verification",
+  "session",
+] as const;
+
+/**
+ * The three statement forms Better Auth's SQLite migration compiler emits,
+ * and the idempotent spelling of each.
+ *
+ * Ordered so the longer prefix is tried first: `create unique index "` also
+ * begins with `create `, and matching the wrong rule would produce SQL that
+ * does not parse.
+ */
+const IDEMPOTENT_FORMS = [
+  ["create table \"", "create table if not exists \""],
+  ["create unique index \"", "create unique index if not exists \""],
+  ["create index \"", "create index if not exists \""],
+] as const;
+
+/**
+ * Rewrites the generated DDL so replaying it against a database that already
+ * holds some of it is a no-op rather than an error.
+ *
+ * `schema.sql` is the library's own output and stays byte-identical to it, so
+ * `generate:check` keeps comparing like with like; `CREATE ... IF NOT EXISTS`
+ * is not something Better Auth's compiler emits, so the idempotent form is
+ * derived here instead of being checked in.
+ *
+ * **Throws on a statement it does not recognise**, at import time. The whole
+ * point of the upgrade path is that a missing table appears; a statement this
+ * function quietly dropped would be a table that never does — a thing that
+ * looks exactly like a schema that is already current. Better a service that
+ * refuses to start and names the statement.
+ *
+ * Exported for the test that feeds it an unrecognised statement.
+ */
+export function idempotentSchema(generated: string): string {
+  const statements = generated
+    // The generated file opens with a `--` comment block, which would
+    // otherwise ride along on the front of the first statement.
+    .replace(/^(?:--[^\n]*\n)+/, "")
+    .split(";")
+    .map((statement) => statement.trim())
+    .filter(Boolean);
+
+  return statements
+    .map((statement) => {
+      const form = IDEMPOTENT_FORMS.find(([prefix]) => statement.startsWith(prefix));
+      if (!form) {
+        throw new Error(
+          `idp.db schema: cannot make this statement idempotent, so the upgrade path ` +
+            `would skip it silently — teach idempotentSchema about it: ${statement.slice(0, 120)}`,
+        );
+      }
+      return `${form[1]}${statement.slice(form[0].length)};`;
+    })
+    .join("\n\n");
+}
+
+/**
+ * The DDL that actually runs, inside `seed()`'s transaction on a fresh
+ * database. Still passed through `idempotentSchema`, although since #6 nothing
+ * replays it against an older disk (see `SCHEMA_VERSION`): the pass costs
+ * nothing, and its refusal of a statement form it does not recognise is how a
+ * Better Auth upgrade that emits a new one is caught at import rather than at
+ * the first seed.
+ */
+const SCHEMA = idempotentSchema(GENERATED_SCHEMA);
+
+/**
+ * The schema revision this build writes, recorded in `PRAGMA user_version`.
+ * Bump it in the same commit as any change to `schema.sql`.
+ *
+ * **Version 2 is a fresh schema (#6): Better Auth 1.7.5.** 1.7.5 drops
+ * `account.issuer`, which 1.7.2 declared `NOT NULL` with a unique index on
+ * `(issuer, accountId)`. A disk written by the 1.7.2 build therefore holds a
+ * column this build never writes, and the first seed or reset against it fails
+ * on that constraint. DESIGN.md → Services records the choice: the demo held
+ * Better Auth at 1.7.2 because moving would have needed a migration on a live
+ * disk, and the template's `idp.db` starts fresh instead. So there is no
+ * upgrade path, and a disk stamped older than this is refused with the way out,
+ * the same as one stamped newer.
+ *
+ * Versions 0 and 1 were the demo's `apps/idp`: 0 before the JWT plugin (#70),
+ * 1 from #70 on. Both are refused.
+ */
+export const SCHEMA_VERSION = 2;
+
+/** The schema revision recorded on disk. 0 on anything written before #70. */
+export function readSchemaVersion(db: Database): number {
+  return db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version ?? 0;
+}
+
+/** How to get from a disk this build cannot read to one it can, said the same way for both directions. */
+function resetAdvice(path: string): string {
+  return (
+    `Reset it: stop the app, delete ${path} (and its -wal and -shm siblings), ` +
+    `and restart — it comes back empty, and \`bun run users\` adds the people again. Note that deleting the file ` +
+    `also rotates the OAuth client, so Arcade has to be re-registered afterwards.`
+  );
+}
+
+/**
+ * Thrown at boot, before the port opens, when `idp.db` is not one this build
+ * can bring forward. Names the file and the way out, because the alternative
+ * is a `SQLiteError: no such table` from the first request that needs the
+ * missing piece, a crash loop, and a remote shell that will not attach to a
+ * service that keeps exiting (#60, measured on `cg-hooks`).
+ */
+export class SchemaTooNewError extends Error {
+  constructor(
+    readonly path: string,
+    readonly found: number,
+  ) {
+    super(
+      `idp.db at ${path} was written by a newer build (PRAGMA user_version ${found}; ` +
+        `this build understands ${SCHEMA_VERSION}) and cannot be migrated backwards. ` +
+        resetAdvice(path),
+    );
+    this.name = "SchemaTooNewError";
+  }
+}
+
+/**
+ * Thrown at boot when `idp.db` was written by an older schema than this build's
+ * fresh one — see {@link SCHEMA_VERSION} for why there is no upgrade path.
+ * Refused rather than opened, because opening it comes up green and fails at
+ * the first reset, on a `NOT NULL` column nothing here writes.
+ */
+export class SchemaTooOldError extends Error {
+  constructor(
+    readonly path: string,
+    readonly found: number,
+  ) {
+    super(
+      `idp.db at ${path} was written by an older schema (PRAGMA user_version ${found}; ` +
+        `this build writes ${SCHEMA_VERSION}, Better Auth 1.7.5's, and does not upgrade older disks). ` +
+        resetAdvice(path),
+    );
+    this.name = "SchemaTooOldError";
+  }
+}
+
+/**
+ * Opens the people database, creating the schema only when it has none, and
+ * refusing one written by any other schema version. The schema is created
+ * with nobody in it unless `people` names somebody (#33).
+ *
+ * Seed-if-empty rather than seed-on-boot: `idp.db` lives on a disk, so a
+ * consent granted on stage is still there after a restart. Getting back to a
+ * clean state is the reset, never a side effect of deploying — and that reset
+ * leaves the OAuth client alone, see `resetPeople`.
+ */
+export async function openPeople(path: string, people: PersonSeed[] = []): Promise<Database> {
+  if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
+
+  const db = new Database(path, { create: true });
+  // First, before anything that takes a lock. The last connection to close
+  // checkpoints the WAL, and an open that lands in that window got
+  // SQLITE_BUSY at once: setup-arcade's `oauth-client` failed that way right
+  // after a sign-in closed the file (#54's CI), and `bun run setup-arcade`,
+  // `oauth-client` and `users` all open idp.db while `bun run dev` holds it.
+  // Measured on #54: 2464 busy opens in about 21k without this, 0 with it.
+  db.exec("PRAGMA busy_timeout = 5000");
+  db.exec("PRAGMA journal_mode = WAL");
+  db.exec("PRAGMA foreign_keys = ON");
+
+  try {
+    if (hasSchema(db)) checkSchemaVersion(db, path);
+    else await seed(db, people);
+  } catch (cause) {
+    // Leave no half-open handle behind: the caller is about to exit, and a
+    // lingering WAL lock is one more thing between a crash-looping service
+    // and somebody deleting the file.
+    db.close();
+    throw cause;
+  }
+
+  return db;
+}
+
+/**
+ * A disk that already has a schema is opened only when it is this build's.
+ *
+ * **No inserts and no DDL.** The rows on this disk are the state the demo is
+ * in, and `bun run users` is what adds or removes people — deliberately, never at boot.
+ */
+function checkSchemaVersion(db: Database, path: string): void {
+  const found = readSchemaVersion(db);
+  if (found > SCHEMA_VERSION) throw new SchemaTooNewError(path, found);
+  if (found < SCHEMA_VERSION) throw new SchemaTooOldError(path, found);
+}
+
+function hasSchema(db: Database): boolean {
+  const row = db
+    .query<{ name: string }, []>(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'user'",
+    )
+    .get();
+
+  return row !== null;
+}
+
+/** A person with the password already hashed — the only form that goes into a transaction. */
+interface HashedPerson {
+  name: string;
+  email: string;
+  passwordHash: string;
+}
+
+/**
+ * Hashing is async (scrypt), and `bun:sqlite` transactions are synchronous, so
+ * every password is hashed before the transaction opens rather than inside it.
+ */
+async function hashAll(people: PersonSeed[]): Promise<HashedPerson[]> {
+  return Promise.all(
+    normalise(people).map(async ({ name, email, password }) => ({
+      name,
+      email,
+      passwordHash: await hashPassword(password),
+    })),
+  );
+}
+
+/**
+ * Creates the schema and inserts the seed rows in **one** transaction.
+ *
+ * The schema has to be inside the transaction, not just the inserts. SQLite
+ * DDL is transactional, so a seed that throws halfway leaves no tables at all
+ * and the next boot tries again with a clear error. Creating the tables first
+ * and wrapping only the inserts produces the one failure that cannot recover
+ * on its own: a database holding a schema and no rows, which `hasSchema` reads
+ * as already seeded. The service then comes up green and nobody can log in —
+ * and on a disk that persists, it stays that way. A caller that seeds two
+ * people under one email is one boot away from that.
+ *
+ * Same shape as the loan book's seed (#29), copied rather than reinvented.
+ * Exported for the test that holds this line.
+ */
+export async function seed(db: Database, people: PersonSeed[]): Promise<void> {
+  const hashed = await hashAll(people);
+
+  db.transaction(() => {
+    db.exec(SCHEMA);
+    // Inside the same transaction as the DDL and the rows, so the version is
+    // recorded if and only if both landed.
+    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    insertPeople(db, hashed);
+  })();
+}
+
+/** What a reset did to the people, by address. */
+export interface PeopleReset {
+  /** Everybody on disk, every one of them kept, and every one of them signed out. */
+  kept: string[];
+}
+
+/**
+ * Signs **everybody** out — every session, token, consent and verification row
+ * — in one transaction, and deletes nobody. **The OAuth client is untouched**,
+ * so the `client_id` and `client_secret` registered in the Arcade dashboard
+ * keep working across a reset.
+ *
+ * ## Nobody is deleted, and nobody is seeded (#32, #33)
+ *
+ * Until #33 the demo cast was the fixture's four people with a shared fixture
+ * password, and a reset deleted and re-inserted them, putting a changed
+ * password or name back. There is no fixture password any more: every person,
+ * the demo cast included, was added by `bun run users` with a password of
+ * their own, printed once and never stored in a form that could be put back.
+ * So there is nothing to restore an account to, and a reset that deleted one
+ * would leave somebody who cannot sign in. Every `user` and credential
+ * `account` row stays exactly as it was; each person signs in again with the
+ * password they already had.
+ *
+ * Deleting the state also deletes every consent, so the first authorize after
+ * a reset shows the login page and the consent page again. That is what a
+ * rehearsal from clean should look like.
+ *
+ * Exported for `scripts/reset.ts` and the test that asserts the client survives.
+ */
+export function resetPeople(db: Database): PeopleReset {
+  return db.transaction(() => {
+    for (const table of STATE_TABLES) db.exec(`DELETE FROM "${table}"`);
+    const kept = db
+      .query<{ email: string }, []>('SELECT "email" FROM "user"')
+      .all()
+      .map((row) => row.email.toLowerCase())
+      .sort();
+    return { kept };
+  })();
+}
+
+/**
+ * Better Auth's Kysely adapter stores every `date` column as an ISO-8601
+ * string on SQLite, and every row id as a random string, so rows written here
+ * are indistinguishable from rows Better Auth writes itself. The credential
+ * account is what `emailAndPassword` sign-in looks up: `providerId` is the
+ * literal `"credential"` and `accountId` is the user's own id, both read off a
+ * row Better Auth's own sign-up wrote. 1.7.2 also required `issuer`
+ * (`"local:credential"`); 1.7.5 dropped the column (#6).
+ */
+function insertPeople(db: Database, people: HashedPerson[]): void {
+  // Prepared after the DDL (the tables have to exist to compile against) and
+  // finalized before the transaction commits, so a rollback is not fighting
+  // open statements over tables it is about to drop.
+  const insertUser = db.prepare<unknown, Record<string, string | number>>(`
+    INSERT INTO "user" ("id", "name", "email", "emailVerified", "createdAt", "updatedAt")
+    VALUES ($id, $name, $email, 1, $now, $now)
+  `);
+  const insertAccount = db.prepare<unknown, Record<string, string | number>>(`
+    INSERT INTO "account" ("id", "accountId", "providerId", "userId", "password", "createdAt", "updatedAt")
+    VALUES ($id, $userId, 'credential', $userId, $password, $now, $now)
+  `);
+
+  try {
+    const now = new Date().toISOString();
+    for (const person of people) {
+      const userId = crypto.randomUUID();
+      insertUser.run({ $id: userId, $name: person.name, $email: person.email, $now: now });
+      insertAccount.run({
+        $id: crypto.randomUUID(),
+        $userId: userId,
+        $password: person.passwordHash,
+        $now: now,
+      });
+    }
+  } finally {
+    insertUser.finalize();
+    insertAccount.finalize();
+  }
+}
+
+export class PersonExistsError extends Error {
+  constructor(readonly email: string) {
+    super(`idp.db already has a user for ${email}`);
+    this.name = "PersonExistsError";
+  }
+}
+
+/**
+ * One person, added by hand (`bun run users add`, #31): a `user` row and its
+ * `credential` account, hashed and inserted exactly as the seed does, in one
+ * transaction. The email is lowercased on the way in, for the reason
+ * `normalise` gives. Refuses an address that already has a user.
+ *
+ * The password is hashed here and goes nowhere else: not into a log line, and
+ * not onto disk in any form but the scrypt hash.
+ */
+export async function addPerson(
+  db: Database,
+  person: { name: string; email: string; password: string },
+): Promise<Person> {
+  const email = person.email.trim().toLowerCase();
+  const passwordHash = await hashPassword(person.password);
+  return db.transaction(() => {
+    if (findPerson(db, email) !== null) throw new PersonExistsError(email);
+    insertPeople(db, [{ name: person.name, email, passwordHash }]);
+    return findPerson(db, email)!;
+  })();
+}
+
+export function findPerson(db: Database, email: string): Person | null {
+  return db
+    .query<Person, [string]>('SELECT "id", "name", "email" FROM "user" WHERE "email" = ?')
+    .get(email.trim().toLowerCase());
+}
+
+/** What removing a person took with them. */
+export interface Removal {
+  person: Person;
+  sessions: number;
+  accessTokens: number;
+  refreshTokens: number;
+  consents: number;
+}
+
+/**
+ * Deletes a person and everything that lets them in: their credential, their
+ * sessions, and every OAuth access token, refresh token and consent issued to
+ * them, in one transaction. `null` when there is nobody at that address.
+ *
+ * The rows are deleted by name rather than left to `on delete cascade`, so the
+ * revocation does not depend on the connection having `foreign_keys` on, and
+ * so the counts are what was actually removed. `oauthClient` is never touched:
+ * the clients belong to nobody (`client.ts`), and one that did belong to this
+ * person would make this a rotation, so it is refused instead.
+ */
+export function removePerson(db: Database, email: string): Removal | null {
+  return db.transaction(() => {
+    const person = findPerson(db, email);
+    if (person === null) return null;
+
+    const owned = db
+      .query<{ n: number }, [string]>('SELECT COUNT(*) AS n FROM "oauthClient" WHERE "userId" = ?')
+      .get(person.id);
+    if ((owned?.n ?? 0) > 0) {
+      throw new Error(
+        `${person.email} owns an OAuth client in idp.db; removing them would delete it and ` +
+          `rotate the registration Arcade holds, so nothing was removed`,
+      );
+    }
+
+    const remove = (table: string) => db.query(`DELETE FROM "${table}" WHERE "userId" = ?`).run(person.id).changes;
+    const accessTokens = remove("oauthAccessToken");
+    const refreshTokens = remove("oauthRefreshToken");
+    const consents = remove("oauthConsent");
+    const sessions = remove("session");
+    remove("account");
+    db.query('DELETE FROM "user" WHERE "id" = ?').run(person.id);
+    return { person, sessions, accessTokens, refreshTokens, consents };
+  })();
+}
+
+export function listPeople(db: Database): Person[] {
+  return db
+    .query<Person, []>('SELECT "id", "name", "email" FROM "user" ORDER BY "email" ASC')
+    .all();
+}
+
+export function countPeople(db: Database): number {
+  const row = db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM "user"').get();
+  return row?.n ?? 0;
+}

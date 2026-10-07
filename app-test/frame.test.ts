@@ -1,0 +1,434 @@
+/**
+ * The co-branded frame (#177), measured rather than described.
+ *
+ * Almost nothing this slice claims is a claim about markup. "The assistant
+ * column is still above the fold", "the mark is 18px tall", "the
+ * misconfiguration banner is under the bar and not behind it" are all claims
+ * about *layout at a stated viewport*, and `renderToStaticMarkup` cannot be
+ * asked any of them — so the browser half of this file drives the real Next
+ * server in a real Chrome at 1920×1080, the projector the demo is given on.
+ *
+ * Two of these would pass on a frame that did nothing at all, so they are
+ * written as differences rather than as absences:
+ *
+ * - **The height budget.** The bar's own height plus the surface's height is
+ *   the viewport exactly. That fails both if the frame costs more than it says
+ *   and if it costs nothing because the surface still takes `100dvh` and the
+ *   document scrolls.
+ * - **The cap height.** Arcade's *ink* is measured off a canvas, in the band
+ *   its capital "A" occupies. Reading the `<img>` box would compare the number
+ *   this slice chose with itself.
+ *
+ * The cheap half — that the frame is on the keep side of the fork seam, and
+ * that the mark was not recolored to sit on the bar — runs everywhere, browser
+ * or not. A control that silently does not run is this project's recurring
+ * failure, and a skipped file would take the source assertions with it.
+ */
+import { describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import type { Subprocess } from "bun";
+
+import { browserRequired, missingBrowserMessage, resolveChrome } from "./chrome.ts";
+import { browserTarget, Cdp, evaluate, serveOnFreePort, startChrome, stopProcess, waitFor } from "./cdp.ts";
+import { spawnChild } from "./child.ts";
+
+const WEB = join(import.meta.dir, "..");
+const chromeResolution = resolveChrome();
+const REQUIRED = browserRequired();
+if (chromeResolution.path === null && !REQUIRED) console.warn(missingBrowserMessage(chromeResolution));
+
+/** The projector. #177 names this viewport and the bank is measured against it. */
+const VIEWPORT = { width: 1920, height: 1080 } as const;
+
+/** What `frame.css` says the frame costs. Asserted, not assumed. */
+const BAR_HEIGHT = 34;
+
+/**
+ * A deployment with nothing missing, so `/` renders without #84's banner.
+ *
+ * None of these values is used against anything: no page in this file signs
+ * anybody in, opens a gateway session or sends a message. They exist because
+ * `configurationProblems` counts absences, and the banner is the subject of the
+ * last test rather than a fixture of the first three.
+ */
+const CONFIGURED: Record<string, string> = {
+  IDP_CLIENT_ID: "web",
+  IDP_CLIENT_SECRET: "not-used-by-this-test",
+  ARCADE_GATEWAY_ID: "cg-demo-us",
+  ARCADE_API_KEY: "not-used-by-this-test",
+  ARCADE_TOOLKIT: "LoanDesk",
+  SESSION_SECRET: "frame-test-session-secret-at-least-32-chars",
+};
+
+interface Browser {
+  cdp: Cdp;
+  origin: string;
+  /** Load a path at 1920×1080 and wait for the frame to exist. */
+  open: (path: string) => Promise<void>;
+}
+
+/**
+ * Boot Next and Chrome, hand them to `body`, and take both down afterwards.
+ *
+ * No session cookie and no stand-ins. Every page under test answers without a
+ * network call when nobody is signed in — `homeSurface` and `readLoanBook` both
+ * short-circuit on a `null` session — so the frame can be measured against the
+ * real App Router without an IdP, a gateway or a loan book behind it. The
+ * surfaces' own tests own the rest.
+ */
+async function withBrowser(
+  env: Record<string, string>,
+  body: (browser: Browser) => Promise<void>,
+): Promise<void> {
+  let next: Subprocess | undefined;
+  let chrome: Subprocess | undefined;
+  let cdp: Cdp | undefined;
+  let profile: string | undefined;
+  try {
+    const environment = (webPort: number): Record<string, string> => {
+      const environment: Record<string, string> = {
+        ...(process.env as Record<string, string>),
+        NODE_ENV: "development",
+        PORT: String(webPort),
+        // The app mounts the control plane since #4; a throwaway one, not
+        // a governance.db in the repo.
+        GOVERNANCE_DB_PATH: ":memory:",
+        // The app's origin, which is also its identity provider's issuer since
+        // #6 (it replaced `PUBLIC_URL`).
+        APP_PUBLIC_HOST: `127.0.0.1:${webPort}`,
+        // The app holds the loan book since #5 (until then this pointed the
+        // loan API's own host variable at a port nothing listened on). A
+        // throwaway one: it may not default to `./loans.db`, which is the
+        // developer's own.
+        LOANS_DB_PATH: ":memory:",
+        // And the identity provider since #6: not `./idp.db` either.
+        IDP_DB_PATH: ":memory:",
+        ...env,
+      };
+      for (const name of ["GOVERNANCE_STREAM"]) delete environment[name];
+      for (const [name, value] of Object.entries(env)) {
+        if (value === "") delete environment[name];
+      }
+      return environment;
+    };
+
+    // Each child gets its port inside `serveOnFreePort` / `startChrome`, which
+    // start it again on a new one if another process took it first (#9).
+    const web = await serveOnFreePort((webPort) =>
+      spawnChild({
+        // `--bun`: the app runs on Bun since #4, because the control plane it
+        // mounts opens governance.db with bun:sqlite (`scripts/next.ts`).
+        cmd: ["bun", "--bun", "run", "next", "dev", "--port", String(webPort)],
+        cwd: WEB,
+        env: environment(webPort),
+        stdout: "pipe",
+        stderr: "pipe",
+      }),
+    );
+    next = web.child;
+    const origin = `http://127.0.0.1:${web.port}`;
+
+    profile = mkdtempSync(join(tmpdir(), "cg-frame-chrome-"));
+    const browser = await startChrome((debugPort) => [
+      chromeResolution.path as string,
+      "--headless=new",
+      "--no-sandbox",
+      "--disable-gpu",
+      "--disable-dev-shm-usage",
+      `--user-data-dir=${profile}`,
+      `--remote-debugging-port=${debugPort}`,
+      "about:blank",
+    ]);
+    chrome = browser.child;
+    const debugPort = browser.port;
+
+    cdp = new Cdp((await browserTarget(debugPort)).webSocketDebuggerUrl);
+    await cdp.command("Page.enable");
+    await cdp.command("Runtime.enable");
+    await cdp.command("Emulation.setDeviceMetricsOverride", {
+      ...VIEWPORT,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+
+    const client = cdp;
+    await body({
+      cdp: client,
+      origin,
+      open: async (path) => {
+        await client.command("Page.navigate", { url: `${origin}${path}` });
+        await waitFor(`the frame on ${path}`, async () =>
+          evaluate<boolean>(
+            client,
+            `document.querySelector('.frame-bar img.frame-mark-arcade')?.complete === true`,
+          ),
+        );
+        // The fonts and the client bundle, so a measured rect is the settled one.
+        await Bun.sleep(1_000);
+      },
+    });
+  } finally {
+    cdp?.close();
+    await stopProcess(chrome);
+    await stopProcess(next);
+    if (profile !== undefined) rmSync(profile, { recursive: true, force: true });
+  }
+}
+
+/** `getBoundingClientRect` for one selector, rounded, or `null` when it is absent. */
+const rectOf = (selector: string) => `(() => {
+  const node = document.querySelector(${JSON.stringify(selector)});
+  if (node === null) return null;
+  const r = node.getBoundingClientRect();
+  return { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height), bottom: Math.round(r.bottom) };
+})()`;
+
+interface Rect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  bottom: number;
+}
+
+/**
+ * The ink height of one mark, in CSS pixels, within a horizontal band of it.
+ *
+ * The band is how the tall element is isolated: Arcade's letters are a single
+ * connected outline — they touch along the baseline flourish — so there is no
+ * sub-path to measure and no gap to segment on at the glyph level. Measured off
+ * the file, the capital "A" occupies 5%–22% of the mark's width and the "r"
+ * begins at 24.5%.
+ *
+ * Drawn at twenty times the rendered size so antialiasing costs a fortieth of a
+ * CSS pixel rather than a whole one, then divided back down.
+ */
+const inkHeight = (selector: string, from: number, to: number) => `(async () => {
+  const img = document.querySelector(${JSON.stringify(selector)});
+  const rect = img.getBoundingClientRect();
+  const scale = 20;
+  const width = Math.round(rect.width * scale);
+  const height = Math.round(rect.height * scale);
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  const source = new Image();
+  source.src = img.currentSrc || img.src;
+  await source.decode();
+  context.drawImage(source, 0, 0, width, height);
+  const pixels = context.getImageData(0, 0, width, height).data;
+  const x0 = Math.floor(width * ${from});
+  const x1 = Math.ceil(width * ${to});
+  let top = -1;
+  let bottom = -1;
+  for (let y = 0; y < height; y++) {
+    for (let x = x0; x < x1; x++) {
+      if (pixels[(y * width + x) * 4 + 3] > 20) { if (top < 0) top = y; bottom = y; break; }
+    }
+  }
+  return { box: rect.height, ink: (bottom - top + 1) / scale };
+})()`;
+
+describe("the frame's source and its assets", () => {
+  /**
+   * The fork seam. `app/Frame.tsx` is on the keep side of it — a developer
+   * deletes `components/bank` and the frame still brands what is left — and it
+   * may no more reach into the panel than the bank may.
+   */
+  test("the frame imports no surface", () => {
+    const source = readFileSync(join(WEB, "app/Frame.tsx"), "utf8");
+
+    for (const surface of ["components/bank", "components/governance"]) {
+      expect({ surface, imports: source.includes(`from "../${surface}`) }).toEqual({
+        surface,
+        imports: false,
+      });
+    }
+  });
+
+  /**
+   * And its stylesheet styles nothing but itself — the rule `bank.css` is held
+   * to, for the same reason. A `.frame-stage > *` that named a surface would be
+   * the frame knowing what it wraps.
+   */
+  test("the frame's stylesheet names no surface", () => {
+    const css = readFileSync(join(WEB, "app/frame.css"), "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
+
+    for (const selector of css.matchAll(/^\.([a-z-]+)/gm)) {
+      expect(selector[1]).toStartWith("frame");
+    }
+    for (const surface of [".bank", ".cg-"]) {
+      expect({ surface, styled: css.includes(surface) }).toEqual({ surface, styled: false });
+    }
+  });
+
+  /**
+   * The mark is not recolored.
+   *
+   * The file is white-only — measured, and the reason the bar is black
+   * rather than a taste call. This is the assertion that a later slice cannot
+   * quietly walk back by tinting a fill to make the frame match something.
+   */
+  test("every fill in the mark is white", () => {
+    for (const mark of ["arcade-wordmark-white.svg"]) {
+      const svg = readFileSync(join(WEB, "public", mark), "utf8");
+      const fills = [...svg.matchAll(/fill="([^"]*)"/g)].map((match) => match[1]);
+
+      expect({ mark, fills: [...new Set(fills)].sort() }).toEqual({ mark, fills: ["none", "white"] });
+    }
+  });
+});
+
+test.skipIf(chromeResolution.path === null && !REQUIRED)(
+  "the frame wraps every surface and costs exactly 34px of the viewport",
+  async () => {
+    if (chromeResolution.path === null) throw new Error(missingBrowserMessage(chromeResolution));
+
+    await withBrowser(CONFIGURED, async (browser) => {
+      // `/panel` brings `.cg-page`, the other two bring `.bank`; both ask for
+      // `height: 100dvh` and both have to end up with the stage's height
+      // instead. That is the whole of the height contract.
+      const surfaces: ReadonlyArray<readonly [string, string]> = [
+        ["/", ".bank"],
+        ["/loans", ".bank"],
+        ["/panel", ".cg-page"],
+      ];
+
+      for (const [path, root] of surfaces) {
+        await browser.open(path);
+
+        const bar = await evaluate<Rect>(browser.cdp, rectOf(".frame-bar"));
+        const surface = await evaluate<Rect>(browser.cdp, rectOf(root));
+
+        expect({ path, bar }).toEqual({
+          path,
+          bar: { x: 0, y: 0, width: VIEWPORT.width, height: BAR_HEIGHT, bottom: BAR_HEIGHT },
+        });
+        // In flow, not over: the surface starts where the bar ends, and the two
+        // together are the viewport and nothing more.
+        expect({ path, surface }).toEqual({
+          path,
+          surface: {
+            x: 0,
+            y: BAR_HEIGHT,
+            width: VIEWPORT.width,
+            height: VIEWPORT.height - BAR_HEIGHT,
+            bottom: VIEWPORT.height,
+          },
+        });
+
+        // Both marks, from the files their owners drew, in the order
+        // `brand-kit` specifies: Arcade, separator, partner.
+        const lockup = await evaluate<string[]>(
+          browser.cdp,
+          `[...document.querySelectorAll('.frame-lockup > *')].map((node) => node.getAttribute('src') ?? node.className)`,
+        );
+        expect({ path, lockup }).toEqual({
+          path,
+          lockup: ["/arcade-wordmark-white.svg", "frame-divider", "frame-partner"],
+        });
+
+        // Nothing scrolls. A frame that had been added to a `100dvh` surface
+        // without taking anything off it would show up here and nowhere else.
+        const scrolls = await evaluate<boolean>(
+          browser.cdp,
+          `document.documentElement.scrollHeight > window.innerHeight`,
+        );
+        expect({ path, scrolls }).toEqual({ path, scrolls: false });
+      }
+
+      // And the bank page, which is the one the frame could break, still keeps
+      // its assistant column on screen at the viewport #177 names.
+      await browser.open("/");
+      const assistant = await evaluate<Rect>(browser.cdp, rectOf('.bank-column-assistant'));
+      expect(assistant.bottom).toBeLessThanOrEqual(VIEWPORT.height);
+      expect(assistant.height).toBeGreaterThan(0);
+
+      // The frame adds no `cg-` class to `/`. The panel's namespace stays the
+      // panel's, which `home-full-screen-browser.test.ts` asserts about the
+      // page and this asserts about the thing now wrapped around it.
+      const html = await evaluate<string>(browser.cdp, `document.documentElement.outerHTML`);
+      expect(html).not.toMatch(/class="[^"]*\bcg-[a-z]/);
+      // The bank chrome, unchanged inside the frame.
+      expect(html).toContain("Loan Desk");
+      expect(html).toContain("Rel. 7.2.1");
+    });
+  },
+  240_000,
+);
+
+test.skipIf(chromeResolution.path === null && !REQUIRED)(
+  "the Arcade mark renders an 18px cap, and the partner sits inside the bar",
+  async () => {
+    if (chromeResolution.path === null) throw new Error(missingBrowserMessage(chromeResolution));
+
+    await withBrowser(CONFIGURED, async (browser) => {
+      await browser.open("/");
+
+      const arcade = await evaluate<{ box: number; ink: number }>(
+        browser.cdp,
+        inkHeight(".frame-mark-arcade", 0.05, 0.23),
+      );
+      // An 18px cap on a 34px bar is what was measured for the projector.
+      expect(Math.round(arcade.ink)).toBe(18);
+
+      // The partner side, in type until a wordmark replaces it: on screen, and
+      // inside the bar rather than spilling out of it.
+      const partner = await evaluate<Rect>(browser.cdp, rectOf(".frame-partner"));
+      expect(partner.height).toBeGreaterThan(0);
+      expect(partner.bottom).toBeLessThanOrEqual(BAR_HEIGHT);
+    });
+  },
+  240_000,
+);
+
+test.skipIf(chromeResolution.path === null && !REQUIRED)(
+  "a half-configured deployment still meets the banner first",
+  async () => {
+    if (chromeResolution.path === null) throw new Error(missingBrowserMessage(chromeResolution));
+
+    // #84 round 2: a deployment that renders a perfectly normal page and fails
+    // at the point of use. The banner is the answer to it, and the frame may
+    // not bury it, push it below the bank's chrome, or cover it.
+    await withBrowser({ ...CONFIGURED, ARCADE_GATEWAY_ID: "" }, async (browser) => {
+      await browser.open("/");
+
+      const html = await evaluate<string>(browser.cdp, `document.documentElement.outerHTML`);
+      expect(html).toContain("This deployment is not fully configured");
+      expect(html).toContain("ARCADE_GATEWAY_ID is not set");
+
+      // Order in the served document: the bar, then the banner, then the bank's
+      // own chrome. Not a screenshot — the order itself.
+      const bar = html.indexOf("frame-bar");
+      const banner = html.indexOf("This deployment is not fully configured");
+      const chrome = html.indexOf("Loan Desk");
+      expect({ barBeforeBanner: bar < banner, bannerBeforeChrome: banner < chrome }).toEqual({
+        barBeforeBanner: true,
+        bannerBeforeChrome: true,
+      });
+
+      // And in the viewport: fully on screen, directly under the bar, with
+      // nothing of the frame's on top of it at any point along its top edge.
+      const alert = await evaluate<Rect>(browser.cdp, rectOf('[role="alert"]'));
+      expect(alert.y).toBe(BAR_HEIGHT);
+      expect(alert.bottom).toBeLessThanOrEqual(VIEWPORT.height);
+      const covered = await evaluate<string[]>(
+        browser.cdp,
+        `(() => {
+          const alert = document.querySelector('[role="alert"]');
+          const r = alert.getBoundingClientRect();
+          const points = [0.02, 0.5, 0.98].map((fraction) => [r.x + r.width * fraction, r.y + 2]);
+          return points.map(([x, y]) => {
+            const hit = document.elementFromPoint(x, y);
+            return hit === null ? "nothing" : alert.contains(hit) || hit === alert ? "banner" : hit.className;
+          });
+        })()`,
+      );
+      expect(covered).toEqual(["banner", "banner", "banner"]);
+    });
+  },
+  240_000,
+);

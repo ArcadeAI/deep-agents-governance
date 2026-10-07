@@ -1,0 +1,32 @@
+# Keep build contexts small and keep host state out of the image. `packages`,
+# `app`, `components`, `lib` and `public` are copied wholesale by the Dockerfile, so
+# anything listed here would otherwise ride along.
+node_modules
+**/node_modules
+.next
+**/.next
+dist
+**/dist
+build
+**/build
+*.tsbuildinfo
+
+.git
+.github
+.env
+.env.*
+!.env.example
+
+# data — bootstrapped from checked-in fixtures, never baked into an image
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+
+# local agent scratch
+.orca/local/
+
+docs
+mcp
+.DS_Store

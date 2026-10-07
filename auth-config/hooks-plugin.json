@@ -1,0 +1,33 @@
+{
+  "name": "loan-approval-limits-hooks",
+  "description": "The Loans Approval Limits control plane: /hooks/access, /hooks/pre, /hooks/post",
+  "plugin_type": "webhook",
+  "status": "active",
+  "webhook_config": {
+    "auth": {
+      "type": "bearer",
+      "token": "<ARCADE_HOOK_SIGNING_SECRET>"
+    },
+    "health_check_path": "https://<APP_PUBLIC_HOST>/hooks/health",
+    "endpoints": {
+      "access": {
+        "url": "https://<APP_PUBLIC_HOST>/hooks/access",
+        "phase": "before",
+        "failure_mode": "fail_closed",
+        "status": "active"
+      },
+      "pre": {
+        "url": "https://<APP_PUBLIC_HOST>/hooks/pre",
+        "phase": "before",
+        "failure_mode": "fail_closed",
+        "status": "active"
+      },
+      "post": {
+        "url": "https://<APP_PUBLIC_HOST>/hooks/post",
+        "phase": "after",
+        "failure_mode": "fail_closed",
+        "status": "active"
+      }
+    }
+  }
+}

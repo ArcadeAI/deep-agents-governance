@@ -1,0 +1,334 @@
+/**
+ * governance.db: seeding, persistence, the revision counter, the append-only
+ * audit log.
+ */
+import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+
+import { compilePolicy } from "@cg/governance-core";
+
+import { count as auditCount, byExecution, newEventId, recent, record } from "../../gate/service/audit-log.ts";
+import {
+  counts,
+  hasSchema,
+  loadSeed,
+  openGovernance,
+  readOutputRules,
+  readPolicy,
+  readRevision,
+  seed,
+  type SeedOptions,
+} from "../../gate/service/policy-store.ts";
+import { DEMO_PEOPLE, seedDemoSubjects } from "../demo-cast.ts";
+
+const OPTIONS: SeedOptions = { toolkit: "LoanDesk" };
+
+/** A first boot: the policy, and nobody in it (#33). */
+const bare = () => openGovernance(":memory:", OPTIONS);
+
+/** A first boot and then `seed-demo`'s subjects, for the tests that edit a demo row. */
+const fresh = () => {
+  const db = bare();
+  seedDemoSubjects(db);
+  return db;
+};
+
+const anEvent = (overrides: Partial<Parameters<typeof record>[1][number]> = {}) => ({
+  id: newEventId(),
+  ts: new Date().toISOString(),
+  execution_id: "tc_1",
+  hook: "pre" as const,
+  user_id: "alice@bank.example",
+  tool: "LoanDesk.ApproveLoan",
+  decision: "deny" as const,
+  reason: "because",
+  rule_id: "pre.approve-within-clearance",
+  ...overrides,
+});
+
+describe("the seed", () => {
+  test("compiles against the configured toolkit names", () => {
+    const data = loadSeed(OPTIONS);
+    expect(() => compilePolicy({ catalogue: data.catalogue, rules: data.policy_rules })).not.toThrow();
+  });
+
+  /**
+   * The stage-edit case, which is the one that would actually bite.
+   *
+   * `governance.db` is editable live and `DESIGN.md` says so — that is the
+   * point of the rule editor and of a `sqlite3` shell on the deployment's disk. So
+   * "the seed spells it right" is a weaker claim than it looks: the rule that
+   * fires on stage is whatever the row says at that moment. Put the dot back
+   * and the control plane refuses the whole policy and fails closed, which is
+   * loud. The alternative is a rule that denies, writes its audit row, renders
+   * its reason, and instructs the model to call a name it has never been shown
+   * (#89) — a demo that looks like it works.
+   */
+  test("a rule edited back to the dot spelling does not compile", () => {
+    const db = fresh();
+    const before = readRevision(db);
+    db.query(
+      `UPDATE policy_rules SET reason = ? WHERE id = 'pre.approve-within-clearance'`,
+    ).run(
+      "DENIED: approving {{inputs.loan_id}} for {{inputs.amount}} exceeds your approval " +
+        "authority of {{subject.clearance}}. To proceed, call LoanDesk.RequestApproval with " +
+        "action=approve_loan, resource_id={{inputs.loan_id}}, amount={{inputs.amount}} and " +
+        "justification=<why this loan should be approved>.",
+    );
+    // The edit landed and the cache would notice it.
+    expect(readRevision(db)).toBeGreaterThan(before);
+
+    expect(() => compilePolicy(readPolicy(db))).toThrow(
+      /names "LoanDesk\.RequestApproval".*"LoanDesk_RequestApproval" — write that instead/s,
+    );
+  });
+
+  test("carries the cast with the limits DESIGN.md names", () => {
+    const byName = Object.fromEntries(loadSeed(OPTIONS).subjects.map((s) => [s.display_name, s]));
+    expect(byName["Alice"]).toMatchObject({ role: "loan_officer", clearance: 50_000 });
+    expect(byName["Bob"]).toMatchObject({ role: "credit_analyst", clearance: 0 });
+    expect(byName["Charlie"]).toMatchObject({ role: "vp_credit", clearance: 250_000 });
+    expect(byName["Michael"]).toMatchObject({ role: "chief_credit_officer", clearance: 5_000_000 });
+  });
+
+  // #33: the fixture's own addresses are how the reset and the drift check
+  // know the demo cast, so they are the only addresses it carries. No role
+  // variable substitutes another one any more: `SeedOptions` has nowhere to
+  // put one, and `seed-demo` takes the addresses on its command line.
+  test("the demo cast is at the fixture's own @bank.example addresses, lowercase", () => {
+    expect(loadSeed(OPTIONS).subjects.map((s) => s.user_id).sort()).toEqual([
+      "alice@bank.example",
+      "bob@bank.example",
+      "charlie@bank.example",
+      "michael@bank.example",
+    ]);
+    expect(Object.keys(OPTIONS)).toEqual(["toolkit"]);
+  });
+
+  test("keys every rule and the catalogue on the configured toolkit name, not on a literal", () => {
+    const data = loadSeed({ toolkit: "LoanBook" });
+    expect(Object.keys(data.catalogue)).toEqual(["LoanBook"]);
+    expect(Object.keys(data.catalogue.LoanBook!)).toHaveLength(6);
+    // Every rule is keyed on the configured name and on no literal: a rule
+    // left pointing at "$TOOLKIT", or at the default "LoanDesk" when the
+    // deployment calls it something else, would match nothing.
+    expect([...new Set(data.policy_rules.map((r) => r.match.toolkit))]).toEqual(["LoanBook"]);
+    expect([...new Set(data.output_rules.map((r) => r.match.toolkit))]).toEqual(["LoanBook"]);
+    const escalation = data.policy_rules.find((r) => r.hook === "pre");
+    // The remediation sentence is addressed to the model, so it carries the
+    // wire spelling — and it carries the *configured* toolkit name in it, which
+    // is the half of #89 a deployment that renamed its toolkits would break
+    // silently. `match` above stays dot-free and split in two; the reason is
+    // the only place the separator is a decision.
+    expect(escalation?.reason).toContain("LoanBook_RequestApproval");
+    expect(escalation?.reason).toContain("LoanBook_ApproveLoan");
+    expect(escalation?.reason).not.toContain("LoanBook.RequestApproval");
+    expect(escalation?.reason).not.toContain("LoanBook.ApproveLoan");
+    expect(JSON.stringify(data)).not.toContain("$TOOLKIT");
+    expect(() => compilePolicy({ catalogue: data.catalogue, rules: data.policy_rules })).not.toThrow();
+  });
+
+  test("keys tools on the PascalCase names arcade-mcp actually produces", () => {
+    const tools = Object.keys(loadSeed(OPTIONS).catalogue.LoanDesk ?? {}).sort();
+    expect(tools).toEqual(["ApproveLoan", "Decide", "DenyLoan", "GetLoan", "RequestApproval", "SearchLoans"]);
+  });
+});
+
+describe("seeding", () => {
+  test("bootstraps the fixture's policy into an empty database, and nobody (#33)", () => {
+    const db = bare();
+    expect(counts(db)).toMatchObject({
+      subjects: 0,
+      // The six LoanDesk tools.
+      catalogue: 6,
+      // One access rule, one approve rule, four decide guards.
+      policy_rules: 6,
+      // Act 3 and act 4.
+      output_rules: 2,
+      grants: 0,
+      approval_requests: 0,
+      audit_log: 0,
+    });
+    // Two since #16: the customer-identifier fields, conditioned on clearance,
+    // and the injected-instruction sweep, which is conditioned on nobody.
+    expect(readOutputRules(db).map((rule) => rule.id)).toEqual([
+      "post.redact-borrower-identifiers",
+      "post.strip-injected-instructions",
+    ]);
+  });
+
+  // Seeding the demo cast would give a fresh deployment four subjects nobody
+  // can sign in as, and approval routing picks from every subject: a $95K
+  // request would go to charlie@bank.example, who does not exist.
+  test("a first boot writes no subject, whatever the fixture's cast holds", () => {
+    const db = bare();
+    expect(readPolicy(db).subjects).toEqual([]);
+    expect(loadSeed(OPTIONS).subjects).toHaveLength(4);
+    expect(db.query("SELECT COUNT(*) AS n FROM subject_changes").get()).toEqual({ n: 0 });
+  });
+
+  test("a seed that fails leaves no schema, so the next boot retries", () => {
+    const db = new Database(":memory:");
+    const data = loadSeed(OPTIONS);
+    const duplicated = { ...data, subjects: [...data.subjects, data.subjects[0]!] };
+
+    expect(() => seed(db, duplicated)).toThrow(/UNIQUE/);
+    expect(hasSchema(db)).toBe(false);
+
+    seed(db, data);
+    expect(counts(db).subjects).toBe(4);
+  });
+
+  test("leaves an existing database alone — a restart is not a reset", () => {
+    const path = join(tmpdir(), `cg-governance-${crypto.randomUUID()}`, "governance.db");
+
+    const first = openGovernance(path, OPTIONS);
+    seedDemoSubjects(first);
+    first.run("UPDATE subjects SET clearance = 100000 WHERE display_name = 'Alice'");
+    record(first, [anEvent()]);
+    first.close();
+
+    const second = openGovernance(path, OPTIONS);
+    const dana = readPolicy(second).subjects.find((s) => s.display_name === "Alice");
+    const audit = auditCount(second);
+    second.close();
+    rmSync(dirname(path), { recursive: true, force: true });
+
+    expect(dana?.clearance).toBe(100_000);
+    expect(audit).toBe(1);
+  });
+});
+
+describe("the revision counter", () => {
+  test("moves on every write to a cached table, from any statement", () => {
+    const db = fresh();
+    const r0 = readRevision(db);
+
+    db.run("UPDATE subjects SET clearance = 1 WHERE display_name = 'Bob'");
+    const r1 = readRevision(db);
+    db.run("UPDATE policy_rules SET enabled = 0 WHERE id = 'access.analysts-cannot-see-approve'");
+    const r2 = readRevision(db);
+    db.run("INSERT INTO catalogue (toolkit, tool, arguments) VALUES ('LoanDesk', 'Ping', '[]')");
+    const r3 = readRevision(db);
+
+    expect(r1).toBeGreaterThan(r0);
+    expect(r2).toBeGreaterThan(r1);
+    expect(r3).toBeGreaterThan(r2);
+  });
+
+  test("does not move on an audit write — those are not policy", () => {
+    const db = fresh();
+    const before = readRevision(db);
+    record(db, [anEvent()]);
+    expect(readRevision(db)).toBe(before);
+  });
+
+  test("is visible across connections to the same file", () => {
+    const path = join(tmpdir(), `cg-governance-${crypto.randomUUID()}`, "governance.db");
+    const server = openGovernance(path, OPTIONS);
+    seedDemoSubjects(server);
+    const before = readRevision(server);
+
+    // A presenter's sqlite3 shell.
+    const shell = new Database(path);
+    shell.run("UPDATE subjects SET clearance = 100000 WHERE display_name = 'Alice'");
+    shell.close();
+
+    const after = readRevision(server);
+    server.close();
+    rmSync(dirname(path), { recursive: true, force: true });
+    expect(after).toBeGreaterThan(before);
+  });
+});
+
+describe("readPolicy", () => {
+  test("refuses a hand-edited row that no longer conforms, loudly", () => {
+    const db = fresh();
+    db.run(`UPDATE policy_rules SET subjects = '{"role": ["credit_analyst"]}' WHERE hook = 'access'`);
+    // `role` is not `roles`; the strict schema refuses it rather than treating
+    // the rule as applying to everyone.
+    expect(() => readPolicy(db)).toThrow(/role/);
+  });
+
+  test("reads back exactly what was seeded", () => {
+    const db = bare();
+    const data = loadSeed(OPTIONS);
+    const snapshot = readPolicy(db);
+    expect(snapshot.catalogue).toEqual(data.catalogue);
+    expect(snapshot.rules).toEqual([...data.policy_rules].sort((a, b) => a.priority - b.priority));
+    expect(snapshot.subjects).toEqual([]);
+    // And what `seed-demo` writes afterwards is the fixture's cast, row for row.
+    seedDemoSubjects(db);
+    expect(readPolicy(db).subjects.map((s) => s.user_id).sort()).toEqual(DEMO_PEOPLE.map((p) => p.email).sort());
+  });
+});
+
+describe("the audit log", () => {
+  test("appends and reads back in GovernanceEvent shape", () => {
+    const db = fresh();
+    const event = anEvent({
+      decision: "modify",
+      hook: "post",
+      redactions: [
+        { path: "$.bank_account_number", rule_id: "rule.redact", pattern_id: null, kind: "mask" },
+      ],
+    });
+    record(db, [event]);
+    expect(recent(db)).toEqual([event]);
+    expect(byExecution(db, "tc_1")).toEqual([event]);
+  });
+
+  test("has nowhere to put a payload: the pre-#101 write is refused by the table", () => {
+    // #101 stopped writing `before`/`after`; #103 removed the columns, so the
+    // old write is no longer a thing the database will accept at all. Stated
+    // as the insert the old code used to make, because "nothing writes it any
+    // more" is a claim about this repo and "the column is gone" is a claim
+    // about every connection — including a `sqlite3` shell on the deployment's disk.
+    const db = fresh();
+
+    expect(() =>
+      db.run(
+        `INSERT INTO audit_log
+           (id, ts, execution_id, hook, user_id, tool, decision, reason, rule_id, before, after)
+         VALUES ('evt_legacy', '2026-01-01T00:00:00.000Z', 'tc_legacy', 'post', 'alice@example.test',
+                 'LoanDesk.GetLoan', 'modify', 'Sensitive field masked.', 'rule.redact', ?, ?)`,
+        [JSON.stringify({ acct: "4738299104857" }), JSON.stringify({ acct: "***" })],
+      ),
+    ).toThrow(/no column named before/);
+
+    const columns = db
+      .query<{ name: string }, []>("PRAGMA table_info(audit_log)")
+      .all()
+      .map((row) => row.name);
+    expect(columns).not.toContain("before");
+    expect(columns).not.toContain("after");
+    // The column that replaced them is still here, and still the only place a
+    // /post modify says anything about what it removed.
+    expect(columns).toContain("redactions");
+  });
+
+  test("is append-only: the database itself refuses UPDATE and DELETE", () => {
+    const db = fresh();
+    record(db, [anEvent()]);
+    expect(() => db.run("UPDATE audit_log SET decision = 'allow'")).toThrow(/append-only/);
+    expect(() => db.run("DELETE FROM audit_log")).toThrow(/append-only/);
+    expect(auditCount(db)).toBe(1);
+  });
+
+  test("writes a batch atomically", () => {
+    const db = fresh();
+    const good = anEvent();
+    const bad = anEvent({ ts: "not a timestamp" });
+    expect(() => record(db, [good, bad])).toThrow();
+    expect(auditCount(db)).toBe(0);
+  });
+
+  test("event ids are short, unambiguous, and parseable as correlation tokens", () => {
+    const ids = new Set(Array.from({ length: 1000 }, newEventId));
+    expect(ids.size).toBe(1000);
+    for (const id of ids) expect(id).toMatch(/^evt_[0-9a-hj-km-np-tv-z]{10}$/);
+  });
+});

@@ -1,0 +1,72 @@
+# The loan desk agent
+
+A LangChain Deep Agent that runs on Managed Deep Agents (MDA) and reaches every tool through
+one Arcade gateway. It is a directory, the way MDA wants it:
+
+| File | What it is |
+| --- | --- |
+| `agent.py` | The agent: `define_deep_agent` with Arcade's middleware, nothing else. |
+| `identity.py` | Who may call it: an ID token from the app's own identity provider. |
+| `instructions.md` | The system prompt. It describes the tools and carries no limits. |
+| `scripted.py` | A model that needs no key, for a first run and for the tests. |
+| `ask.py` | Signs you in to the app and asks the agent a question from a terminal. |
+| `langchain_arcade/` | Arcade's LangChain middleware, vendored (MIT, see its `LICENSE`). |
+| `tests/` | `uv run --group dev pytest`, offline, no keys. CI runs them. |
+
+## Run it
+
+```sh
+cp .env.example .env    # then fill it in; the file says where each value comes from
+uv sync
+uv run mda dev .
+```
+
+In another terminal, from this directory:
+
+```sh
+uv run --env-file .env python ask.py "Which loan applications are pending?"
+```
+
+`ask.py` opens the app's sign-in page, catches the redirect on
+`http://127.0.0.1:8765/callback` (which `bun run setup-arcade` allowlists for the app's web
+client), trades the code for an ID token and sends the question with it. It prints each tool
+call, each tool result and the answer. `--agent <url>` sends it somewhere other than the local
+server; `AGENT_URL` in `.env` does the same.
+
+## Who the caller is
+
+`identity.py` tells MDA to accept only an ID token the app signed: issuer
+`LOAN_DESK_ISSUER`, keys at `LOAN_DESK_ISSUER/jwks`, audience `IDP_CLIENT_ID`, RS256. The
+token's `email` claim becomes the caller. The middleware reads it from the run and passes it to
+Arcade as the user id on every tool call, so the hooks see the person, never the agent. No
+token, or a token from anywhere else, and MDA answers 401 before the agent runs.
+
+## Which model
+
+With `MODEL_ID` unset the agent runs `ScriptedModel`: it selects the loan desk's search tool,
+calls `LoanDesk_SearchLoans` for pending requests and answers with what came back. That is
+enough to prove the sign-in, the gateway and the hooks with no model key.
+
+For a real model:
+
+```sh
+uv sync --extra anthropic
+```
+
+then set `MODEL_ID=anthropic:claude-sonnet-5-5` and `ANTHROPIC_API_KEY` in `.env`. Any
+provider `init_chat_model` knows works the same way, with that provider's package and key.
+
+## When a tool needs authorizing
+
+The first loan desk call, and the first Gmail or Slack call, need the caller to authorize
+that provider in Arcade. The middleware returns the authorization link as the tool's result,
+the model passes it on, and `ask.py` prints it. Open it, allow it, and ask again.
+
+## Deploy it
+
+```sh
+uv run mda deploy .
+```
+
+It reads the same `.env`. Point `ask.py` at the deployment with `--agent <deployment URL>`.
+MDA is in beta and runs on LangSmith's US cloud only.

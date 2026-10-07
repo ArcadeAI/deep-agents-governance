@@ -1,0 +1,136 @@
+{
+  "//": [
+    "The workshop's three policies, one per hook, and the demo cast. governance.db is seeded from these, merged with gate/service/approval-guards.json, when it has no schema. Edit a row live in the database, not here: this file is read once, on first boot.",
+    "$TOOLKIT is replaced at seed time with ARCADE_TOOLKIT (default LoanDesk): one deployed server, one toolkit, every tool LoanDesk_<Tool> on the wire. Tool names are PascalCase because arcade-mcp PascalCases them unconditionally (measured on #35); a rule keyed on get_loan matches nothing, and a rule that matches nothing is indistinguishable from a rule that permits.",
+    "The placeholder is the toolkit name alone, so the separator after it is yours to choose and it means something (#89). Write $TOOLKIT.ApproveLoan in a match or anywhere naming the tool as a hook payload and an audit row do; write $TOOLKIT_ApproveLoan in a pre denial's reason, because that sentence is addressed to the model and the model can only call the name its own tool list carries. The compiler enforces the difference: a reason naming a catalogued toolkit dot-spelled does not compile.",
+    "$TOOLKIT.Decide lists an argument the tool does not take: `approval`. It is not something a caller supplies — /pre resolves the request_id against approval_requests and writes the resolved facts into that key, discarding anything the caller put there. Catalogued because a rule condition may only read a catalogued argument, and optional because a request_id naming nothing must reach pre.decide-needs-a-known-request rather than be refused as a malformed call.",
+    "subjects is the demo cast, and the first boot does NOT seed it (#33): governance.db starts with no subjects and idp.db with no users. `bun run users seed-demo` adds these four with these names, roles and clearances, under whatever addresses it is given. The @bank.example addresses are how the reset and the drift check know the demo cast: a demo row at one of them is rewritten by a reset and compared by the drift check, only where it is on disk. A demo person seeded under any other address counts as a real user.",
+    "post.redact-borrower-identifiers is conditioned on clearance: Charlie and Michael read the bank account number and tax id, Alice and Bob do not, because a control that redacts for everyone demonstrates nothing about identity. It matches every $TOOLKIT tool, not GetLoan alone (#4): ApproveLoan and DenyLoan return the same whole loan record GetLoan does, and '*' covers the next tool that returns it. SearchLoans never reads the sensitive columns, so on it the rule has nothing to remove."
+  ],
+  "catalogue": {
+    "$TOOLKIT": {
+      "SearchLoans": [
+        "status?",
+        "min_amount?",
+        "max_amount?"
+      ],
+      "GetLoan": [
+        "loan_id"
+      ],
+      "ApproveLoan": [
+        "loan_id",
+        "amount"
+      ],
+      "DenyLoan": [
+        "loan_id",
+        "reason"
+      ],
+      "RequestApproval": [
+        "action",
+        "resource_id",
+        "amount",
+        "justification"
+      ],
+      "Decide": [
+        "request_id",
+        "decision",
+        "note?",
+        "approval?"
+      ]
+    }
+  },
+  "subjects": [
+    {
+      "persona": "dana",
+      "user_id": "alice@bank.example",
+      "display_name": "Alice",
+      "role": "loan_officer",
+      "clearance": 50000
+    },
+    {
+      "persona": "sam",
+      "user_id": "bob@bank.example",
+      "display_name": "Bob",
+      "role": "credit_analyst",
+      "clearance": 0
+    },
+    {
+      "persona": "riley",
+      "user_id": "charlie@bank.example",
+      "display_name": "Charlie",
+      "role": "vp_credit",
+      "clearance": 250000
+    },
+    {
+      "persona": "morgan",
+      "user_id": "michael@bank.example",
+      "display_name": "Michael",
+      "role": "chief_credit_officer",
+      "clearance": 5000000
+    }
+  ],
+  "policy_rules": [
+    {
+      "id": "access.analysts-cannot-see-approve",
+      "description": "Act 1. A credit analyst never sees the approval tool: it is absent from tools/list, not merely refused.",
+      "hook": "access",
+      "match": {
+        "toolkit": "$TOOLKIT",
+        "tool": "ApproveLoan"
+      },
+      "subjects": {
+        "roles": [
+          "credit_analyst"
+        ]
+      },
+      "effect": "deny",
+      "reason": "Credit analysts do not hold approval authority; the tool is hidden from this role.",
+      "priority": 10
+    },
+    {
+      "id": "pre.approve-within-clearance",
+      "description": "Act 2. An approval above the caller's authority is blocked, and the denial tells the model how to escalate and then retry.",
+      "hook": "pre",
+      "match": {
+        "toolkit": "$TOOLKIT",
+        "tool": "ApproveLoan"
+      },
+      "conditions": [
+        {
+          "input": "amount",
+          "operator": "exceeds_clearance"
+        }
+      ],
+      "effect": "deny",
+      "reason": "DENIED: approving {{inputs.loan_id}} for {{inputs.amount}} exceeds your approval authority of {{subject.clearance}}. To proceed, call $TOOLKIT_RequestApproval with action=approve_loan, resource_id={{inputs.loan_id}}, amount={{inputs.amount}} and justification=<why this loan should be approved>, then wait for the approval and retry $TOOLKIT_ApproveLoan with loan_id={{inputs.loan_id}} and amount={{inputs.amount}} unchanged.",
+      "priority": 100
+    }
+  ],
+  "output_rules": [
+    {
+      "id": "post.redact-borrower-identifiers",
+      "description": "Act 3. Masks the borrower's bank account number and tax id for anyone whose clearance is under 250000, on every loan tool that returns the record.",
+      "match": {
+        "toolkit": "$TOOLKIT",
+        "tool": "*"
+      },
+      "subjects": {
+        "clearance_below": 250000
+      },
+      "fields": [
+        {
+          "path": "bank_account_number",
+          "strategy": "mask",
+          "replacement": "[REDACTED]"
+        },
+        {
+          "path": "tax_id",
+          "strategy": "mask",
+          "replacement": "[REDACTED]"
+        }
+      ],
+      "reason": "Customer identifiers masked before the output reached the model.",
+      "priority": 100
+    }
+  ]
+}
