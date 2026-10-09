@@ -4,9 +4,10 @@
  * exactly as the app serves it (#5) — not by calling handlers in-process.
  *
  * Tokens are validated against a stand-in identity provider that this file
- * runs itself: it serves `/oauth2/userinfo` and knows two tokens. The real one
- * is `apps/idp` (#36); the API only ever sees that endpoint, so a fake that
- * speaks it is a complete test double.
+ * runs itself: it publishes a discovery document, serves the userinfo endpoint
+ * that document names, and knows a few tokens. The real one is Okta; the API
+ * only ever reads those two, so a fake that speaks them is a complete test
+ * double.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { Server, Subprocess } from "bun";
@@ -17,6 +18,7 @@ import { dirname, join } from "node:path";
 import type { LoanRecord, LoanSummary } from "../../api/db.ts";
 import { serveOnFreePort } from "../cdp.ts";
 import { spawnChild } from "../child.ts";
+import { answerDiscovery } from "../oidc-discovery.ts";
 
 /**
  * `Response.json()` is `Promise<unknown>`, so every read off a body below has
@@ -68,6 +70,8 @@ beforeAll(async () => {
   idp = Bun.serve({
     port: 0,
     fetch(request) {
+      const discovery = answerDiscovery(request);
+      if (discovery) return discovery;
       const { pathname } = new URL(request.url);
       if (pathname === "/oauth2/userinfo") userinfoCalls++;
       const token = /^Bearer (\S+)$/.exec(request.headers.get("authorization") ?? "")?.[1];
@@ -91,7 +95,7 @@ beforeAll(async () => {
           ...process.env,
           PORT: String(port),
           LOANS_DB_PATH: dbPath,
-          IDENTITY_HOST: `localhost:${idp.port}`,
+          IDP_ISSUER: `http://localhost:${idp.port}`,
         },
         stdout: "pipe",
         stderr: "pipe",

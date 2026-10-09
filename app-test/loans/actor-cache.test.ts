@@ -9,7 +9,8 @@
  * So these drive repeated requests through `actorFromRequest` and assert the
  * **number of calls that reach the provider**, against a stand-in that counts
  * them. Nothing here is mocked: the stand-in is a real server on a real port
- * speaking the one endpoint this module uses, the same double
+ * speaking the one endpoint this module uses (found, as in production, through
+ * the issuer's discovery document), the same double
  * `test/api.test.ts` has always used.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
@@ -23,6 +24,7 @@ import {
   RESOLUTION_TTL_MS,
   tokenFingerprint,
 } from "../../api/actor.ts";
+import { answerDiscovery } from "../oidc-discovery.ts";
 
 const ALICE = "alice@example.test";
 const BOB = "bob@example.test";
@@ -39,6 +41,8 @@ beforeAll(() => {
   idp = Bun.serve({
     port: 0,
     fetch(request) {
+      const discovery = answerDiscovery(request);
+      if (discovery) return discovery;
       const { pathname } = new URL(request.url);
       if (pathname !== "/oauth2/userinfo") return new Response("Not found", { status: 404 });
 
@@ -53,7 +57,7 @@ beforeAll(() => {
       return Response.json({ sub: email, email, email_verified: true });
     },
   });
-  idpIssuer = `localhost:${idp.port}`;
+  idpIssuer = `http://localhost:${idp.port}`;
 });
 
 afterAll(() => {
@@ -222,9 +226,12 @@ describe("what is never remembered", () => {
 
   test("a response with no email is not remembered", async () => {
     answers = {};
-    const noEmail = Bun.serve({ port: 0, fetch: () => Response.json({ sub: "someone" }) });
+    const noEmail = Bun.serve({
+      port: 0,
+      fetch: (request) => answerDiscovery(request) ?? Response.json({ sub: "someone" }),
+    });
     try {
-      await expect(actorFromRequest(read("tok-alice"), `localhost:${noEmail.port}`)).rejects.toThrow(
+      await expect(actorFromRequest(read("tok-alice"), `http://localhost:${noEmail.port}`)).rejects.toThrow(
         /does not identify an email/,
       );
       expect(rememberedKeys()).toEqual([]);

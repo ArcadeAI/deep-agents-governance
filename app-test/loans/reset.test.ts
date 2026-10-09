@@ -22,6 +22,7 @@ import { dirname, join } from "node:path";
 import type { LoanRecord } from "../../api/db.ts";
 import { serveOnFreePort } from "../cdp.ts";
 import { spawnChild } from "../child.ts";
+import { answerDiscovery } from "../oidc-discovery.ts";
 
 const RESET_TOKEN = "loan-app-reset-token-for-tests";
 const DANA = "alice@example.test";
@@ -59,7 +60,7 @@ async function boot(env: Record<string, string>): Promise<Instance> {
           ...process.env,
           PORT: String(port),
           LOANS_DB_PATH: dbPath,
-          IDENTITY_HOST: `localhost:${idp.port}`,
+          IDP_ISSUER: `http://localhost:${idp.port}`,
           ...env,
         },
         stdout: "pipe",
@@ -98,6 +99,8 @@ beforeAll(async () => {
   idp = Bun.serve({
     port: 0,
     fetch(request) {
+      const discovery = answerDiscovery(request);
+      if (discovery) return discovery;
       const { pathname } = new URL(request.url);
       const token = /^Bearer (\S+)$/.exec(request.headers.get("authorization") ?? "")?.[1];
       const email = token === undefined ? undefined : TOKENS[token];
