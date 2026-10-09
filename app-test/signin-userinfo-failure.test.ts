@@ -35,12 +35,12 @@ let userinfoAnswer: { status: number; body: string; contentType?: string } = {
   body: JSON.stringify({ sub: "alice", email: "alice@bank.example" }),
 };
 
-const idp = Bun.serve({
+const idp: Bun.Server<undefined> = Bun.serve({
   hostname: "127.0.0.1",
   port: 0,
-  async fetch(request) {
+  async fetch(request): Promise<Response> {
     const { pathname } = new URL(request.url);
-    const issuer = `http://127.0.0.1:${idp.port}/oauth2/default`;
+    const issuer: string = `http://127.0.0.1:${idp.port}/oauth2/default`;
     if (pathname === "/oauth2/default/.well-known/openid-configuration") {
       return Response.json({
         issuer,

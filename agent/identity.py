@@ -1,22 +1,23 @@
-"""Who may call the agent: whoever the loan desk's own identity provider signed in.
+"""Who may call the agent: whoever the loan desk's identity provider signed in.
 
-The app at the repo root runs Better Auth as its IdP and signs ID tokens with RS256
-(`auth/provider/auth.ts`). Callers send that ID token as `Authorization: Bearer`. MDA
-checks it against the app's published keys at `/jwks` and the web client's id, and the
-verified email becomes the caller, which `agent.py` reads as the Arcade user id.
+The loan desk signs people in through Okta (`IDP_ISSUER`), which signs ID tokens with
+RS256. Callers send that ID token as `Authorization: Bearer`. MDA checks it against the
+key set the issuer's discovery document names (`jwks_uri`) and the Okta app's client id,
+and the verified email becomes the caller, which `agent.py` reads as the Arcade user id.
 
-The issuer is `APP_PUBLIC_HOST` with its scheme, the same value the app uses
-(`issuerOf` in `auth/provider/config.ts`). The audience is the app's `IDP_CLIENT_ID`.
-Both come from this directory's `.env`; neither is a secret. The issuer has to be the
-public host, because MDA fetches `/jwks` from wherever the agent runs.
+The issuer is `IDP_ISSUER`, the same value the app uses (`LOAN_DESK_ISSUER` still works,
+the name it had before Okta). The audience is `IDP_CLIENT_ID`. Both come from this
+directory's `.env`; neither is a secret.
 
-An agent that cannot verify its callers does not start: a missing value stops the import
-with the name of the variable, rather than falling back to anything.
+An agent that cannot verify its callers does not start: a missing value, or an issuer
+whose discovery does not answer, stops the import rather than falling back to anything.
 """
 
 import os
 
 from managed_deepagents import define_identity
+
+from oidc import discover, issuer
 
 
 def required(name: str) -> str:
@@ -26,13 +27,13 @@ def required(name: str) -> str:
     return value
 
 
-ISSUER = required("LOAN_DESK_ISSUER").rstrip("/")
+ISSUER = issuer()
 
 identity = define_identity(
     auth={
         "id": "loan-desk-idp",
         "issuer": ISSUER,
-        "jwks": f"{ISSUER}/jwks",
+        "jwks": discover(ISSUER)["jwks_uri"],
         "audience": required("IDP_CLIENT_ID"),
         "algorithms": ["RS256"],
         "claims": {"user": "email", "email": "email"},
