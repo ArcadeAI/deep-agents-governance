@@ -8,15 +8,16 @@
  * loads the root `.env.local`, whose `PORT` is the app's — the same trap with
  * a different owner. Until #56 it took `PORT` from that file — the loan API's
  * port. In a worktree
- * owning 4410-4419 both processes wanted 4412, and `IDENTITY_HOST` pointed
- * at 4413 where nothing was listening. Sibling of `app-test/dev-port.test.ts`
+ * owning 4410-4419 both processes wanted 4412, and the identity provider's
+ * address pointed at 4413 where nothing was listening. Since the move to Okta
+ * that address is `IDP_ISSUER`. Sibling of `app-test/dev-port.test.ts`
  * (#50): same family of silent misbinding, different cause — that one was a
  * shell expanding `${PORT:-3000}` before anything read the file, this one read
  * the right file for the wrong service.
  *
  * The first test therefore runs the *packaged* script, verbatim, from the root
  * manifest, in a throwaway tree whose `.env.local` carries a `PORT` and an
- * `IDENTITY_HOST` that disagree. Only one of them can be the one it binds.
+ * `IDP_ISSUER` that disagree. Only one of them can be the one it binds.
  * Before #5 there were two manifests in that chain, the root's and
  * `apps/loan-app`'s; the service's is gone, and so is the one expectation that
  * read a script out of it.
@@ -33,6 +34,7 @@ import { freePort, spawnChild } from "../child.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..", "..");
 const STUB = join(REPO_ROOT, "scripts", "dev-idp.ts");
+const STAND_IN = join(REPO_ROOT, "scripts", "oidc-stand-in.ts");
 
 interface Manifest {
   scripts?: Record<string, string>;
@@ -50,13 +52,13 @@ async function manifestAt(dir: string): Promise<Manifest> {
  * entirely — a real dev server's environment is the one without it, so
  * `NODE_ENV` is not passed. And the whole question is which of the fixture
  * `.env.local`'s two values the stub picks, so neither `PORT` nor
- * `IDENTITY_HOST` may reach it from the caller: Bun lets a variable already
+ * `IDP_ISSUER` may reach it from the caller: Bun lets a variable already
  * in the environment win over the file. Measured on #50.
  *
  * An allowlist, not a list of exclusions, since round 1 of #5's review: the
  * first cut dropped `PORT` and `NODE_ENV` only, and a shell that had exported
  * the worktree's own `.env.local` (`set -a; . ./.env.local`) handed the stub
- * `IDENTITY_HOST=localhost:4443`, so it bound that and the test timed out on
+ * the worktree's identity provider address, so it bound that and the test timed out on
  * the fixture's port. Every `*_PUBLIC_HOST`, `CG_PORT_*` or anything else a
  * future fixture writes is excluded the same way, by not being on this list.
  */
@@ -79,7 +81,7 @@ afterAll(() => {
   if (project !== undefined) rmSync(project, { recursive: true, force: true });
 });
 
-test("the packaged dev:idp-stub script binds IDENTITY_HOST's port, not PORT", async () => {
+test("the packaged dev:idp-stub script binds IDP_ISSUER's port, not PORT", async () => {
   // Nothing listens on the app's port: the stub must leave it alone.
   const loanPort = freePort();
 
@@ -101,6 +103,7 @@ test("the packaged dev:idp-stub script binds IDENTITY_HOST's port, not PORT", as
     )}\n`,
   );
   cpSync(STUB, join(project, "scripts", "dev-idp.ts"));
+  cpSync(STAND_IN, join(project, "scripts", "oidc-stand-in.ts"));
 
   // The stub's port is chosen inside `serveOnFreePort`, which writes it and
   // starts the stub again on a new one if another process took it first (#9).
@@ -112,50 +115,45 @@ test("the packaged dev:idp-stub script binds IDENTITY_HOST's port, not PORT", as
     (idpPort) => {
       // The only two ports in the fixture, and they disagree on purpose: `PORT` is
       // the app's, the way `scripts/orca-setup.sh` writes the root `.env.local`.
-      writeFileSync(join(dir, ".env.local"), `PORT=${loanPort}\nIDENTITY_HOST=localhost:${idpPort}\n`);
+      writeFileSync(join(dir, ".env.local"), `PORT=${loanPort}\nIDP_ISSUER=http://localhost:${idpPort}/oauth2/default\n`);
       return spawnChild(["bun", "run", "--cwd", dir, "dev:idp-stub"], {
         env: devEnv(),
         stdout: "pipe",
         stderr: "pipe",
       });
     },
-    { ready: async (idpPort) => (await fetch(`http://127.0.0.1:${idpPort}/health`)).ok, timeoutMs: 30_000 },
+    { ready: async (idpPort) => (await fetch(`http://localhost:${idpPort}/oauth2/default/.well-known/openid-configuration`)).ok, timeoutMs: 30_000 },
   ).catch((error: unknown) => {
     throw new Error(
-      `\`${stubScript as string}\` did not answer on the port in IDENTITY_HOST.\n${(error as Error).message}`,
+      `\`${stubScript as string}\` did not answer on the port in IDP_ISSUER.\n${(error as Error).message}`,
     );
   });
   child = booted.child;
   expect(booted.port).not.toBe(loanPort);
 
-  const body = (await (await fetch(`http://127.0.0.1:${booted.port}/health`)).json()) as {
-    status?: string;
-    service?: string;
-  };
-  expect(body).toEqual({ status: "ok", service: "dev-idp" });
+  const issuer = `http://localhost:${booted.port}/oauth2/default`;
+  const body = (await (await fetch(`${issuer}/.well-known/openid-configuration`)).json()) as { issuer?: string; userinfo_endpoint?: string };
+  expect(body.issuer).toBe(issuer);
+  // The whole of its protocol: `dev:<email>` is that email.
+  const me = await fetch(body.userinfo_endpoint!, { headers: { authorization: "Bearer dev:alice@example.test" } });
+  expect(((await me.json()) as { email?: string }).email).toBe("alice@example.test");
 
   // And the other half of the bug: the app's port is still free, so `bun run
   // dev` can have it.
-  await expect(fetch(`http://127.0.0.1:${loanPort}/health`)).rejects.toThrow();
+  await expect(fetch(`http://localhost:${loanPort}/health`)).rejects.toThrow();
 }, 60_000);
 
-/**
- * Unset, the loan API validates against the app itself, `localhost:$PORT`,
- * which serves the real identity provider since #6. That is the one port the
- * stub must never take (#56), so there is no default to fall back to: until #6
- * this asserted 8083, where `apps/idp` listened.
- */
-test("a missing IDENTITY_HOST is refused, because the loan API's default is the app itself", () => {
-  expect(() => resolveStubPort({})).toThrow(/IDENTITY_HOST is not set/);
-  expect(() => resolveStubPort({ IDENTITY_HOST: "  " })).toThrow(/IDENTITY_HOST is not set/);
+/** Unset, there is no issuer to stand in for, and no port to fall back to: the #56 lesson. */
+test("a missing IDP_ISSUER is refused rather than defaulted", () => {
+  expect(() => resolveStubPort({})).toThrow(/IDP_ISSUER is not set/);
+  expect(() => resolveStubPort({ IDP_ISSUER: "  " })).toThrow(/IDP_ISSUER is not set/);
 });
 
-test("the port is read out of the host, in any of the forms IDENTITY_HOST takes", () => {
-  expect(resolveStubPort({ IDENTITY_HOST: "localhost:4413" })).toBe(4413);
-  expect(resolveStubPort({ IDENTITY_HOST: " localhost:4413 " })).toBe(4413);
-  expect(resolveStubPort({ IDENTITY_HOST: "127.0.0.1:4413" })).toBe(4413);
-  expect(resolveStubPort({ IDENTITY_HOST: "http://localhost:4413" })).toBe(4413);
-  expect(resolveStubPort({ IDENTITY_HOST: "[::1]:4413" })).toBe(4413);
+test("the port is read out of the issuer", () => {
+  expect(resolveStubPort({ IDP_ISSUER: "http://localhost:4413/oauth2/default" })).toBe(4413);
+  expect(resolveStubPort({ IDP_ISSUER: " http://localhost:4413/oauth2/default " })).toBe(4413);
+  expect(resolveStubPort({ IDP_ISSUER: "http://127.0.0.1:4413" })).toBe(4413);
+  expect(resolveStubPort({ IDP_ISSUER: "http://[::1]:4413/oauth2/default" })).toBe(4413);
 });
 
 /**
@@ -164,18 +162,14 @@ test("the port is read out of the host, in any of the forms IDENTITY_HOST takes"
  * there would be listening where nobody is calling — the #56 failure again,
  * wearing a different hat.
  */
-test("a host with no port is refused rather than defaulted", () => {
-  expect(() => resolveStubPort({ IDENTITY_HOST: "cg-idp.example.test" })).toThrow(
-    /names no port/,
-  );
-  expect(() => resolveStubPort({ IDENTITY_HOST: "https://cg-idp.example.test" })).toThrow(
-    /names no port/,
-  );
+test("an issuer with no port is refused rather than defaulted", () => {
+  expect(() => resolveStubPort({ IDP_ISSUER: "https://example.okta.com/oauth2/default" })).toThrow(/names no port/);
+  expect(() => resolveStubPort({ IDP_ISSUER: "example.okta.com" })).toThrow(/not a URL|names no port/);
 });
 
-test("the stub exits EX_CONFIG, and binds nothing, when the host names no port", async () => {
+test("the stub exits EX_CONFIG, and binds nothing, when the issuer names no port", async () => {
   const refused = spawnChild(["bun", STUB], {
-    env: devEnv({ IDENTITY_HOST: "cg-idp.example.test" }),
+    env: devEnv({ IDP_ISSUER: "https://example.okta.com/oauth2/default" }),
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -186,5 +180,5 @@ test("the stub exits EX_CONFIG, and binds nothing, when the host names no port",
   // Exit status, not just the message: a script that printed this and then
   // served anyway would pass a stderr-only assertion.
   expect(status).toBe(78);
-  expect(stderr).toContain("IDENTITY_HOST=cg-idp.example.test");
+  expect(stderr).toContain("IDP_ISSUER=https://example.okta.com/oauth2/default");
 }, 30_000);

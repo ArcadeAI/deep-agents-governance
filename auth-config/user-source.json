@@ -1,10 +1,10 @@
 {
   "name": "Loans Approval Limits",
-  "description": "The app's own sign-in (hop 1)",
+  "description": "The app's sign-in, through its identity provider (hop 1)",
   "protocol": "oidc",
-  "issuer": "https://<APP_PUBLIC_HOST>",
-  "client_id": "<ARCADE_USER_SOURCE_CLIENT_ID>",
-  "client_secret": "<ARCADE_USER_SOURCE_CLIENT_SECRET>",
+  "issuer": "<IDP_ISSUER>",
+  "client_id": "<IDP_CLIENT_ID>",
+  "client_secret": "<IDP_CLIENT_SECRET>",
   "subject_claim": "email",
   "scopes": [
     "openid",

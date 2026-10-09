@@ -44,8 +44,8 @@ export const DEFAULT_COORDINATOR_URL = "https://cloud.arcade.dev/api";
 const FORBIDDEN_HOST = "experience.arcade.dev";
 
 /**
- * The callback every User Source signs in through, which the app's
- * `arcade-user-source` client allowlists. Arcade fixes it for every User Source
+ * The callback every User Source signs in through, which `bun run okta-setup`
+ * allowlists on the app's Okta client. Arcade fixes it for every User Source
  * on Cloud, so no request sends it and no answer carries it.
  */
 export const USER_SOURCE_CALLBACK = "https://cloud.arcade.dev/oauth2/intermediate_callback";
@@ -53,7 +53,7 @@ export const USER_SOURCE_CALLBACK = "https://cloud.arcade.dev/oauth2/intermediat
 /**
  * Where `agent/ask.py` catches its sign-in: loopback, so the ID token it sends
  * the Deep Agent never leaves the machine that asked for it. Allowlisted on the
- * web client, whose id is the audience `agent/identity.py` checks.
+ * app's Okta client, whose id is the audience `agent/identity.py` checks.
  */
 export const AGENT_SIGNIN_CALLBACK = "http://127.0.0.1:8765/callback";
 
@@ -164,15 +164,15 @@ export function parseCreated(data: unknown): UserSource | null {
 }
 
 /**
- * The create request's body. The issuer is the one the app's own discovery
- * names, byte for byte: Arcade reads that document at the create and refuses
- * any other string. `protocol` and `status` are the defaults, sent so the
+ * The create request's body. The issuer is `IDP_ISSUER`, as the identity
+ * provider's discovery names it, byte for byte: Arcade reads that document at
+ * the create and refuses any other string. `protocol` and `status` are the defaults, sent so the
  * request says what it makes.
  */
 export function userSourceBody({ issuer, clientId, clientSecret }: { issuer: string; clientId: string; clientSecret: string }) {
   return {
     [SHAPE.name]: USER_SOURCE_NAME,
-    [SHAPE.description]: "The app's own sign-in (hop 1)",
+    [SHAPE.description]: "The app's sign-in, through its identity provider (hop 1)",
     [SHAPE.protocol]: "oidc",
     [SHAPE.issuer]: issuer,
     [SHAPE.clientId]: clientId,
@@ -187,8 +187,8 @@ export function userSourceBody({ issuer, clientId, clientSecret }: { issuer: str
 const sameIssuer = (a: string, b: string) => a.replace(/\/+$/, "") === b.replace(/\/+$/, "");
 
 /**
- * The User Sources that are this app's, or claim to be: the issuer is the app's
- * origin, or the client is the app's `arcade-user-source`. Each of them is held
+ * The User Sources that are this app's, or claim to be: the issuer is
+ * `IDP_ISSUER`, or the client is `IDP_CLIENT_ID`. Each of them is held
  * to the whole spec, so one that shares only its issuer or only its client is
  * a mismatch to report, never a stranger to ignore.
  */

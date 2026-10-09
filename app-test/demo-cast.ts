@@ -1,19 +1,18 @@
 /**
  * The demo cast, seeded by the tests themselves (#33).
  *
- * Until #33 the app seeded Alice, Bob, Charlie and Michael on its first boot,
- * into both `idp.db` and `governance.db`, all four under one shipped password.
- * Now a fresh start seeds nobody, and an operator adds the cast with
- * `bun run users seed-demo`, which generates their passwords. Most suites are
- * about something else — a hook, a page, the approval flow — and act as the
- * cast, so they seed it here: the same two writes `seed-demo` makes (a Better
- * Auth account through `addPerson`, a `subjects` row through `addSubject`),
- * at the fixture's own `@bank.example` addresses, with a password that exists
- * only in this file.
+ * A fresh start seeds nobody, and an operator adds the cast with
+ * `bun run users seed-demo`, which creates them in Okta and generates their
+ * passwords. Most suites are about something else (a hook, a page, the
+ * approval flow) and act as the cast, so they seed it here: the same two
+ * writes `seed-demo` makes, a person in the identity provider (here the OIDC
+ * stand-in, `scripts/oidc-stand-in.ts`) and a `subjects` row through
+ * `addSubject`, at the fixture's own `@bank.example` addresses, with a
+ * password that exists only in this file.
  *
  * `app-test/users-cli.test.ts` and `test/reset-real-users.test.ts` run the
- * real `seed-demo` end to end; this helper is for the suites that are not
- * about it.
+ * real `seed-demo` end to end, against the stand-in's Management API; this
+ * helper is for the suites that are not about it.
  */
 import { Database } from "bun:sqlite";
 import { join } from "node:path";
@@ -21,7 +20,7 @@ import { join } from "node:path";
 import fixture from "../gate/policies/governance.json" with { type: "json" };
 import { openGovernance, type SeedOptions } from "../gate/service/policy-store.ts";
 import { addSubject, readSubject } from "../gate/service/subjects.ts";
-import { addPerson, findPerson, openPeople } from "../auth/provider/db.ts";
+import type { OidcStandIn } from "../scripts/oidc-stand-in.ts";
 import { childEnv } from "./child-env.ts";
 import { spawnChild } from "./child.ts";
 
@@ -29,11 +28,14 @@ const REPO = join(import.meta.dir, "..");
 
 /**
  * The tests' own throwaway password for every demo person. Not a credential:
- * it signs in only to databases a test created, and nothing outside `app-test/`
- * and `test/` knows it. Deliberately nothing like the shipped password the app
- * had before #33, so a test still leaning on that one fails.
+ * it signs in only to a stand-in a test started, and nothing outside
+ * `app-test/` and `test/` knows it. It meets Okta's default policy (upper,
+ * lower and a digit, no part of the username), as a real one must.
  */
-export const DEMO_PASSWORD = "demo-cast-test-only-throwaway-33";
+export const DEMO_PASSWORD = "Throwaway-Cast-33";
+
+/** The Management API token the tests' stand-ins accept. Not a credential either. */
+export const TEST_OKTA_TOKEN = "test-only-ssws-token";
 
 export type DemoKey = "dana" | "sam" | "riley" | "morgan";
 
@@ -64,23 +66,9 @@ export const DEMO_CAST: Readonly<Record<DemoKey, DemoPerson>> = Object.fromEntri
 
 export const DEMO_PEOPLE: readonly DemoPerson[] = Object.values(DEMO_CAST);
 
-/**
- * The cast's identities in `idp.db`: an open database, or a path, which is
- * opened (and its schema created, as the app would) and closed again. Anybody
- * already there is left as they are, as `seed-demo` leaves them.
- */
-export async function seedDemoIdentity(target: Database | string): Promise<void> {
-  const db = typeof target === "string" ? await openPeople(target) : target;
-  try {
-    if (typeof target === "string") db.exec("PRAGMA busy_timeout = 5000");
-    for (const person of DEMO_PEOPLE) {
-      if (findPerson(db, person.email) === null) {
-        await addPerson(db, { name: person.name, email: person.email, password: person.password });
-      }
-    }
-  } finally {
-    if (typeof target === "string") db.close();
-  }
+/** The cast as people the identity provider knows. Anybody already there is left as they are, as `seed-demo` leaves them. */
+export function seedDemoIdentity(standIn: OidcStandIn): void {
+  for (const person of DEMO_PEOPLE) standIn.addPerson({ name: person.name, email: person.email, password: person.password });
 }
 
 /**
@@ -125,17 +113,24 @@ export function seedDemoGovernance(path: string, toolkits: SeedOptions = { toolk
 }
 
 /**
- * `bun run users …` itself, as an operator runs it: a subprocess against two
- * database files, with nothing else from the test's environment. For the tests
- * whose point is that a person got in the way a real one does.
+ * `bun run users …` itself, as an operator runs it: a subprocess against an
+ * Okta org (the stand-in's Management API, which must have been started with
+ * `managementToken: TEST_OKTA_TOKEN`) and a `governance.db`, with nothing else
+ * from the test's environment. For the tests whose point is that a person got
+ * in the way a real one does.
  */
 export async function runUsers(
   args: string[],
-  databases: { idp: string; governance: string },
+  target: { standIn: OidcStandIn; governance: string },
 ): Promise<{ code: number; out: string; err: string }> {
   const proc = spawnChild(["bun", "--no-env-file", join(REPO, "scripts", "users.ts"), ...args], {
     cwd: REPO,
-    env: childEnv({ IDP_DB_PATH: databases.idp, GOVERNANCE_DB_PATH: databases.governance }),
+    env: childEnv({
+      OKTA_ORG_URL: target.standIn.url,
+      OKTA_API_TOKEN: TEST_OKTA_TOKEN,
+      IDP_ISSUER: target.standIn.issuer,
+      GOVERNANCE_DB_PATH: target.governance,
+    }),
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",

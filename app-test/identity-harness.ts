@@ -1,40 +1,34 @@
 /**
  * What the identity suite runs against.
  *
- * One origin, as the app has since #6, and the line between "real" and
- * "stand-in" is drawn exactly once, at the network edge:
+ * The line between "real" and "stand-in" is drawn at the network edge:
  *
- * - **The identity provider is real, and in this process.** Opened the way the
- *   app opens it (`openIdentityProvider`), with its own client C
- *   (`IDP_OAUTH_CLIENTS=web`) whose redirect URI is this harness's own
- *   callback, and served on the web server's port under the paths the app
- *   routes to it. Every sign-in in this suite is a real authorization-code +
- *   PKCE flow against Better Auth, with a real password typed into a real
- *   login form. `prompt=login` is measured against it rather than assumed —
- *   the issue asked for that specifically. Until #6 this was `apps/idp` in a
- *   subprocess on a port of its own.
+ * - **The identity provider is the OIDC stand-in** (`scripts/oidc-stand-in.ts`),
+ *   which speaks what Okta's custom authorization server speaks: discovery,
+ *   `authorize` with a login form and an SSO cookie, `token` with PKCE and
+ *   `client_secret_basic`, `userinfo` and `keys`. One client, as in
+ *   production, whose redirect URIs are this harness's callback and the Arcade
+ *   stand-in's provider callback. Every sign-in in this suite is a real
+ *   authorization-code + PKCE flow with a password typed into a login form, and
+ *   `prompt=login` is measured against the stand-in's SSO cookie rather than
+ *   assumed.
  * - **The web UI's handlers are real, behind a real server.** `Bun.serve` on
- *   `:0`, routing to the same `auth/handlers.ts` functions `app/api/**`
- *   calls, and reaching the provider in-process as they do in the app
- *   (`auth/link.ts`). Nothing is mocked: the suite drives them with a
- *   cookie jar over HTTP and asserts on the `Set-Cookie` headers a browser
- *   would actually get.
- * - **Arcade Cloud is a stand-in, and only Arcade Cloud.** It speaks the MCP
- *   authorization discovery Arcade speaks (401 → protected-resource metadata →
- *   authorization-server metadata → dynamic registration → authorize → token),
- *   checks PKCE for real, and serves `confirm_user` and a `next_uri` whose code
- *   is single-use, the way #100 measured Better Auth's to be. It is a
- *   stand-in because the real one needs a project API key and a human's
- *   dashboard field; the shape it imitates is the one spike #04 and #75
+ *   a free port, routing to the same `auth/handlers.ts` functions `app/api/**`
+ *   calls, which reach the provider over HTTP through its discovery document as
+ *   they do in the app. Nothing is mocked: the suite drives them with a cookie
+ *   jar over HTTP and asserts on the `Set-Cookie` headers a browser would
+ *   actually get.
+ * - **Arcade Cloud is a stand-in.** It speaks the MCP authorization discovery
+ *   Arcade speaks (401 → protected-resource metadata → authorization-server
+ *   metadata → dynamic registration → authorize → token), checks PKCE for
+ *   real, and serves `confirm_user` and a `next_uri` whose code is single-use.
+ *   It is a stand-in because the real one needs a project API key and a
+ *   human's dashboard field; the shape it imitates is the one spike #04 and #75
  *   measured off the live service, hop for hop.
  *
  * Every port is `:0` and read back. This worktree owns a block of ten and the
  * reviewer's owns a different block, so nothing here may pick a number.
  */
-import { mkdirSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-
 import { readWebConfig, type WebConfig } from "../lib/config.ts";
 import {
   gatewayCallback,
@@ -44,16 +38,12 @@ import {
   signout,
   verify,
 } from "../auth/handlers.ts";
-import { childEnv } from "./child-env.ts";
-import { freePort, spawnChild } from "./child.ts";
-import { DEMO_CAST, seedDemoIdentity } from "./demo-cast.ts";
+import { freePort } from "./child.ts";
+import { DEMO_CAST, DEMO_PEOPLE, TEST_OKTA_TOKEN } from "./demo-cast.ts";
 import { forgetGatewayClients } from "../auth/gateway.ts";
-import { linkIdentity } from "../auth/link.ts";
-import { readConfig as readIdpConfig } from "../auth/provider/config.ts";
-import { isIdentityPath, openIdentityProvider } from "../auth/provider/server.ts";
+import { forgetDiscovery } from "../auth/discovery.ts";
 import { nonce, pkce } from "../auth/oidc.ts";
-
-const REPO_ROOT = join(import.meta.dir, "..");
+import { startOidcStandIn, type OidcStandIn } from "../scripts/oidc-stand-in.ts";
 
 /**
  * The four demo people, as this harness seeds them (`demo-cast.ts`): the
@@ -84,7 +74,7 @@ export const GATEWAY_ID = "cg-demo-us";
  * the port, so `localhost:<web>` and `localhost:<idp>` genuinely do share a jar
  * on a developer's machine. Imitating that is what makes "the IdP's session
  * cookie is still here when the second sign-in starts" a real condition rather
- * than one the harness arranged away — which is the whole of the `prompt=login`
+ * than one the harness arranged away, which is the whole of the `prompt=login`
  * measurement.
  */
 export class Browser {
@@ -168,15 +158,8 @@ interface ParsedForm {
 }
 
 /**
- * HTML entities, back to characters.
- *
- * A browser does this and a regex does not, and the difference is not cosmetic:
- * `apps/idp` puts the plugin's **signed** OAuth query in a hidden field, so
- * every `&` in it arrives as `&amp;`. Posting that back splits one parameter
- * into two, the signature over the canonicalised parameters no longer matches,
- * and Better Auth answers `invalid_signature` — which the login page renders as
- * "This sign-in request has expired". Cost an hour on this slice; the login
- * page is telling the truth about the symptom and nothing about the cause.
+ * HTML entities, back to characters. A browser does this and a regex does not,
+ * and a hidden field carrying a query string arrives with every `&` as `&amp;`.
  */
 function unescapeHtml(value: string): string {
   return value
@@ -330,9 +313,9 @@ export interface ArcadeStandIn {
     grant_flow_id: string | null;
     outcome: "grant" | "fresh_challenge";
   }>;
-  /** Configure the real local IdP route used by the provider leg below. */
+  /** Configure the identity provider used by the provider leg below. */
   configureIdpProvider(options: {
-    issuer: string;
+    endpoints: { authorize: string; token: string; userinfo: string };
     clientId: string;
     clientSecret: string;
     redirectUri: string;
@@ -347,13 +330,17 @@ export interface ArcadeStandIn {
   clearToolGrantsForTest(): void;
   /**
    * Make hop 1 a **User Source** gateway (#6): the gateway's authorize step
-   * sends the browser to this issuer's `/oauth2/authorize` under this client,
-   * with PKCE, before its own consent screen, the way the live gateway
-   * brokered it to `cg-idp` (spike 04's addendum) and now brokers it to the
-   * app. Off unless configured, so every other suite sees the gateway it saw
-   * before.
+   * sends the browser to this issuer's authorize endpoint under this client,
+   * with PKCE, before its own consent screen, the way the live gateway brokers
+   * it to Okta. Off unless configured, so every other suite sees the gateway
+   * it saw before.
    */
-  configureUserSource(options: { issuer: string; clientId: string; clientSecret: string }): void;
+  configureUserSource(options: {
+    issuer: string;
+    endpoints: { authorize: string; token: string };
+    clientId: string;
+    clientSecret: string;
+  }): void;
   /**
    * Every login the gateway brokered to the User Source, with what it read
    * off the ID token. `iss` is compared with the configured issuer byte for
@@ -392,12 +379,17 @@ export function startArcadeStandIn(): ArcadeStandIn {
   const parkedAuthorize = new Map<string, { query: string; verifier: string }>();
   /** Who the User Source said each gateway authorize is, by the `us` key it resumes under. */
   const userSourceSubjects = new Map<string, { email: string; login: number }>();
-  let userSource: { issuer: string; clientId: string; clientSecret: string } | null = null;
+  let userSource: {
+    issuer: string;
+    endpoints: { authorize: string; token: string };
+    clientId: string;
+    clientSecret: string;
+  } | null = null;
   const pendingProvider = new Map<string, { code: string; codeVerifier: string }>();
   const actors = new Map<string, string>();
   const grantsByUser = new Map<string, string>();
   let idpProvider: {
-    issuer: string;
+    endpoints: { authorize: string; token: string; userinfo: string };
     clientId: string;
     clientSecret: string;
     redirectUri: string;
@@ -637,7 +629,7 @@ export function startArcadeStandIn(): ArcadeStandIn {
           await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)),
         ).toString("base64url");
         parkedAuthorize.set(key, { query: url.search, verifier });
-        const brokered = new URL(`${userSource.issuer}/oauth2/authorize`);
+        const brokered = new URL(userSource.endpoints.authorize);
         brokered.search = new URLSearchParams({
           response_type: "code",
           client_id: userSource.clientId,
@@ -659,7 +651,7 @@ export function startArcadeStandIn(): ArcadeStandIn {
         const code = url.searchParams.get("code");
         if (!parked || !code) return new Response("no such user source login", { status: 400 });
         const half = (value: string) => new URLSearchParams({ v: value }).toString().slice(2);
-        const exchanged = await fetch(`${userSource.issuer}/oauth2/token`, {
+        const exchanged = await fetch(userSource.endpoints.token, {
           method: "POST",
           headers: {
             "content-type": "application/x-www-form-urlencoded",
@@ -822,7 +814,7 @@ export function startArcadeStandIn(): ArcadeStandIn {
         state.nextUriFetches.push(flowId);
 
         // In the live path Arcade exchanges the provider code after the
-        // verifier confirms the user. When a test binds a real local IdP code
+        // verifier confirms the user. When a test binds a provider code
         // to this flow, perform that same server-to-server exchange here and
         // derive the effective identity from /userinfo. The ordinary identity
         // tests do not bind a code, so their narrower stand-in behavior stays
@@ -832,7 +824,7 @@ export function startArcadeStandIn(): ArcadeStandIn {
           const basic = Buffer.from(
             `${formEncode(idpProvider.clientId)}:${formEncode(idpProvider.clientSecret)}`,
           ).toString("base64");
-          const tokenResponse = await fetch(`${idpProvider.issuer}/oauth2/token`, {
+          const tokenResponse = await fetch(idpProvider.endpoints.token, {
             method: "POST",
             headers: {
               authorization: `Basic ${basic}`,
@@ -843,7 +835,6 @@ export function startArcadeStandIn(): ArcadeStandIn {
               grant_type: "authorization_code",
               code: flow.provider.code,
               redirect_uri: idpProvider.redirectUri,
-              client_id: idpProvider.clientId,
               code_verifier: flow.provider.codeVerifier,
             }).toString(),
           });
@@ -852,7 +843,7 @@ export function startArcadeStandIn(): ArcadeStandIn {
             | null;
           let effective: string | null = null;
           if (tokenResponse.ok && typeof token?.access_token === "string") {
-            const userinfo = await fetch(`${idpProvider.issuer}/oauth2/userinfo`, {
+            const userinfo = await fetch(idpProvider.endpoints.userinfo, {
               headers: { authorization: `Bearer ${token.access_token}` },
             });
             const identity = (await userinfo.json().catch(() => null)) as { email?: string } | null;
@@ -913,157 +904,91 @@ export function startArcadeStandIn(): ArcadeStandIn {
 
 export interface IdentityHarness {
   webUrl: string;
+  /** The identity provider's issuer, as the app is configured with it. */
   idpUrl: string;
+  idp: OidcStandIn;
   arcade: ArcadeStandIn;
   config: WebConfig;
-  /** Every `[idp]` line the identity provider printed, for assertions about what it was asked. */
+  /** Every request the identity provider served, and every refusal, one per line. */
   idpLog(): Promise<string>;
   stop(): Promise<void>;
 }
 
 export interface IdentityHarnessOptions {
   /**
-   * Extra callback URLs the identity provider will accept for client C.
+   * Extra callback URLs the identity provider will accept for the app's
+   * client.
    *
    * For a suite that serves the *pages* from its own `next dev` on its own
-   * port rather than from this harness's handler server. Better Auth checks
-   * the redirect URI against the registered list and answers
-   * `invalid_redirect` otherwise — correctly, and it is not something to work
-   * around by pointing the sign-in at a server that does not serve the page
-   * under test. Reserve the port with `freePort()` first and pass the callback
-   * here.
+   * port rather than from this harness's handler server. The provider checks
+   * the redirect URI against the registered list, as Okta does, so reserve
+   * the port with `freePort()` first and pass the callback here.
    */
   extraWebRedirectUris?: readonly string[];
   /**
-   * Make the gateway a User Source gateway whose User Source is this app's own
-   * identity provider (#6): the provider gets its `arcade-user-source` client,
-   * allowlisting the stand-in's intermediate callback, and the stand-in
-   * brokers hop 1's login to it. Off by default, so a suite about something
-   * else sees the gateway it saw before.
+   * Make the gateway a User Source gateway whose User Source is the identity
+   * provider (#6): the one client also allowlists the stand-in's intermediate
+   * callback, and the stand-in brokers hop 1's login to it. Off by default, so
+   * a suite about something else sees the gateway it saw before.
    */
   userSource?: boolean;
 }
 
-/** The provider's client key for the Arcade User Source, as `.env.example` documents it. */
-export const USER_SOURCE_CLIENT = "arcade-user-source";
+/** The one client the app, the provider leg and the User Source share, as `bun run okta-setup` makes one. */
+export const HARNESS_CLIENT_ID = "0oa-identity-suite";
 
 export async function startIdentityHarness(
   options: IdentityHarnessOptions = {},
 ): Promise<IdentityHarness> {
   // Registration is a module-level cache keyed by gateway URL, and every run of
   // this harness stands a new one up on a new port. Clearing it is what keeps
-  // one suite's registration out of the next suite's flow.
+  // one suite's registration out of the next suite's flow. Discovery is cached
+  // per issuer the same way.
   forgetGatewayClients();
+  forgetDiscovery();
 
   const arcade = startArcadeStandIn();
 
-  // One origin since #6: the identity provider is part of the app, so it
-  // answers on the web server's own port, under the paths the app routes to
-  // it (`IDENTITY_PATHS`), and its issuer is the app's origin. The port is
-  // taken from the OS first and the server bound to it after the provider is
-  // configured, because the provider's issuer and client C's redirect URI
-  // both name it — the same trick, and the same reason, as binding `:0`.
   const webPort = freePort();
   const webUrl = `http://localhost:${webPort}`;
-  const idpUrl = webUrl;
 
-  const dbPath = join(tmpdir(), `cg-web-identity-${crypto.randomUUID()}`, "idp.db");
-  mkdirSync(dirname(dbPath), { recursive: true });
-
-  // The provider's environment, and the credentials script's: an allowlist
-  // (`child-env.ts`), so a developer's own IDP_* or host values
-  // never reach it — these tests are about the fixture.
-  const idpEnv: Record<string, string> = childEnv({
-    PORT: String(webPort),
-    APP_PUBLIC_HOST: `localhost:${webPort}`,
-    IDP_DB_PATH: dbPath,
-    BETTER_AUTH_SECRET: "identity-suite-idp-secret".padEnd(48, "x"),
-    // Client A stays the Arcade registration; client C is the web sign-in's
-    // own — DESIGN.md's "one OAuth client per relying party", settled on #75/#79.
-    IDP_OAUTH_CLIENTS: options.userSource ? `web,${USER_SOURCE_CLIENT}` : "web",
-    ...(options.userSource
-      ? { IDP_OAUTH_REDIRECT_URIS_ARCADE_USER_SOURCE: `${arcade.url}/oauth2/intermediate_callback` }
-      : {}),
-    IDP_OAUTH_REDIRECT_URIS_WEB: [
-      `${webUrl}/api/auth/callback`,
-      `${arcade.url}/idp/callback`,
-      ...(options.extraWebRedirectUris ?? []),
-    ].join(","),
-    NODE_ENV: "test",
+  const clientSecret = Buffer.from(crypto.getRandomValues(new Uint8Array(24))).toString("hex");
+  const idp = await startOidcStandIn({
+    people: DEMO_PEOPLE.map((person) => ({ name: person.name, email: person.email, password: person.password })),
+    clients: [
+      {
+        clientId: HARNESS_CLIENT_ID,
+        clientSecret,
+        redirectUris: [
+          `${webUrl}/api/auth/callback`,
+          `${arcade.url}/idp/callback`,
+          ...(options.userSource ? [`${arcade.url}/oauth2/intermediate_callback`] : []),
+          ...(options.extraWebRedirectUris ?? []),
+        ],
+      },
+    ],
+    managementToken: TEST_OKTA_TOKEN,
   });
-
-  // The provider runs in this process, as it does in the app, so everything it
-  // prints comes out of this process's console. The lines it prints are kept
-  // for `idpLog()` — the text `apps/idp`'s log file held until #6 — and still
-  // printed.
-  const idpLines: string[] = [];
-  const consoleLog = console.log;
-  const consoleError = console.error;
-  const keep =
-    (write: (...args: unknown[]) => void) =>
-    (...args: unknown[]) => {
-      const line = args.map(String).join(" ");
-      if (line.startsWith("[idp]")) idpLines.push(line);
-      write(...args);
-    };
-  console.log = keep(consoleLog);
-  console.error = keep(consoleError);
-
-  // Nobody is seeded at first boot (#33): the demo cast goes in the way
-  // `bun run users seed-demo` puts it, before the provider opens the file.
-  await seedDemoIdentity(dbPath);
-  const provider = await openIdentityProvider(readIdpConfig(idpEnv));
-
-  // The secret is stored hashed and cannot be printed twice (#70), so the
-  // operational path a human takes on a fresh deploy is the one taken here:
-  // rotate once, under the same client id, to obtain a readable one. The
-  // script opens the same `idp.db`, as it would beside the running app.
-  const rotate = spawnChild(
-    ["bun", join(REPO_ROOT, "scripts", "identity", "oauth-client.ts"), "--json", "--client", "web", "--rotate"],
-    { env: idpEnv, stdout: "pipe", stderr: "pipe" },
-  );
-  const [rotateOut, rotateErr, rotateCode] = await Promise.all([
-    new Response(rotate.stdout).text(),
-    new Response(rotate.stderr).text(),
-    rotate.exited,
-  ]);
-  if (rotateCode !== 0) throw new Error(`oauth-client --client web --rotate exited ${rotateCode}: ${rotateErr}`);
-  const credentials = JSON.parse(rotateOut) as {
-    clients: Array<{ key: string; client_id: string; client_secret: string | null }>;
-  };
-  const clientC = credentials.clients.find((each) => each.key === "web");
-  if (!clientC?.client_secret) throw new Error(`no readable secret for client C in:\n${rotateOut}`);
+  const idpUrl = idp.issuer;
 
   if (options.userSource) {
-    const minted = spawnChild(
-      ["bun", join(REPO_ROOT, "scripts", "identity", "oauth-client.ts"), "--json", "--client", USER_SOURCE_CLIENT, "--rotate"],
-      { env: idpEnv, stdout: "pipe", stderr: "pipe" },
-    );
-    const [out, err, code] = await Promise.all([
-      new Response(minted.stdout).text(),
-      new Response(minted.stderr).text(),
-      minted.exited,
-    ]);
-    if (code !== 0) throw new Error(`oauth-client --client ${USER_SOURCE_CLIENT} --rotate exited ${code}: ${err}`);
-    const printed = JSON.parse(out) as { clients: Array<{ key: string; client_id: string; client_secret: string | null }> };
-    const client = printed.clients.find((each) => each.key === USER_SOURCE_CLIENT);
-    if (!client?.client_secret) throw new Error(`no readable secret for ${USER_SOURCE_CLIENT} in:\n${out}`);
-    arcade.configureUserSource({ issuer: idpUrl, clientId: client.client_id, clientSecret: client.client_secret });
+    arcade.configureUserSource({
+      issuer: idp.issuer,
+      endpoints: { authorize: idp.endpoints.authorize, token: idp.endpoints.token },
+      clientId: HARNESS_CLIENT_ID,
+      clientSecret,
+    });
   }
 
-  // What the app's instance does when it opens: the web sign-in's server-side
-  // calls reach this provider in-process, never over the network.
-  linkIdentity({ fetch: provider.fetch, failure: () => null });
-
-  // The same real local IdP client is used as the provider leg in the focused
-  // hop-2 regression. The callback is a route on the Arcade stand-in, so the
-  // browser captures the authorization code there and the stand-in exchanges
-  // it through the actual `/oauth2/token` and `/oauth2/userinfo` routes during
+  // The same client is the provider leg in the focused hop-2 regression, as
+  // the `app-identity` provider is in production. The callback is a route on
+  // the Arcade stand-in, so the browser captures the authorization code there
+  // and the stand-in exchanges it at the token and userinfo endpoints during
   // next_uri finalization. No code or token is exposed by the harness API.
   arcade.configureIdpProvider({
-    issuer: idpUrl,
-    clientId: clientC.client_id,
-    clientSecret: clientC.client_secret,
+    endpoints: idp.endpoints,
+    clientId: HARNESS_CLIENT_ID,
+    clientSecret,
     redirectUri: `${arcade.url}/idp/callback`,
   });
 
@@ -1073,8 +998,9 @@ export async function startIdentityHarness(
     ARCADE_CLOUD_URL: arcade.url,
     ARCADE_GATEWAY_ID: GATEWAY_ID,
     APP_PUBLIC_HOST: `localhost:${webPort}`,
-    IDP_CLIENT_ID: clientC.client_id,
-    IDP_CLIENT_SECRET: clientC.client_secret,
+    IDP_ISSUER: idp.issuer,
+    IDP_CLIENT_ID: HARNESS_CLIENT_ID,
+    IDP_CLIENT_SECRET: clientSecret,
     SESSION_SECRET,
   });
 
@@ -1083,8 +1009,6 @@ export async function startIdentityHarness(
     idleTimeout: 30,
     fetch(request) {
       const { pathname } = new URL(request.url);
-      // The identity provider's paths, on the app's own port (#6).
-      if (isIdentityPath(pathname)) return provider.fetch(request);
       if (pathname === "/api/auth/signin") return signin(request, config);
       if (pathname === "/api/auth/callback") return signinCallback(request, config);
       if (pathname === "/api/auth/signout" && request.method === "POST") return signout(request, config);
@@ -1101,24 +1025,22 @@ export async function startIdentityHarness(
   return {
     webUrl,
     idpUrl,
+    idp,
     arcade,
     config,
-    idpLog: async () => idpLines.join("\n"),
+    idpLog: async () => idp.log.join("\n"),
     async stop() {
       web.stop(true);
       arcade.stop();
-      linkIdentity(undefined);
-      provider.close();
-      console.log = consoleLog;
-      console.error = consoleError;
-      rmSync(dirname(dbPath), { recursive: true, force: true });
+      idp.stop();
+      forgetDiscovery();
     },
   };
 }
 
 /**
- * Mint a provider authorization code in the real local IdP, retaining it only
- * inside the Arcade stand-in until a flow's `next_uri` is finalized.
+ * Mint a provider authorization code at the identity provider, retaining it
+ * only inside the Arcade stand-in until a flow's `next_uri` is finalized.
  */
 export async function prepareProviderCode(
   browser: Browser,
@@ -1127,7 +1049,7 @@ export async function prepareProviderCode(
 ): Promise<{ authorizationState: string; codeVerifier: string }> {
   const { verifier, challenge } = await pkce();
   const authorizationState = nonce();
-  const authorize = new URL(`${harness.idpUrl}/oauth2/authorize`);
+  const authorize = new URL(harness.idp.endpoints.authorize);
   authorize.search = new URLSearchParams({
     response_type: "code",
     client_id: harness.arcade.providerClientIdForTest(),
@@ -1152,14 +1074,14 @@ export async function prepareProviderCode(
 
 /**
  * Sign a persona in from scratch: press their button, land on the IdP, type the
- * password, accept consent if it is offered, and come back.
+ * password, and come back.
  *
  * Returns where the chain ended, so a caller can assert it reached hop 1 rather
  * than an error page.
  */
 export async function signInAs(
   browser: Browser,
-  /** Where sign-in starts: this harness, or since #6 a booted app that is its own identity provider. */
+  /** Where sign-in starts: this harness, or a booted app. */
   harness: Pick<IdentityHarness, "webUrl">,
   persona: PersonaKey,
   options: { from?: string; stopAt?: string } = {},
@@ -1169,9 +1091,9 @@ export async function signInAs(
     options.from ?? `${harness.webUrl}/api/auth/signin?persona=${persona}`,
     (fields) => {
       const filled: Record<string, string> = { ...fields };
-      // The login form asks for an identifier and a password; the consent form
-      // does not. Filling by shape rather than by page means this helper does
-      // not have to know how many pages the IdP decided to show.
+      // The login form asks for an identifier and a password; a consent form,
+      // if a provider shows one, does not. Filling by shape rather than by page
+      // means this helper does not have to know how many pages it showed.
       if ("email" in fields) {
         filled.email = person.email;
         filled.password = person.password;

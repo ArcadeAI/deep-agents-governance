@@ -12,20 +12,20 @@
  *    context. Then, before anything is written, **one read-only call** under
  *    them with the key, `GET …/plugins`: a 401, 403 or 404 means the key and
  *    the resolved project disagree, and the run stops (#30).
- * 3. **Reads** the hop-2 provider `app-identity` back from Arcade. It is
+ * 3. **Reads the identity provider** from `.env`: `IDP_ISSUER`, `IDP_CLIENT_ID`
+ *    and `IDP_CLIENT_SECRET`, which `bun run okta-setup` writes. One blank stops
+ *    the run, naming that command. The authorize, token and userinfo endpoints
+ *    come from `IDP_ISSUER`'s discovery document, never from a spelled path.
+ * 4. **Reads** the hop-2 provider `app-identity` back from Arcade. It is
  *    create-only (DESIGN.md → "Arcade config is read-only"): if it exists and
  *    differs from what this app needs, the differences are printed and the run
  *    stops, having written nothing.
- * 4. **Mints** the app's three OAuth clients in `idp.db`: `arcade` (hop 2),
- *    `arcade-user-source` (hop 1) and `web` (the app's own sign-in).
  * 5. **Fills in `.env`**, blanks only, never overwriting: `APP_PUBLIC_HOST`,
- *    `SESSION_SECRET`, `BETTER_AUTH_SECRET`, `ARCADE_HOOK_SIGNING_SECRET`, `APPROVALS_STORE_TOKEN`,
- *    `IDP_OAUTH_CLIENTS` and the clients' redirect URIs, `IDP_CLIENT_ID` and
- *    `IDP_CLIENT_SECRET`, `ARCADE_GATEWAY_ID` and `GOVERNANCE_STREAM=hooks`.
- *    One exception (#54): an `IDP_CLIENT_ID` that is not `idp.db`'s web client,
- *    as after `idp.db` was deleted, is rewritten with its secret, before step 3's
- *    comparison can stop the run. That client is the app's own sign-in, and
- *    nothing in Arcade holds it.
+ *    `SESSION_SECRET`, `ARCADE_HOOK_SIGNING_SECRET`, `APPROVALS_STORE_TOKEN`,
+ *    `ARCADE_GATEWAY_ID` and `GOVERNANCE_STREAM=hooks`. Then
+ *    `ARCADE_PROVIDER_CALLBACK`, the callback Arcade made for the provider,
+ *    kept in step with Arcade; `bun run okta-setup` allowlists it on the Okta
+ *    app, and the run says to rerun that whenever it changes.
  * 6. **Registers by API**: the provider, the tool secrets `APP_PUBLIC_HOST`
  *    and `APPROVALS_STORE_TOKEN`, the custom verifier, and the contextual
  *    access hooks (#30), each read back. The hooks are created **disabled**
@@ -40,18 +40,15 @@
  *    on** (#52), the one-click path, through the Coordinator API
  *    (`setup-arcade/coordinator.ts`, `ARCADE_COORDINATOR_URL`, default
  *    `https://cloud.arcade.dev/api`, never experience.arcade.dev):
- *    - The project's User Sources are listed. One whose issuer is the app's
- *      origin, or whose client is the app's `arcade-user-source`, is held to
- *      the issuer, the client id, the `email` subject claim and the scopes: it
- *      matches and is used, or it differs and the run stops (exit 1), naming
- *      each difference, with no gateway and the hooks as they were.
- *    - With none, the run waits, on a terminal only, for the developer to
- *      start `bun run dev` and the tunnel. On Enter it reads the issuer from
- *      the app's `/.well-known/openid-configuration` through it, byte for
- *      byte, and has Arcade check that issuer (`POST …/user_sources/test_issuer`,
- *      which saves nothing). A failure of either, a 422 from Arcade with its
- *      reason, asks again. Then it creates the User Source, the
- *      `arcade-user-source` secret rotated unless this run minted it.
+ *    - The project's User Sources are listed. One whose issuer is `IDP_ISSUER`,
+ *      or whose client is `IDP_CLIENT_ID`, is held to the issuer, the client
+ *      id, the `email` subject claim and the scopes: it matches and is used,
+ *      or it differs and the run stops (exit 1), naming each difference, with
+ *      no gateway and the hooks as they were.
+ *    - With none, Arcade checks the issuer (`POST …/user_sources/test_issuer`,
+ *      which saves nothing). It reads the identity provider's discovery, not
+ *      the app's, so the app does not have to be up. Then the User Source is
+ *      created with `IDP_CLIENT_ID` and `IDP_CLIENT_SECRET`.
  *    - The User Source, found or created, is read back by id: active, and
  *      this app's, or the run stops as for one that differs.
  *    - The gateway is created through it (`POST …/gateways`, the nine tools,
@@ -61,9 +58,8 @@
  *      not is said plainly, with the gateway form and the rerun that finishes.
  *    - **The fallback** (#48): a Coordinator call that fails, or answers a
  *      shape this script does not expect (a 401 or a 404 is said to be the
- *      key or the project), an issuer check this Coordinator does not have,
- *      `n` or Ctrl-C at the wait, or stdin that is not a terminal prints one
- *      line naming which, then the #48 flow,
+ *      key or the project), or an issuer check this Coordinator does not have
+ *      or that Arcade refuses, prints one line naming which, then the #48 flow,
  *      unchanged: `GET …/gateways`, never written, under the slug the gateway
  *      form names. Not there (the first run): the hooks stay disabled, and the
  *      run ends on the User Source form, then the gateway form, then the
@@ -85,9 +81,10 @@
  * `--dry-run` writes nothing and sends nothing: it prints every request a real
  * run would make from the state on disk, in order, with the key and every
  * secret as a placeholder. Sending nothing, it cannot ask Arcade whether the
- * provider exists, so it infers it: `.env`'s `IDP_OAUTH_REDIRECT_URIS_ARCADE`
- * holds the callback Arcade returns when it creates the provider, and `idp.db`
- * holds the clients (#28). Which registration goes which way, and the spec
+ * provider exists, so it infers it: `.env`'s `ARCADE_PROVIDER_CALLBACK` holds
+ * the callback Arcade returns when it creates the provider (#28). Nor does it
+ * read the identity provider's discovery, so the endpoints are placeholders
+ * too. Which registration goes which way, and the spec
  * path of each call, is in `scripts/setup-arcade/arcade.ts`.
  * `app-test/setup-arcade.test.ts` runs this against a local stand-in, with the
  * Arcade CLI faked on `PATH` and its context faked in a throwaway `HOME`. Its
@@ -101,7 +98,9 @@
  * from elsewhere, and writes only to `.env`.
  */
 import { existsSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
+
+import { discover } from "../auth/discovery.ts";
 
 import {
   ArcadeAdmin,
@@ -139,10 +138,7 @@ import {
   coordinatorUrl,
   failureLine,
   readinessDifferences,
-  USER_SOURCE_CALLBACK,
-  AGENT_SIGNIN_CALLBACK,
   USER_SOURCE_NAME,
-  USER_SOURCE_SCOPES,
   reported,
   type UserSource,
   userSourceBody,
@@ -153,7 +149,6 @@ import { fillBlanks, MANAGED_KEYS, parseEnv, readEnvFile, replaceValue, shellCon
 import { gatewayForm, hooksForm, hooksOnCommand, type NextSteps, nextSteps, userSourceForm } from "./setup-arcade/forms.ts";
 import { serverName } from "./setup-arcade/toolkit.ts";
 
-const CLIENT_KEYS = ["arcade", "arcade-user-source", "web"] as const;
 /**
  * The gateway slug when neither `--gateway` nor `ARCADE_GATEWAY_ID` names one.
  *
@@ -232,8 +227,8 @@ for (const source of [localEnv, fileEnv]) {
   for (const [key, value] of Object.entries(source)) if (process.env[key] === undefined) process.env[key] = value;
 }
 // What the app would see, frozen before this run adds its own values to
-// `process.env` for the identity module below. Used for the settings this run
-// only reads (`ARCADE_API_URL`, `PORT`, `IDP_DB_PATH`, the toolkit names).
+// `process.env`. Used for the settings this run only reads (`ARCADE_API_URL`,
+// `PORT`, the toolkit names).
 const loaded: Record<string, string | undefined> = { ...process.env };
 const effective = (key: string): string => loaded[key]?.trim() ?? "";
 /**
@@ -242,7 +237,7 @@ const effective = (key: string): string => loaded[key]?.trim() ?? "";
  * because the file is what this run writes and what `bun run dev` reads. On
  * the fourth live run the shell still exported an old `.env`, the shell won,
  * and the run reported "nothing to fill" into a fresh `.env`: the app then
- * booted with no BETTER_AUTH_SECRET, and the provider was created with the
+ * booted with no secret of its own, and the provider was created with the
  * shell's old client. `shellConflicts` below refuses that state instead.
  */
 const fromFile = (key: string): string => fileEnv[key]?.trim() ?? "";
@@ -313,15 +308,6 @@ if (effective(RETIRED) !== "") {
 // sent if it names the dashboard's own proxy; the run then falls back to the
 // dashboard forms (#48).
 const coordinatorBase = coordinatorUrl(effective("ARCADE_COORDINATOR_URL"));
-/**
- * Whether the run may pause for the developer before it creates the User
- * Source (#52): only with a terminal on stdin. Otherwise the run falls back to
- * the dashboard forms rather than wait on a pipe nobody writes to.
- * `CG_SETUP_ARCADE_TTY=1` is the test harness's stand-in for a terminal, read
- * from the shell only, never from `.env`.
- */
-const interactive = process.stdin.isTTY === true || shellEnv.CG_SETUP_ARCADE_TTY === "1";
-
 // The org and project the hooks and the gateway are registered in (#30).
 const resolution = resolveContext(loaded);
 const scope: (ArcadeContext & ProjectScope) | null = resolution.context;
@@ -342,14 +328,25 @@ if (scope !== null) {
 }
 const toolkit = effective("ARCADE_TOOLKIT") || "LoanDesk";
 
-const configuredClients = fromFile("IDP_OAUTH_CLIENTS");
-if (configuredClients !== "") {
-  const listed = configuredClients.split(",").map((each) => each.trim());
-  const missing = CLIENT_KEYS.filter((key) => key !== "arcade" && !listed.includes(key));
-  if (missing.length > 0) {
-    fail(`IDP_OAUTH_CLIENTS=${configuredClients} leaves out ${missing.join(", ")}. Add ${missing.length === 1 ? "it" : "them"}, or blank it.`);
-  }
+// The identity provider, as `bun run okta-setup` wrote it. The same client
+// signs people in to the app, is hop 2's provider, and is hop 1's User Source.
+const idp = {
+  issuer: fromFile("IDP_ISSUER").replace(/\/+$/, ""),
+  clientId: fromFile("IDP_CLIENT_ID"),
+  clientSecret: fromFile("IDP_CLIENT_SECRET"),
+};
+const idpBlank = (["IDP_ISSUER", "IDP_CLIENT_ID", "IDP_CLIENT_SECRET"] as const).filter((key) => fromFile(key) === "");
+if (idpBlank.length > 0 && !dryRun) {
+  fail(
+    `${idpBlank.join(", ")} ${idpBlank.length === 1 ? "is" : "are"} blank in .env. Run \`bun run okta-setup\` first: it makes the Okta app ` +
+      "and writes them (README → Create your Okta org).",
+  );
 }
+if (dryRun) {
+  idp.issuer ||= "<IDP_ISSUER, from bun run okta-setup>";
+  idp.clientId ||= "<IDP_CLIENT_ID, from bun run okta-setup>";
+}
+out(`  identity      ${idp.issuer}, client ${idp.clientId}`);
 
 /** A value this run needs: what the app already has, else a fresh one. */
 function secretFor(key: string): { value: string; generated: boolean } {
@@ -361,35 +358,24 @@ function secretFor(key: string): { value: string; generated: boolean } {
 }
 
 const sessionSecret = secretFor("SESSION_SECRET");
-// The identity provider's own secret (#9). On a public host it refuses the
-// published development one, and it must exist before the clients are minted
-// below: `oauth-client` reads the same configuration the provider boots on.
-const identitySecret = secretFor("BETTER_AUTH_SECRET");
 const hookToken = secretFor("ARCADE_HOOK_SIGNING_SECRET");
 const storeToken = secretFor("APPROVALS_STORE_TOKEN");
 // Optional: the room's copy of every approval request (.env.example).
 const approvalsChannel = effective("SLACK_APPROVALS_CHANNEL") || "";
 
-/** Everything this run writes to `.env`, before the clients are minted. */
+/** Everything this run writes to `.env`, blanks only. */
 const planned: Record<string, string> = {
   APP_PUBLIC_HOST: host,
   SESSION_SECRET: sessionSecret.value,
-  BETTER_AUTH_SECRET: identitySecret.value,
   ARCADE_HOOK_SIGNING_SECRET: hookToken.value,
   APPROVALS_STORE_TOKEN: storeToken.value,
-  IDP_OAUTH_CLIENTS: CLIENT_KEYS.join(","),
-  IDP_OAUTH_REDIRECT_URIS_WEB: `${origin}/api/auth/callback,${AGENT_SIGNIN_CALLBACK}`,
-  IDP_OAUTH_REDIRECT_URIS_ARCADE_USER_SOURCE: USER_SOURCE_CALLBACK,
   ARCADE_GATEWAY_ID: slug,
   // Arcade calls the hooks from here on, so the panel watches them rather
   // than the fixture replay a blank value means under `next dev`.
   GOVERNANCE_STREAM: "hooks",
 };
-// The identity module reads these from the environment when it mints. The
-// host is always this run's: an `.env.local` naming localhost must not make
-// it mint for another issuer.
 // Every managed variable is `.env`'s value or this run's, whatever .env.local
-// or the shell had.
+// or the shell had, and the host is always this run's.
 for (const key of MANAGED_KEYS) {
   const value = fromFile(key) || planned[key];
   if (value) process.env[key] = value;
@@ -399,8 +385,8 @@ process.env.APP_PUBLIC_HOST = host;
 
 const admin = new ArcadeAdmin(apiUrl, apiKey, dryRun, out);
 const coordinator = coordinatorBase.url === null ? null : new Coordinator(coordinatorBase.url, apiKey, dryRun, out);
-/** Set once the app answered through the tunnel after this run wrote .env: the steps left then skip starting it (#52). */
-let appConfirmed = false;
+/** Set when this run wrote a new provider callback, which Okta does not allowlist until `okta-setup` runs again. */
+let oktaRerun = false;
 
 /**
  * The forms left for the dashboard, and the steps after them. The last thing
@@ -409,7 +395,6 @@ let appConfirmed = false;
  * gateway's, and the run exits `code`.
  */
 function finish(
-  userSource: { clientId: string; clientSecret: string | null },
   gateway: NextSteps["gateway"],
   registered: UserSource | null = null,
   code = 0,
@@ -424,7 +409,7 @@ function finish(
   }
   if (gateway !== "enabled") {
     if (registered === null) {
-      out(userSourceForm({ origin, ...userSource }));
+      out(userSourceForm({ issuer: idp.issuer, clientId: idp.clientId }));
       out();
     }
     out(gatewayForm({ slug, toolkit, ...(registered === null ? {} : { userSourceId: registered.id }) }));
@@ -435,7 +420,7 @@ function finish(
   }
   out();
   out(
-    nextSteps({ host, origin, port: effective("PORT") || "3000", gateway, deployed: !skipDeploy, userSourceReady: registered !== null, appRunning: appConfirmed }),
+    nextSteps({ host, origin, port: effective("PORT") || "3000", gateway, deployed: !skipDeploy, userSourceReady: registered !== null, oktaRerun }),
   );
   if (gateway === "needs-gateway") {
     out(`\nOnce the gateway ${slug} exists, turn the hooks on with the same command:`);
@@ -461,45 +446,22 @@ function deployLine(dir: string): string {
 
 // --- Dry run: the whole sequence, nothing sent ------------------------------
 
-/** `.env` has the app's own sign-in client, so a real run leaves the `web` client's secret alone. */
-const webConfigured = fromFile("IDP_CLIENT_ID") !== "" && fromFile("IDP_CLIENT_SECRET") !== "";
 if (dryRun) {
   // What a real run would find, read off the disk alone: a dry run sends
-  // nothing, so it cannot ask Arcade (#28). `IDP_OAUTH_REDIRECT_URIS_ARCADE`
-  // is written only from the callback Arcade returns when it creates the
-  // provider, and `idp.db` is where the clients are minted.
-  const idpDb = resolve(cwd, effective("IDP_DB_PATH") || "./idp.db");
-  const clientsOnDisk = existsSync(idpDb);
-  const callbackRecorded = fromFile("IDP_OAUTH_REDIRECT_URIS_ARCADE") !== "";
-  const registered = clientsOnDisk && callbackRecorded;
+  // nothing, so it cannot ask Arcade (#28). `ARCADE_PROVIDER_CALLBACK` is
+  // written only from the callback Arcade returns when it creates the provider.
+  const registered = fromFile("ARCADE_PROVIDER_CALLBACK") !== "";
 
   const keys = Object.keys(planned).filter((key) => fromFile(key) === "");
-  if (!webConfigured) keys.push("IDP_CLIENT_ID", "IDP_CLIENT_SECRET");
-  if (!callbackRecorded) keys.push("IDP_OAUTH_REDIRECT_URIS_ARCADE (with the callback Arcade generates for the provider)");
+  if (!registered) keys.push("ARCADE_PROVIDER_CALLBACK (with the callback Arcade generates for the provider)");
   out(
     `\n.env${envExists ? "" : " (created from .env.example)"}: ` +
       (keys.length > 0 ? `would fill ${keys.join(", ")}` : "nothing to fill: every value is already set, and none is overwritten"),
   );
-  if (fromFile("IDP_CLIENT_ID") !== "") {
-    out(
-      clientsOnDisk
-        ? "  and if idp.db's web client is not IDP_CLIENT_ID, would rewrite IDP_CLIENT_ID and IDP_CLIENT_SECRET to it, with a new secret"
-        : "  and would rewrite IDP_CLIENT_ID and IDP_CLIENT_SECRET: with no idp.db, a real run mints a new web client, and .env follows it",
-    );
+  if (idpBlank.length > 0) {
+    out(`  warning       ${idpBlank.join(", ")} ${idpBlank.length === 1 ? "is" : "are"} blank: a real run stops here. Run \`bun run okta-setup\` first.`);
   }
-  if (!clientsOnDisk) {
-    out(`idp.db: would mint the OAuth clients ${CLIENT_KEYS.join(", ")}`);
-    if (callbackRecorded) {
-      out(
-        `  warning       .env records the provider's callback, but there is no ${idpDb}: a real run mints new clients, ` +
-          `and a provider Arcade still holds names the old arcade client, so the run stops at the comparison`,
-      );
-    }
-  } else {
-    const rotated = [...(registered ? [] : ["arcade (the provider is created with it)"]), ...(webConfigured ? [] : ["web (.env has no IDP_CLIENT_ID and IDP_CLIENT_SECRET)"])];
-    out(`idp.db: already holds the OAuth clients; each keeps its id, and a missing one is minted`);
-    out(rotated.length > 0 ? `  a new secret, under the same id, for ${rotated.join(" and ")}` : "  no secret is minted or rotated");
-  }
+  out(`identity: a real run reads ${idp.issuer}/.well-known/openid-configuration for the provider's endpoints`);
 
   out(`\nRequests, in order (${apiUrl}):`);
   if (scope !== null) {
@@ -509,15 +471,19 @@ if (dryRun) {
   const registration: Registration = {
     host,
     origin,
-    arcadeClientId: "<the arcade client id in idp.db>",
-    arcadeClientSecret: clientsOnDisk ? "<a new secret for the arcade client, rotated by this run>" : "<the arcade client secret, minted by this run>",
+    endpoints: {
+      authorize: "<authorization_endpoint from IDP_ISSUER's discovery>",
+      token: "<token_endpoint from IDP_ISSUER's discovery>",
+      userinfo: "<userinfo_endpoint from IDP_ISSUER's discovery>",
+    },
+    clientId: idp.clientId,
+    clientSecret: "<IDP_CLIENT_SECRET from .env>",
     approvalsStoreToken: storeToken.generated ? storeToken.value : "<APPROVALS_STORE_TOKEN from .env>",
   };
   await admin.request("GET", `/v1/admin/auth_providers/${PROVIDER_ID}`);
   if (registered) {
     out("    (expected 200: .env holds the callback Arcade made for this provider. It is compared, a difference stops");
-    out("    the run, and nothing is created. If Arcade answers 404 instead, a real run mints a new secret for the");
-    out("    arcade client and creates the provider with it.)");
+    out("    the run, and nothing is created. If Arcade answers 404 instead, a real run creates the provider.)");
   } else {
     out("    (404: the provider is created below. 200: it is compared, and a difference stops the run.)");
     await admin.request("POST", "/v1/admin/auth_providers", providerBody(registration));
@@ -548,20 +514,11 @@ if (dryRun) {
   if (scope !== null && coordinator !== null) {
     out(`    (the User Source, through the Coordinator API at ${coordinator.baseUrl}:)`);
     await coordinator.list(scope);
-    out(`    (searched for the issuer ${origin} and the arcade-user-source client. One that differs stops the run, and`);
-    out("    one that matches is used. With none, the run waits for you to start `bun run dev` and the tunnel. On Enter");
-    out(`    it reads the issuer from ${origin}/.well-known/openid-configuration through the tunnel, and has Arcade check it:)`);
-    const discovered = `<the issuer ${origin}/.well-known/openid-configuration names>`;
-    await coordinator.testIssuer(scope, discovered);
-    out("    (204 creates it. A 422 prints Arcade's reason and asks again:)");
-    await coordinator.create(
-      scope,
-      userSourceBody({
-        issuer: discovered,
-        clientId: "<the arcade-user-source client id in idp.db>",
-        clientSecret: clientsOnDisk ? "<a new secret for the arcade-user-source client, rotated by this run>" : "<its secret, minted by this run>",
-      }),
-    );
+    out(`    (searched for the issuer ${idp.issuer} and the client ${idp.clientId}. One that differs stops the run, and`);
+    out("    one that matches is used. With none, Arcade checks the issuer:)");
+    await coordinator.testIssuer(scope, idp.issuer);
+    out("    (204 creates it. Anything else falls back to the dashboard forms, with Arcade's reason:)");
+    await coordinator.create(scope, userSourceBody({ issuer: idp.issuer, clientId: idp.clientId, clientSecret: "<IDP_CLIENT_SECRET from .env>" }));
     out("    (then the one found or created is read back by id, and must be active and this app's:)");
     await coordinator.get(scope, "<user_source_id>");
   }
@@ -579,7 +536,7 @@ if (dryRun) {
       await admin.request("PATCH", projectPath(scope, "/plugins/<plugin_id>"), pluginPatch(origin, hookToken.generated ? hookToken.value : "<ARCADE_HOOK_SIGNING_SECRET from .env>", "active"));
       await admin.request("GET", projectPath(scope, "/plugins/<plugin_id>"));
       await admin.request("GET", projectPath(scope, "/hooks?plugin_id=<plugin_id>"));
-      out("    (If a Coordinator call fails, if you answer n at the pause, or if stdin is not a terminal, the run says which,");
+      out("    (If a Coordinator call fails, or Arcade refuses the issuer, the run says which,");
       out("    sends none of the User Source or gateway writes above, and falls back to the dashboard forms (#48): the");
       out(`    gateway ${slug} is only looked for, the hooks stay disabled, and the forms below are left.)`);
     } else {
@@ -601,44 +558,19 @@ if (dryRun) {
     out("\nWith the User Source and the gateway made by API, nothing is left for the dashboard. If the run falls back,");
     out("it ends on these forms instead:");
   }
-  finish(
-    { clientId: "<the arcade-user-source client id in idp.db>", clientSecret: clientsOnDisk ? null : "<its secret, minted by this run>" },
-    scope === null ? "form" : "needs-gateway",
-  );
+  finish(scope === null ? "form" : "needs-gateway");
 }
 
 // --- 2. The provider is read back before anything is written ----------------
 
-/**
- * The identity module's own tool, `bun run oauth-client`, as a subprocess.
- * Only the identity module mints (DESIGN.md → Services;
- * `app-test/identity/only-identity-mints.test.ts`), so this script never
- * imports the provider: it runs the same command a human would, with the
- * environment this run has built, and reads its `--json`.
- */
-interface MintedClient {
-  key: string;
-  client_id: string;
-  client_secret: string | null;
-  created: boolean;
-  redirect_uris: string[];
+// The identity provider's endpoints, from its own discovery document: nothing here spells an Okta path.
+let endpoints: Registration["endpoints"];
+try {
+  const document = await discover(idp.issuer);
+  endpoints = { authorize: document.authorization_endpoint, token: document.token_endpoint, userinfo: document.userinfo_endpoint };
+} catch (error) {
+  fail(`reading ${idp.issuer}/.well-known/openid-configuration failed: ${(error as Error).message}. Is IDP_ISSUER the issuer \`bun run okta-setup\` wrote?`);
 }
-async function oauthClient(...args: string[]): Promise<MintedClient[]> {
-  const run = Bun.spawn(["bun", "--no-env-file", join(import.meta.dir, "identity", "oauth-client.ts"), "--json", ...args], {
-    cwd,
-    env: process.env,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const [stdout, stderr, code] = await Promise.all([new Response(run.stdout).text(), new Response(run.stderr).text(), run.exited]);
-  if (code !== 0) fail(`bun run oauth-client ${args.join(" ")} exited ${code}:\n${stderr}`);
-  const printed = (JSON.parse(stdout) as { clients: MintedClient[] }).clients;
-  // A secret is printed only by the call that minted it, and every later call
-  // lists that client again with none: keep each one this run has seen.
-  for (const each of printed) if (each.client_secret !== null) minted.set(each.key, each.client_secret);
-  return printed.map((each) => ({ ...each, client_secret: minted.get(each.key) ?? null }));
-}
-const minted = new Map<string, string>();
 
 out(`\nArcade (${apiUrl}):`);
 
@@ -667,82 +599,23 @@ if (existingProvider.status !== 200 && existingProvider.status !== 404) {
 }
 const providerExists = existingProvider.status === 200;
 
-// --- 3. The OAuth clients ---------------------------------------------------
-
-let clients = await oauthClient();
-const client = (key: string) => {
-  const found = clients.find((each) => each.key === key);
-  if (!found) fail(`bun run oauth-client printed no ${key} client`);
-  return found;
-};
-
-// `web`: the app's own sign-in client. Nothing in Arcade holds it, so when
-// .env names another client than idp.db's, .env follows idp.db (#54): its
-// IDP_CLIENT_ID and IDP_CLIENT_SECRET are rewritten, the one exception to
-// blanks-only besides the provider's callback. Until #54 this was a warning
-// and exit 0, and the sign-in failed with invalid_client: the state that
-// deleting idp.db and rerunning this command, as the identity module's own
-// advice says, leaves behind. Before the provider is compared, so a provider
-// that still names the deleted idp.db's arcade client, which stops the run,
-// does not also leave the sign-in broken.
-const staleWebClient = fromFile("IDP_CLIENT_ID") !== "" && fromFile("IDP_CLIENT_ID") !== client("web").client_id;
-if (staleWebClient) {
-  const secret = await secretOf("web", true);
-  if (secret === null) fail("bun run oauth-client --client web --rotate printed no secret");
-  const id = client("web").client_id;
-  envText = replaceValue(replaceValue(envText, "IDP_CLIENT_ID", id), "IDP_CLIENT_SECRET", secret);
-  writeEnvFile(envPath, envText);
-  fileEnv.IDP_CLIENT_ID = process.env.IDP_CLIENT_ID = id;
-  fileEnv.IDP_CLIENT_SECRET = process.env.IDP_CLIENT_SECRET = secret;
-  out(`
-.env:`);
-  out(`  rewrote  IDP_CLIENT_ID, IDP_CLIENT_SECRET  (.env named a web client idp.db does not hold; now idp.db's ${id},`);
-  out(`           with a new secret, not shown. It is the app's own sign-in client, and nothing in Arcade holds it.`);
-  out(`           Restart \`bun run dev\` if it is running.)`);
-}
-
 if (providerExists) {
-  const desired = providerBody({ host, origin, arcadeClientId: client("arcade").client_id, arcadeClientSecret: "", approvalsStoreToken: "" });
+  const desired = providerBody({ host, origin, endpoints, clientId: idp.clientId, clientSecret: "", approvalsStoreToken: "" });
   const differences = providerDifferences(existingProvider.json, desired);
   if (differences.length > 0) {
     out(`\nThe provider ${PROVIDER_ID} already exists in this Arcade project, and it is not what this app needs:`);
     for (const line of differences) out(`  - ${line}`);
     fail(
-      `nothing was changed in Arcade${staleWebClient ? "" : " or in .env"}. This command never edits an existing provider (DESIGN.md: ` +
-        `Arcade config is read-only). Correct it in the dashboard, or delete it there and run this again.` +
-        (staleWebClient ? "\n  .env's IDP_CLIENT_ID and IDP_CLIENT_SECRET were rewritten above, so the app's own sign-in works; nothing else in .env changed." : ""),
+      "nothing was changed in Arcade or in .env. This command never edits an existing provider (DESIGN.md: " +
+        "Arcade config is read-only). Correct it in the dashboard, or delete it there and run this again.",
     );
   }
   out(`  the provider ${PROVIDER_ID} is already registered and matches; it is left as it is`);
 }
 
-/** The secret a client needs this run, minting a new one only where nothing registered depends on the old. */
-async function secretOf(key: string, rotate: boolean): Promise<string | null> {
-  const current = client(key);
-  if (current.client_secret !== null) return current.client_secret;
-  if (!rotate) return null;
-  clients = await oauthClient("--client", key, "--rotate");
-  return client(key).client_secret;
-}
-
-// `arcade`: rotated only when the provider is about to be created with it.
-const arcadeSecret = await secretOf("arcade", !providerExists);
-// `web`: its credentials live in .env, so rotating is safe whenever .env has none.
-// Already rewritten above when .env named another client.
-const webSecret = webConfigured || staleWebClient ? null : await secretOf("web", true);
-// `arcade-user-source`: shown when minted now; never rotated behind a User Source that may exist.
-// Rotated only when the Coordinator API shows this project has none for the app, right before one is created with it (#52).
-let userSourceSecret = client("arcade-user-source").client_secret;
-
 // --- 4. .env, blanks only ---------------------------------------------------
 
-const toWrite: Record<string, string> = {};
-for (const [key, value] of Object.entries(planned)) toWrite[key] = value;
-if (webSecret !== null) {
-  toWrite.IDP_CLIENT_ID = client("web").client_id;
-  toWrite.IDP_CLIENT_SECRET = webSecret;
-}
-let filled = fillBlanks(envText, toWrite);
+let filled = fillBlanks(envText, planned);
 writeEnvFile(envPath, filled.text);
 out(`\n.env${envExists ? "" : " (created from .env.example)"}:`);
 out(`  filled   ${filled.written.join(", ") || "(nothing to fill: every value was already set)"}`);
@@ -753,8 +626,9 @@ if (filled.kept.length > 0) out(`  kept     ${filled.kept.join(", ")}  (already 
 const registration: Registration = {
   host,
   origin,
-  arcadeClientId: client("arcade").client_id,
-  arcadeClientSecret: arcadeSecret ?? "",
+  endpoints,
+  clientId: idp.clientId,
+  clientSecret: idp.clientSecret,
   approvalsStoreToken: storeToken.value,
 };
 
@@ -768,7 +642,7 @@ async function step<T>(what: string, run: () => Promise<T>, hint?: (error: unkno
       `${what} failed: ${(error as Error).message}\n` +
         (said ? `Arcade says: ${said}\n` : "") +
         (advice ? `${advice}\n` : "") +
-        `.env and idp.db keep what this run wrote, so running the same command again picks up from here.`,
+        `.env keeps what this run wrote, so running the same command again picks up from here.`,
     );
   }
 }
@@ -779,32 +653,30 @@ if (!providerExists) {
 }
 
 // Arcade generates the provider's callback, one per provider (measured in the
-// custom-verifier spike: `…/oauth/<id>/callback`), and the `arcade` client must
+// custom-verifier spike: `…/oauth/<id>/callback`), and the Okta app must
 // allowlist it exactly.
 //
-// The live provider is the source of truth for IDP_OAUTH_REDIRECT_URIS_ARCADE,
-// the one variable this run replaces rather than only fills (#30). On run 4,
-// app-identity was recreated, so Arcade made a new callback, and `.env` still
-// named the old provider's: the run only warned, Arcade then sent the new one,
-// and the identity provider refused it (invalid_redirect) at hop 2's Authorize.
+// The live provider is the source of truth for ARCADE_PROVIDER_CALLBACK, which
+// this run replaces rather than only fills (#30). On run 4, app-identity was
+// recreated, so Arcade made a new callback, and `.env` still named the old
+// provider's: the identity provider then refused it (invalid_redirect) at hop
+// 2's Authorize. `bun run okta-setup` reads it from `.env` and adds it to the
+// Okta app's redirect URIs, so a changed one is a rerun of that command.
 const callback = (provider as { oauth2?: { redirect_uri?: string } } | null)?.oauth2?.redirect_uri;
-const CALLBACK_KEY = "IDP_OAUTH_REDIRECT_URIS_ARCADE";
+const CALLBACK_KEY = "ARCADE_PROVIDER_CALLBACK";
 const onFileCallback = fromFile(CALLBACK_KEY);
-if (callback && (onFileCallback !== callback || !client("arcade").redirect_uris.includes(callback))) {
-  if (onFileCallback === "") {
-    filled = fillBlanks(filled.text, { [CALLBACK_KEY]: callback });
-  } else if (onFileCallback !== callback) {
-    filled = { ...filled, text: replaceValue(filled.text, CALLBACK_KEY, callback) };
-  }
+if (callback && onFileCallback !== callback) {
+  filled =
+    onFileCallback === "" ? fillBlanks(filled.text, { [CALLBACK_KEY]: callback }) : { ...filled, text: replaceValue(filled.text, CALLBACK_KEY, callback) };
   writeEnvFile(envPath, filled.text);
   process.env[CALLBACK_KEY] = callback;
-  // Brings the client's allowlist in line in place; the id and secret do not change.
-  clients = await oauthClient();
+  oktaRerun = true;
   out(
-    onFileCallback !== "" && onFileCallback !== callback
-      ? `  replaced the provider's callback: ${onFileCallback} -> ${callback}`
-      : `  allowlisted the provider's callback on the arcade client: ${callback}`,
+    onFileCallback !== ""
+      ? `  replaced the provider's callback in .env: ${onFileCallback} -> ${callback}`
+      : `  wrote the provider's callback to .env: ${callback}`,
   );
+  out("  Okta does not allowlist it until you run `bun run okta-setup` again (the steps at the end say how)");
 }
 for (const secret of toolSecrets(host, storeToken.value, approvalsChannel)) {
   const { method, path, body } = secretRequest(secret);
@@ -1043,111 +915,6 @@ async function dashboardFlow(scope: ProjectScope, hooks: { id: string; status: H
 type Fallback = { fallback: string };
 
 /**
- * The app's own OIDC discovery through the public host, which Arcade reads at
- * the create (#52): the issuer it names, byte for byte, which is what the
- * create must send, or what is wrong, in one line. Wrong: no answer, not
- * JSON, an issuer that is not the app's origin (an app started before `.env`
- * was written), or a `scopes_supported` without one of the scopes the User
- * Source asks for. `CG_SETUP_ARCADE_ISSUER_URL` is the test harness's
- * stand-in for the tunnel, read from the shell only, never from `.env`.
- */
-async function appDiscovery(): Promise<{ issuer: string } | { problem: string }> {
-  const base = (shellEnv.CG_SETUP_ARCADE_ISSUER_URL?.trim() || origin).replace(/\/+$/, "");
-  const url = `${base}/.well-known/openid-configuration`;
-  let response: Response;
-  try {
-    // ngrok's free-domain warning page is for browsers; this header skips it for anything else.
-    response = await fetch(url, { headers: { accept: "application/json", "ngrok-skip-browser-warning": "1" }, signal: AbortSignal.timeout(10_000) });
-  } catch (error) {
-    return { problem: `GET ${url} failed: ${(error as Error).message}. Is the tunnel up, pointing at the app's port?` };
-  }
-  const raw = await response.text();
-  if (response.status !== 200) {
-    return {
-      problem: `GET ${url} answered ${response.status}${response.status === 503 ? ": the app's sign-in did not start (start `bun run dev` again, so it reads the new .env)" : ""}`,
-    };
-  }
-  let document: { issuer?: unknown; scopes_supported?: unknown } | null;
-  try {
-    document = JSON.parse(raw) as typeof document;
-  } catch {
-    return { problem: `GET ${url} answered 200 with a body that is not JSON: is the tunnel pointing at this app?` };
-  }
-  const issuer = document?.issuer;
-  if (typeof issuer !== "string" || issuer.replace(/\/+$/, "") !== origin) {
-    return {
-      problem: `GET ${url} names the issuer ${JSON.stringify(issuer) ?? "nothing"}, not ${origin}: stop \`bun run dev\` and start it again, so it reads APP_PUBLIC_HOST from .env`,
-    };
-  }
-  const supported = document?.scopes_supported;
-  if (Array.isArray(supported)) {
-    const missing = USER_SOURCE_SCOPES.filter((scope) => !supported.includes(scope));
-    if (missing.length > 0) {
-      return {
-        problem: `GET ${url} does not publish the scope${missing.length > 1 ? "s" : ""} ${missing.join(", ")} in scopes_supported, which the User Source asks for: is an older app still running?`,
-      };
-    }
-  }
-  return { issuer };
-}
-
-/**
- * The one reader of stdin for the whole run, made at the first question: the
- * lines typed so far and not yet answered (typed ahead, or piped), whoever is
- * waiting for the next one, and whether stdin has ended.
- */
-interface Prompt {
-  rl: import("node:readline").Interface;
-  lines: string[];
-  waiting: ((line: string | null) => void) | null;
-  ended: boolean;
-}
-let prompt: Prompt | null = null;
-
-/**
- * One line from the terminal, or `null` for no (`n`), the end of stdin, or
- * Ctrl-C (#52). Ctrl-C is caught for the question alone, so it falls back to
- * the forms instead of leaving the run half-printed. Stdin that is not a
- * terminal does not echo the Enter, so the line break is printed for it.
- */
-async function ask(question: string): Promise<string | null> {
-  if (prompt === null) {
-    const { createInterface } = await import("node:readline");
-    const rl = createInterface({ input: process.stdin, terminal: process.stdin.isTTY === true });
-    const state: Prompt = { rl, lines: [], waiting: null, ended: false };
-    const give = (line: string | null) => {
-      const waiting = state.waiting;
-      state.waiting = null;
-      if (waiting) waiting(line);
-      else if (line !== null) state.lines.push(line);
-    };
-    rl.on("line", (line) => give(line));
-    rl.on("SIGINT", () => give(null));
-    rl.once("close", () => {
-      state.ended = true;
-      give(null);
-    });
-    prompt = state;
-  }
-  const state = prompt;
-  if (state.lines.length === 0 && state.ended) return null;
-  process.stdout.write(question);
-  const answer = await new Promise<string | null>((resolve) => {
-    const queued = state.lines.shift();
-    if (queued !== undefined) return resolve(queued);
-    const interrupted = () => resolve(null);
-    process.once("SIGINT", interrupted);
-    state.waiting = (line) => {
-      process.removeListener("SIGINT", interrupted);
-      resolve(line);
-    };
-  });
-  state.waiting = null;
-  if (process.stdin.isTTY !== true || answer === null) out();
-  return answer === null || /^\s*n(o)?\s*$/i.test(answer) ? null : answer;
-}
-
-/**
  * What is left when the User Source is registered and the gateway is not
  * (#52): said plainly, then the gateway form alone, and exit 1. The hooks are
  * left as they were, so no gateway runs ungoverned by this run's doing.
@@ -1157,7 +924,7 @@ function gatewayNotCreated(source: UserSource, createdNow: boolean, hooks: { sta
   out(`\nThe User Source ${source.id} is registered (${createdNow ? "created by this run" : "it was there already"}), and the gateway is not, so the hooks`);
   out(`are left ${hooks.status === "active" ? "on" : "disabled"}. What is left: run this same command again, which finds the User Source and creates the`);
   out("gateway through it, or fill in the gateway form below and then run this command again to turn the hooks on.");
-  finish({ clientId: client("arcade-user-source").client_id, clientSecret: null }, "needs-gateway", source, 1);
+  finish("needs-gateway", source, 1);
 }
 
 /**
@@ -1170,7 +937,7 @@ function gatewayNotCreated(source: UserSource, createdNow: boolean, hooks: { sta
 async function oneClick(scope: ProjectScope, hooks: { id: string; status: HooksStatus }): Promise<"enabled" | Fallback> {
   if (coordinator === null) return { fallback: `coordinator: ${"why" in coordinatorBase ? coordinatorBase.why : "none"}` };
   out(`\nThe User Source (${coordinator.baseUrl}):`);
-  const want: UserSourceSpec = { issuer: origin, clientId: client("arcade-user-source").client_id };
+  const want: UserSourceSpec = { issuer: idp.issuer, clientId: idp.clientId };
   const listed = await coordinator.list(scope);
   if (!listed.ok) return { fallback: failureLine(listed) };
   const hooksLeft = `the hooks are left ${hooks.status === "active" ? "on" : "disabled"}`;
@@ -1192,56 +959,22 @@ async function oneClick(scope: ProjectScope, hooks: { id: string; status: HooksS
   }
   if (claimants.length === 1) {
     found = claimants[0]!;
-    out(`  user source: found ${found.name ?? USER_SOURCE_NAME} (${found.id}), issuer ${origin}, client ${want.clientId}; it matches and is left as it is`);
+    out(`  user source: found ${found.name ?? USER_SOURCE_NAME} (${found.id}), issuer ${want.issuer}, client ${want.clientId}; it matches and is left as it is`);
   } else {
-    out(`  user source: there is none for ${origin} in this project yet. Arcade reads the app's sign-in through the tunnel`);
-    out("  when it creates one, so the app has to be up behind it first.");
-    if (!interactive) {
-      return {
-        fallback: "user source: not created, because stdin is not a terminal, so this run cannot wait for you to start `bun run dev` and the tunnel",
-      };
-    }
-    const port = effective("PORT") || "3000";
-    for (;;) {
-      // The human's wording (#52): the app starts after .env is written, so there is nothing to restart.
-      const answer = await ask(
-        `\n  Now start the app and the tunnel, in two other terminals: bun run dev, and ngrok http --url=${host} ${port}.\n` +
-        `  (Or both in one: bun run up.)\n` +
-          "  Press Enter when both are running (n, or Ctrl-C, ends on the dashboard forms instead): ",
-      );
-      if (answer === null) return { fallback: "user source: not created, at your answer, so none of it is sent" };
-      // The issuer as the app names it, byte for byte: the create compares the two so.
-      const discovery = await appDiscovery();
-      if ("problem" in discovery) {
-        out(`  ${discovery.problem}`);
-        continue;
-      }
-      want.issuer = discovery.issuer;
-      // Arcade's own check, the create's without the save: a 422 is the app or the tunnel not up yet, as Arcade sees it.
-      const checked = await coordinator.testIssuer(scope, discovery.issuer);
-      if (checked.ok) break;
-      if (checked.code === 422) {
-        out(`  Arcade cannot use the issuer ${discovery.issuer} yet: ${checked.msg ?? "(no reason given)"}`);
-        continue;
-      }
+    out(`  user source: there is none for ${want.issuer} in this project yet; Arcade checks the issuer, then it is created`);
+    // Arcade's own check, the create's without the save. It reads the identity provider's discovery, not the app's.
+    const checked = await coordinator.testIssuer(scope, want.issuer);
+    if (!checked.ok) {
       if (checked.code === 404 || checked.code === 405) {
         return { fallback: `coordinator: ${checked.call} answered ${checked.status}, so this Coordinator cannot check the issuer before the create` };
       }
+      if (checked.code === 422) return { fallback: `user source: Arcade cannot use the issuer ${want.issuer}: ${checked.msg ?? "(no reason given)"}` };
       return { fallback: failureLine(checked) };
     }
-    prompt?.rl.close();
-    out(`  the app answers for ${want.issuer} through the tunnel, and Arcade can use it`);
-    // The client's secret goes to Arcade in the create, and only there: a
-    // client minted by this run already has one, and an older one is rotated,
-    // which is safe because no User Source in this project uses it.
-    const secret = userSourceSecret ?? (await secretOf("arcade-user-source", true));
-    userSourceSecret = secret;
-    if (secret === null) fail("bun run oauth-client --client arcade-user-source --rotate printed no secret");
-    const created = await coordinator.create(scope, userSourceBody({ issuer: want.issuer, clientId: want.clientId, clientSecret: secret }));
+    const created = await coordinator.create(scope, userSourceBody({ issuer: want.issuer, clientId: want.clientId, clientSecret: idp.clientSecret }));
     if (!created.ok) return { fallback: failureLine(created) };
     found = created.value;
     createdNow = true;
-    appConfirmed = true;
   }
 
   // Read back by id, found or created: the gateway create checks only the id's shape, not that it is there, active and this app's.
@@ -1333,4 +1066,4 @@ if (scope !== null && hooks !== null) {
     gatewayState = await dashboardFlow(scope, hooks);
   }
 }
-finish({ clientId: client("arcade-user-source").client_id, clientSecret: userSourceSecret }, gatewayState);
+finish(gatewayState);

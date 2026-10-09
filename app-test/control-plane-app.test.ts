@@ -26,7 +26,8 @@ import { HealthResponse } from "@cg/policy-schema";
 
 import { serveOnFreePort, stopProcess, type Booted } from "./cdp.ts";
 import { spawnChild } from "./child.ts";
-import { seedDemoGovernance, seedDemoIdentity } from "./demo-cast.ts";
+import { appIdentityEnv, stopAppIdentities } from "./app-identity.ts";
+import { seedDemoGovernance } from "./demo-cast.ts";
 import { loanFixture } from "./control-plane/loan-fixture.ts";
 import { openEventStream } from "./control-plane/sse-reader.ts";
 
@@ -50,6 +51,7 @@ async function bootApp(env: Record<string, string> = {}): Promise<App> {
   const cleanup = () => {
     rmSync(data, { recursive: true, force: true });
     for (const distDir of distDirs) rmSync(join(ROOT, distDir), { recursive: true, force: true });
+    stopAppIdentities();
   };
   // The port is chosen inside `serveOnFreePort`, which starts the app again on
   // a new one if another process took it first (#9); each attempt gets its own
@@ -61,11 +63,12 @@ async function bootApp(env: Record<string, string> = {}): Promise<App> {
         const dir = join(data, String(port));
         mkdirSync(dir);
         // A first boot seeds nobody (#33): the demo cast this file acts as goes
-        // into both files first, the way `bun run users seed-demo` writes it.
+        // into `governance.db` first, and into the identity provider (an OIDC
+        // stand-in), the way `bun run users seed-demo` writes them.
         seedDemoGovernance(join(dir, "governance.db"), {
           toolkit: env.ARCADE_TOOLKIT ?? process.env.ARCADE_TOOLKIT?.trim() ?? "LoanDesk",
         });
-        await seedDemoIdentity(join(dir, "idp.db"));
+        const identity = await appIdentityEnv(`http://127.0.0.1:${port}`);
         const distDir = `.next/cg-test-${port}`;
         distDirs.push(distDir);
         return spawnChild(["bun", "scripts/next.ts", "dev"], {
@@ -78,9 +81,8 @@ async function bootApp(env: Record<string, string> = {}): Promise<App> {
             // The app holds the loan book too since #5; this one's, not a loans.db
             // in the repo.
             LOANS_DB_PATH: join(dir, "loans.db"),
-            // And the identity provider since #6: not a `./idp.db` in the repo.
-            IDP_DB_PATH: join(dir, "idp.db"),
-            APP_PUBLIC_HOST: `127.0.0.1:${port}`,
+            // Not the developer's Okta org: a stand-in of this run's own.
+            ...identity.env,
             GOVERNANCE_STREAM: "hooks",
             NEXT_TELEMETRY_DISABLED: "1",
             ...env,

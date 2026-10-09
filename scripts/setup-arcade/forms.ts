@@ -24,28 +24,26 @@
 import { healthCheckUrl, HOOKS_NAME, HOOK_POINTS } from "./arcade.ts";
 
 export interface UserSourceForm {
-  origin: string;
+  /** `IDP_ISSUER`. */
+  issuer: string;
+  /** `IDP_CLIENT_ID`. */
   clientId: string;
-  /** `null` when the client already existed and was not rotated on this run. */
-  clientSecret: string | null;
 }
 
-export function userSourceForm({ origin, clientId, clientSecret }: UserSourceForm): string {
+/** The client secret is `.env`'s `IDP_CLIENT_SECRET`, named here and never printed, like the hooks' bearer below. */
+export function userSourceForm({ issuer, clientId }: UserSourceForm): string {
   return [
     "┌─ Arcade dashboard → your project → User Sources → Create User Source",
     "│  Name            Loans Approval Limits",
-    "│  Description     The app's own sign-in (hop 1)",
-    `│  Issuer URL      ${origin}`,
+    "│  Description     The app's sign-in, through its identity provider (hop 1)",
+    `│  Issuer URL      ${issuer}`,
     `│  Client ID       ${clientId}`,
-    `│  Client Secret   ${
-      clientSecret ??
-      "(unchanged, and not shown: it is stored hashed. If you have not created this User Source yet, run `bun run oauth-client --client arcade-user-source --rotate` and paste the secret it prints.)"
-    }`,
+    "│  Client Secret   IDP_CLIENT_SECRET from .env (not shown here)",
     "│  Advanced → Scopes          openid profile email",
     "│  Advanced → Subject Claim   email          ← not the default `sub`",
     "│",
     "│  Its callback, https://cloud.arcade.dev/oauth2/intermediate_callback, is already",
-    "│  allowlisted on the app's `arcade-user-source` client.",
+    "│  allowlisted on the app's Okta client by `bun run okta-setup`.",
     "└─",
   ].join("\n");
 }
@@ -127,6 +125,11 @@ export interface NextSteps {
   userSourceReady?: boolean;
   /** True when the app answered through the tunnel after this run wrote .env (#52): starting it is not a step left. */
   appRunning?: boolean;
+  /**
+   * True when Okta does not allowlist the provider's callback yet: this run
+   * wrote a new `ARCADE_PROVIDER_CALLBACK`, and `bun run okta-setup` adds it.
+   */
+  oktaRerun?: boolean;
 }
 
 /** The second run, which turns the hooks on once the gateway exists: the same command as the first. */
@@ -138,14 +141,18 @@ export function hooksOnCommand(host: string): string {
  * What is left once the run has registered everything it can, in the README
  * Quickstart's order (steps 5 and 6), which `app-test/setup-arcade.test.ts`
  * pins against the README itself (#11). The order is not a preference, and
- * since #48 it is the one the dashboard allows: Arcade reads the User Source's
- * issuer from the app, so the app and the tunnel are up before that form; the
- * gateway authenticates through the User Source, so it comes next; its form
+ * since #48 it is the one the dashboard allows: Okta has to allowlist the
+ * provider's callback before anybody grants hop 2; the User Source reads its
+ * issuer from Okta; the gateway authenticates through the User Source, so it
+ * comes next; its form
  * lists the toolkits' tools only once they are deployed and while the hooks
  * are disabled; so the hooks are turned on last, by the second run.
  */
-export function nextSteps({ host, origin, port, gateway, deployed, userSourceReady = false, appRunning = false }: NextSteps): string {
+export function nextSteps({ host, origin, port, gateway, deployed, userSourceReady = false, appRunning = false, oktaRerun = false }: NextSteps): string {
   const steps = [
+    ...(oktaRerun
+      ? ['Allowlist the provider\'s callback on the Okta app: OKTA_API_TOKEN="op://<vault>/<item>/<field>" op run -- bun run okta-setup']
+      : []),
     ...(appRunning
       ? []
       : ["Start `bun run dev` (or restart it, if it is already running), so the app reads the new .env.", `Start the tunnel: ngrok http --url=${host} ${port}`]),
@@ -155,7 +162,7 @@ export function nextSteps({ host, origin, port, gateway, deployed, userSourceRea
     ...(gateway === "enabled"
       ? []
       : [
-          ...(userSourceReady ? [] : ["With the app reachable through the tunnel, fill in the User Source form above."]),
+          ...(userSourceReady ? [] : ["Fill in the User Source form above."]),
           "Fill in the gateway form above. It authenticates through the User Source, and lists the toolkits' tools once they are deployed.",
         ]),
     ...(gateway === "needs-gateway" ? [`Turn the hooks on: run ${hooksOnCommand(host)} again.`] : []),

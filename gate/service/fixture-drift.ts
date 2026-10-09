@@ -71,7 +71,7 @@ const ROW_KEY: Record<PolicyTable, (row: Record<string, unknown>) => string> = {
  * still named too, because nothing adds or removes those on purpose.
  *
  * Who can sign in without a subject, or has a subject and cannot sign in, is
- * a different question with its own answer: `user-drift.ts`.
+ * a different question with its own answer: `bun run users list`.
  */
 const OPERATOR_ROWS: ReadonlySet<PolicyTable> = new Set(["subjects"]);
 

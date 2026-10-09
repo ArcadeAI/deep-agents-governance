@@ -16,6 +16,16 @@ import { serverName } from "../scripts/setup-arcade/toolkit.ts";
 const REPO = join(import.meta.dir, "..");
 const HOST = "<APP_PUBLIC_HOST>";
 const ORIGIN = `https://${HOST}`;
+/**
+ * The identity provider's endpoints, in Okta's shape under `<IDP_ISSUER>`.
+ * Another provider's come from its discovery document.
+ */
+const ISSUER = "<IDP_ISSUER>";
+const ENDPOINTS = {
+  authorize: `${ISSUER}/v1/authorize`,
+  token: `${ISSUER}/v1/token`,
+  userinfo: `${ISSUER}/v1/userinfo`,
+};
 
 /** `loan_desk` as Arcade prefixes its tools: `LoanDesk` (`mcp/loan_desk/app.py`). */
 const TOOLKIT = serverName(join(REPO, "mcp"))!
@@ -27,15 +37,16 @@ const read = (name: string) => JSON.parse(readFileSync(join(REPO, "auth-config",
 
 const EXPECTED: Record<string, unknown> = {
   "user-source.json": userSourceBody({
-    issuer: ORIGIN,
-    clientId: "<ARCADE_USER_SOURCE_CLIENT_ID>",
-    clientSecret: "<ARCADE_USER_SOURCE_CLIENT_SECRET>",
+    issuer: ISSUER,
+    clientId: "<IDP_CLIENT_ID>",
+    clientSecret: "<IDP_CLIENT_SECRET>",
   }),
   "app-identity-provider.json": providerBody({
     host: HOST,
     origin: ORIGIN,
-    arcadeClientId: "<ARCADE_CLIENT_ID>",
-    arcadeClientSecret: "<ARCADE_CLIENT_SECRET>",
+    endpoints: ENDPOINTS,
+    clientId: "<IDP_CLIENT_ID>",
+    clientSecret: "<IDP_CLIENT_SECRET>",
     approvalsStoreToken: "",
   }),
   "custom-verifier.json": verifierBody(ORIGIN),

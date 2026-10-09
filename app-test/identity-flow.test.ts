@@ -1,20 +1,22 @@
 /**
- * Sign-in, the gateway hop, and the custom verifier — over real HTTP, against a
- * real `apps/idp`.
+ * Sign-in, the gateway hop, and the custom verifier, over real HTTP, against
+ * an OIDC identity provider standing in for Okta.
  *
  * What is real and what stands in is stated in `identity-harness.ts` and is
- * worth restating because the value of this suite depends on it: the identity
- * provider is the actual service, booted as a subprocess with its own client C;
- * the route handlers are the actual handlers, mounted behind an actual server
- * and driven with a cookie jar; and the only stand-in is Arcade Cloud, at the
- * network edge, speaking the discovery and confirmation chain spikes #04 and
- * #75 measured off the live service.
+ * worth restating because the value of this suite depends on it: the route
+ * handlers are the actual handlers, mounted behind an actual server and driven
+ * with a cookie jar, and they find every identity endpoint through
+ * `IDP_ISSUER`'s discovery document, as they do against Okta. Two things stand
+ * in at the network edge: the identity provider (`scripts/oidc-stand-in.ts`,
+ * shaped like an Okta custom authorization server) and Arcade Cloud, speaking
+ * the discovery and confirmation chain spikes #04 and #75 measured off the
+ * live service.
  *
  * The measurements this suite exists to make, rather than assume:
  *
- *  - which host renders the login page (cg-idp's, never Arcade's)
- *  - that `prompt=login` actually forces re-authentication on Better Auth, so a
- *    persona switch cannot silently continue as the previous persona
+ *  - which host renders the login page (the identity provider's, never Arcade's)
+ *  - that `prompt=login` is sent and forces re-authentication, so a persona
+ *    switch cannot silently continue as the previous persona
  *  - that `confirm_user` receives the email from the sealed session and nothing
  *    from the request
  *  - that `next_uri` is fetched server-side, without which the grant does not
@@ -35,12 +37,10 @@ import {
   type IdentityHarness,
 } from "./identity-harness.ts";
 import { bootTestControlPlane } from "./control-plane-instance.ts";
-import { openTestIdentity } from "./identity-instance.ts";
 import { openTestLoanBook } from "./loan-module-instance.ts";
 
 bootTestControlPlane();
 openTestLoanBook();
-await openTestIdentity();
 
 /** Put `process.env` back exactly as it was, including keys that were unset. */
 function restoreEnv(previous: NodeJS.ProcessEnv, keys: string[]) {
@@ -90,26 +90,25 @@ function sessionOf(browser: Browser) {
 
 describe("signing in as a person", () => {
   /**
-   * #176's third criterion, against the real IdP.
+   * #176's third criterion, against the identity provider.
    *
    * The bank's chrome renders **one** `Sign in` and its href is this path with
    * nothing on it — no persona hint, because there are no persona buttons left
    * to have pressed. What has to still be true is the thing that was always the
-   * point: the browser lands on **cg-idp's** login page, and the person who
+   * point: the browser lands on **the identity provider's** login page, and the person who
    * comes back is whoever types a password there.
    *
    * The literal is imported rather than typed, so this and
    * `components/identity/SessionChrome.tsx` cannot drift into testing different
    * addresses.
    */
-  test("the chrome's one Sign in lands on cg-idp's login page, with no persona chosen", async () => {
+  test("the chrome's one Sign in lands on the identity provider's login page, with no persona chosen", async () => {
     const browser = new Browser();
     const started = await browser.fetch(`${harness.webUrl}${SIGNIN_PATH}`);
 
     expect(started.status).toBe(303);
     const authorize = new URL(started.headers.get("location")!);
-    expect(authorize.origin).toBe(harness.idpUrl);
-    expect(authorize.pathname).toBe("/oauth2/authorize");
+    expect(`${authorize.origin}${authorize.pathname}`).toBe(harness.idp.endpoints.authorize);
     expect(authorize.searchParams.get("client_id")).toBe(harness.config.identity.idpClientId);
     expect(authorize.searchParams.get("redirect_uri")).toBe(`${harness.webUrl}/api/auth/callback`);
     // Still forced re-authentication, so a browser that was somebody a moment
@@ -117,7 +116,7 @@ describe("signing in as a person", () => {
     expect(authorize.searchParams.get("prompt")).toBe("login");
 
     const landed = await browser.follow(authorize.toString(), (fields) => fields, { limit: 4 });
-    expect(new URL(landed.url).origin).toBe(harness.idpUrl);
+    expect(new URL(landed.url).origin).toBe(new URL(harness.idpUrl).origin);
     expect(landed.html).toContain("Sign in");
   });
 
@@ -127,9 +126,8 @@ describe("signing in as a person", () => {
 
     expect(started.status).toBe(303);
     const authorize = new URL(started.headers.get("location")!);
-    // The IdP's own origin, and the IdP's own authorize endpoint.
-    expect(authorize.origin).toBe(harness.idpUrl);
-    expect(authorize.pathname).toBe("/oauth2/authorize");
+    // The authorize endpoint the issuer's discovery document names.
+    expect(`${authorize.origin}${authorize.pathname}`).toBe(harness.idp.endpoints.authorize);
     expect(authorize.searchParams.get("client_id")).toBe(harness.config.identity.idpClientId);
     expect(authorize.searchParams.get("redirect_uri")).toBe(`${harness.webUrl}/api/auth/callback`);
     expect(authorize.searchParams.get("code_challenge_method")).toBe("S256");
@@ -137,7 +135,7 @@ describe("signing in as a person", () => {
 
     // Follow it and see who actually rendered a form.
     const landed = await browser.follow(authorize.toString(), (fields) => fields, { limit: 4 });
-    expect(new URL(landed.url).origin).toBe(harness.idpUrl);
+    expect(new URL(landed.url).origin).toBe(new URL(harness.idpUrl).origin);
     expect(landed.html).toContain("Sign in");
   });
 
@@ -221,11 +219,11 @@ describe("switching persona", () => {
     await signInAs(browser, harness, "dana", { stopAt: "/api/arcade/start" });
     expect((await sessionOf(browser))?.email).toBe(PEOPLE.dana.email);
 
-    // The browser still holds the IdP's own session cookie from Alice's login.
-    // This is the condition the measurement needs: without `prompt=login`,
-    // Better Auth would continue the authorization off that session and never
-    // show a form.
-    const idpSessionCookies = [...browser.cookies.keys()].filter((name) => name.includes("session"));
+    // The browser still holds the IdP's own session cookie from Alice's login
+    // (Okta's `sid`). This is the condition the measurement needs: without
+    // `prompt=login`, the provider would continue the authorization off that
+    // session and never show a form.
+    const idpSessionCookies = [...browser.cookies.keys()].filter((name) => name.endsWith("sid"));
     expect(idpSessionCookies.length).toBeGreaterThan(0);
 
     const pagesBefore = browser.pageHosts.length;
@@ -573,6 +571,7 @@ describe("/health", () => {
     // Each capability fails on its own variables rather than as one flag.
     const signinOnly = readWebConfig({
       APP_PUBLIC_HOST: new URL(harness.webUrl).host,
+      IDP_ISSUER: harness.idpUrl,
       IDP_CLIENT_ID: "c",
       IDP_CLIENT_SECRET: "s",
       SESSION_SECRET: GOOD_SECRET,
@@ -593,6 +592,7 @@ describe("/health", () => {
     try {
       Object.assign(process.env, {
         APP_PUBLIC_HOST: new URL(harness.webUrl).host,
+        IDP_ISSUER: harness.idpUrl,
         IDP_CLIENT_ID: "c",
         IDP_CLIENT_SECRET: "s",
         SESSION_SECRET: GOOD_SECRET,
@@ -607,14 +607,12 @@ describe("/health", () => {
       // pinned in `app-test/health-control-plane.test.ts`. Since #5 it carries
       // the loan book's, pinned in `app-test/loans/health.test.ts`. What this
       // test is about is unchanged, and still exact.
-      // Since #6 it carries the identity provider's too, the `identity` field,
-      // and since #33 `user_drift`, the two databases held against each other:
-      // the demo cast on both sides, so no drift.
-      const { policy, fixture_drift, injection_detection, warnings, control_plane, loans, identity, user_drift, ...web } =
+      // Since #6 it carries the identity provider's too, the `identity` field:
+      // whether `IDP_ISSUER`'s discovery document answers and names it.
+      const { policy, fixture_drift, injection_detection, warnings, control_plane, loans, identity, ...web } =
         (await (await GET()).json()) as Record<string, unknown>;
       expect(loans).toMatchObject({ status: "ok" });
-      expect(identity).toMatchObject({ status: "ok", people: 4 });
-      expect(user_drift).toBeNull();
+      expect(identity).toEqual({ status: "ok", issuer: harness.idpUrl });
       expect(web).toEqual({
         status: "ok",
         service: "web",
@@ -629,7 +627,7 @@ describe("/health", () => {
         control_plane: { status: "healthy" },
       });
     } finally {
-      for (const key of ["APP_PUBLIC_HOST", "IDP_CLIENT_ID", "IDP_CLIENT_SECRET", "SESSION_SECRET", "ARCADE_GATEWAY_ID", "ARCADE_API_KEY", "GOVERNANCE_STREAM"]) {
+      for (const key of ["APP_PUBLIC_HOST", "IDP_ISSUER", "IDP_CLIENT_ID", "IDP_CLIENT_SECRET", "SESSION_SECRET", "ARCADE_GATEWAY_ID", "ARCADE_API_KEY", "GOVERNANCE_STREAM"]) {
         if (previous[key] === undefined) delete process.env[key];
         else process.env[key] = previous[key];
       }
@@ -731,6 +729,7 @@ describe("a SESSION_SECRET that is set but too weak", () => {
     try {
       Object.assign(process.env, {
         ...FILLED,
+        IDP_ISSUER: harness.idpUrl,
         NODE_ENV: "production",
         SESSION_SECRET: "x",
         GOVERNANCE_STREAM: "fixture",
@@ -743,9 +742,8 @@ describe("a SESSION_SECRET that is set but too weak", () => {
       expect(answer.status).toBe(200);
       // The control plane's fields are pinned elsewhere since #4, the loan
       // book's since #5 and the identity provider's since #6; see above.
-      const { policy, fixture_drift, injection_detection, warnings, control_plane, loans, identity, user_drift, ...web } =
+      const { policy, fixture_drift, injection_detection, warnings, control_plane, loans, identity, ...web } =
         (await answer.json()) as Record<string, unknown>;
-      expect(user_drift).toBeNull();
       expect(loans).toMatchObject({ status: "ok" });
       expect(identity).toMatchObject({ status: "ok" });
       expect({ policy, fixture_drift, injection_detection, warnings, control_plane }).toMatchObject({
@@ -765,7 +763,7 @@ describe("a SESSION_SECRET that is set but too weak", () => {
         reset: "disabled",
       });
     } finally {
-      restoreEnv(previous, [...Object.keys(FILLED), "NODE_ENV", "SESSION_SECRET", "GOVERNANCE_STREAM"]);
+      restoreEnv(previous, [...Object.keys(FILLED), "IDP_ISSUER", "NODE_ENV", "SESSION_SECRET", "GOVERNANCE_STREAM"]);
     }
   });
 
@@ -820,9 +818,11 @@ describe("an unconfigured deployment", () => {
 
     const signinAnswer = await signin(new Request("https://cg-web-sa31.example.com/api/auth/signin"), bare);
     expect(signinAnswer.status).toBe(503);
-    // `APP_PUBLIC_HOST` since #6, which replaced `IDP_ISSUER`: the issuer is
-    // the app's own origin now.
-    expect(await signinAnswer.text()).toContain("APP_PUBLIC_HOST");
+    // Every missing variable, by name: the app's own host and the identity
+    // provider's issuer are two different things to set.
+    const signinText = await signinAnswer.text();
+    expect(signinText).toContain("APP_PUBLIC_HOST");
+    expect(signinText).toContain("IDP_ISSUER");
 
     const verifyAnswer = await verify(
       new Request("https://cg-web-sa31.example.com/api/arcade/verify?flow_id=x"),
@@ -847,6 +847,7 @@ describe("an unconfigured deployment", () => {
       Object.assign(process.env, {
         NODE_ENV: "production",
         APP_PUBLIC_HOST: new URL(harness.webUrl).host,
+        IDP_ISSUER: harness.idpUrl,
         IDP_CLIENT_ID: "c",
         IDP_CLIENT_SECRET: "s",
         SESSION_SECRET: GOOD_SECRET,
@@ -856,9 +857,9 @@ describe("an unconfigured deployment", () => {
       const { signin } = await import("../auth/handlers.ts");
       const answer = await signin(new Request(`${harness.webUrl}/api/auth/signin?persona=dana`));
       expect(answer.status).toBe(303);
-      expect(answer.headers.get("location")).toContain(`${harness.idpUrl}/oauth2/authorize`);
+      expect(answer.headers.get("location")).toContain(harness.idp.endpoints.authorize);
     } finally {
-      for (const key of ["NODE_ENV", "APP_PUBLIC_HOST", "IDP_CLIENT_ID", "IDP_CLIENT_SECRET", "SESSION_SECRET", "APPROVALS_STORE_TOKEN"]) {
+      for (const key of ["NODE_ENV", "APP_PUBLIC_HOST", "IDP_ISSUER", "IDP_CLIENT_ID", "IDP_CLIENT_SECRET", "SESSION_SECRET", "APPROVALS_STORE_TOKEN"]) {
         if (previous[key] === undefined) delete process.env[key];
         else process.env[key] = previous[key];
       }

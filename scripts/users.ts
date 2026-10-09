@@ -1,7 +1,6 @@
 /**
  * `bun run users` — the people who can use the app, added from the terminal
- * (#31). There is no open sign-up: `/sign-up/email` is not routed, so this is
- * how somebody comes to exist.
+ * (#31). There is no open sign-up, so this is how somebody comes to exist.
  *
  *     bun run users add <email> --name <name> --role <role> [--clearance <n>] [--password <p>]
  *     bun run users list
@@ -12,20 +11,26 @@
  *
  * ## Two halves, one person
  *
- * A user is two rows in two databases, joined on the lowercase email:
+ * A user is two records in two places, joined on the lowercase email:
  *
- *     identity        idp.db         a Better Auth `user` and its `credential`
- *                                    account: who they are, so they can sign in
+ *     identity        Okta           a user in the org, active, with a
+ *                                    password: who they are, so they can sign in
  *     control plane   governance.db  a `subjects` row: role and clearance, so
  *                                    the hooks know what they may do
  *
  * Signing in without a subject gets you denied at every hook ("an
  * administrator must register the identity"); a subject without an identity
  * can never sign in. So `add` writes both or neither: the identity first, then
- * the subject, and if the subject cannot be written the identity is removed
- * again. Each half is written through the module that owns its file, and
- * identity only through the provider's own tool, `scripts/identity/people.ts`,
- * which hands back people and nothing that can sign a token.
+ * the subject, and if the subject cannot be written the identity is deleted
+ * again. Okta is reached through its Management API (`scripts/okta/`), with
+ * `OKTA_API_TOKEN` from the environment and the org from `OKTA_ORG_URL`, or
+ * from `IDP_ISSUER`'s origin.
+ *
+ * Somebody already in the org, the admin who made it for one, is given a
+ * subject and nothing else: they keep their own Okta password, and `remove`
+ * takes their subject away and leaves their Okta account alone. Only people
+ * this command created, which it keeps in the `Loan Desk users` group, are
+ * deleted from Okta by `remove`.
  *
  * ## The role is mandatory, and read from the policy
  *
@@ -46,17 +51,18 @@
  *
  * ## The running app sees it at once
  *
- * The writes go straight to the two databases, the way `bun run oauth-client`
- * does. A running app reads the new identity on the next sign-in, and its
- * policy cache notices `policy_revision` move within one poll, so no restart.
+ * Okta has the person as soon as the call returns, and the app's policy cache
+ * notices `policy_revision` move within one poll, so no restart.
  *
  * ## Passwords
  *
  * Without `--password`, `add` and `seed-demo` generate one and print it once.
- * Only its scrypt hash is stored; it is never logged or written anywhere else.
- * A `--password` typed on the command line lands in your shell history. There
- * is no shipped password (#33): nobody is seeded at first boot, so this is the
- * only way anybody gets one.
+ * Okta keeps only its hash; it is never logged or written anywhere else. A
+ * `--password` typed on the command line lands in your shell history. A
+ * password is held to Okta's default policy before anything is sent: at least
+ * 8 characters, with an uppercase letter, a lowercase letter and a number, and
+ * no part of the username (the email, split at `.`, `-`, `_` and `@`). There
+ * is no shipped password (#33).
  *
  * ## The demo cast, and who counts as it
  *
@@ -75,8 +81,10 @@
  * that their email must be invited to the project, and where.
  *
  * Reads `.env` and `.env.local` the way `bun run dev` does, so it writes the
- * databases the app opens: `IDP_DB_PATH` and `GOVERNANCE_DB_PATH`, `./idp.db`
- * and `./governance.db` when unset.
+ * database the app opens: `GOVERNANCE_DB_PATH`, `./governance.db` when unset.
+ * `OKTA_API_TOKEN` comes from the environment, `op run` in practice:
+ *
+ *     OKTA_API_TOKEN="op://<vault>/<item>/<field>" op run -- bun run users seed-demo
  */
 import type { Database } from "bun:sqlite";
 import { userInfo } from "node:os";
@@ -98,7 +106,16 @@ import {
   type NewSubject,
   type SubjectChange,
 } from "../gate/service/subjects.ts";
-import { openPeopleStore, type People } from "./identity/people.ts";
+import { OktaError } from "./okta/client.ts";
+import {
+  generatePassword,
+  type OktaPeople,
+  openOktaPeople,
+  PASSWORD_MAX,
+  PASSWORD_MIN,
+  passwordProblem,
+  type Person,
+} from "./okta/people.ts";
 
 /** Where a requester is invited. One constant, so the wording has one place to be corrected. */
 const ARCADE_INVITE_WHERE = "Arcade dashboard (https://api.arcade.dev/dashboard), your project, Members";
@@ -108,10 +125,6 @@ const APPROVE_TOOL = "ApproveLoan";
 /** The tool that asks for an approval, and so goes through Arcade's Slack provider. */
 const REQUEST_TOOL = "RequestApproval";
 
-/** Better Auth's own bounds on a password (`minPasswordLength`, `maxPasswordLength` defaults). */
-const PASSWORD_MIN = 8;
-const PASSWORD_MAX = 128;
-
 const USAGE = `usage: bun run users <command>
 
   add <email> --name <name> --role <role> [--clearance <n>] [--password <p>]
@@ -119,7 +132,10 @@ const USAGE = `usage: bun run users <command>
   set-role <email> <role>
   set-clearance <email> <n>
   remove <email>
-  seed-demo [--alice <email>] [--bob <email>] [--charlie <email>] [--michael <email>] [--password <p>]`;
+  seed-demo [--alice <email>] [--bob <email>] [--charlie <email>] [--michael <email>] [--password <p>]
+
+add, list, remove and seed-demo reach Okta, with OKTA_API_TOKEN from the environment:
+  OKTA_API_TOKEN="op://<vault>/<item>/<field>" op run -- bun run users <command>`;
 
 /** A refusal: said on stderr, exit 1, and nothing written. */
 class Refusal extends Error {}
@@ -138,7 +154,7 @@ const actor = `cli:${userInfo().username}`;
 
 function parseEmail(raw: string | undefined, what = "email"): string {
   const email = raw?.trim().toLowerCase() ?? "";
-  // The shape Better Auth and the subject's own schema accept; the domain is not checked.
+  // The shape Okta's login and the subject's own schema accept; the domain is not checked.
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     throw new UsageError(`${what} ${raw === undefined ? "is missing" : `"${raw}" is not an email address`}`);
   }
@@ -161,20 +177,16 @@ function parsePassword(raw: string | undefined): string | undefined {
   return raw;
 }
 
-/** 20 characters from 62, about 119 bits, drawn without modulo bias. */
-function generatePassword(): string {
-  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  let out = "";
-  while (out.length < 20) {
-    for (const byte of crypto.getRandomValues(new Uint8Array(32))) {
-      if (byte < 248 && out.length < 20) out += alphabet[byte % 62];
-    }
+/** `--password` for one person, held to Okta's default policy for their email. */
+function checkPassword(password: string, email: string): void {
+  const problem = passwordProblem(password, email);
+  if (problem !== null) {
+    throw new UsageError(`--password ${problem}, by Okta's default password policy (for ${email})`);
   }
-  return out;
 }
 
 // ---------------------------------------------------------------------------
-// The two databases
+// The two halves
 // ---------------------------------------------------------------------------
 
 function openControlPlane(): Database {
@@ -182,9 +194,13 @@ function openControlPlane(): Database {
   return db;
 }
 
-/** Identity through the provider's own tool, which hands back people and nothing that signs. */
-function openIdentity(): Promise<People> {
-  return openPeopleStore();
+/** Identity in Okta. A missing org or token is a refusal that names the variable. */
+function openIdentity(): OktaPeople {
+  try {
+    return openOktaPeople();
+  } catch (cause) {
+    throw new Refusal((cause as Error).message);
+  }
 }
 
 /** The shipped fixture's cast, for the roles it names and for `seed-demo`. */
@@ -209,7 +225,15 @@ function describeChange(change: SubjectChange): string {
 function describeGeneratedPassword(email: string, password: string): string {
   return (
     `  password   ${password}\n` +
-    `             shown once: only its hash is stored, so it cannot be printed again. Give it to ${email}.`
+    `             shown once: Okta keeps only its hash, so it cannot be printed again. Give it to ${email}.`
+  );
+}
+
+/** Said for somebody who was already in Okta: they keep their account and their password. */
+function adoptedLine(person: Person): string {
+  return (
+    `  identity   ${person.email} was already in Okta (${person.status.toLowerCase()}): they sign in with their own password, ` +
+    "and nothing about their Okta account was changed"
   );
 }
 
@@ -252,17 +276,22 @@ function impliesNoClearance(governance: Database, role: string): boolean {
   );
 }
 
-/** Refuses an address either half already holds, naming which. */
-function checkAbsent(identity: People, governance: Database, email: string): void {
-  const person = identity.find(email) !== null;
+/**
+ * Where an address stands for `add`: nobody (null), or somebody already in
+ * Okta with no subject, who is adopted. A subject already there, with or
+ * without an identity, is refused, naming which.
+ */
+async function standing(identity: OktaPeople, governance: Database, email: string): Promise<Person | null> {
+  const person = await identity.find(email);
   const subject = readSubject(governance, email) !== null;
   if (person && subject) throw new Refusal(`${email} already exists; change them with set-role or set-clearance`);
-  if (person || subject) {
+  if (subject) {
     throw new Refusal(
-      `${email} is half there: ${person ? "an identity in idp.db but no subject" : "a subject in governance.db but no identity"}. ` +
+      `${email} is half there: a subject in governance.db but no identity in Okta. ` +
         `Run \`bun run users remove ${email}\` and add them again`,
     );
   }
+  return person;
 }
 
 /**
@@ -270,18 +299,23 @@ function checkAbsent(identity: People, governance: Database, email: string): voi
  * left to fail is the write itself, and then the identity is taken back out.
  */
 async function createUser(
-  identity: People,
+  identity: OktaPeople,
   governance: Database,
   subject: NewSubject,
   password: string,
 ): Promise<SubjectChange> {
-  await identity.add({ name: subject.display_name, email: subject.user_id, password });
+  try {
+    await identity.add({ name: subject.display_name, email: subject.user_id, password });
+  } catch (cause) {
+    const why = cause instanceof Error ? cause.message : String(cause);
+    throw new Refusal(`${subject.user_id}: Okta did not create the user (${why}); nothing was added`);
+  }
   try {
     return addSubject(governance, subject, actor);
   } catch (cause) {
-    identity.remove(subject.user_id);
+    await identity.remove(subject.user_id);
     const why = cause instanceof Error ? cause.message : String(cause);
-    throw new Refusal(`${subject.user_id}: the subject could not be written (${why}), so the identity was removed again and nothing was added`);
+    throw new Refusal(`${subject.user_id}: the subject could not be written (${why}), so the identity was deleted again and nothing was added`);
   }
 }
 
@@ -304,6 +338,7 @@ async function add(args: string[]): Promise<void> {
   if (!role) throw new UsageError("--role is required: every user gets one, and a user without one is not added");
   const clearanceGiven = values.clearance === undefined ? undefined : parseClearance(values.clearance);
   const password = parsePassword(values.password);
+  if (password !== undefined) checkPassword(password, email);
 
   const governance = openControlPlane();
   try {
@@ -317,20 +352,25 @@ async function add(args: string[]): Promise<void> {
     }
     const subject: NewSubject = { user_id: email, display_name: name, role, clearance };
 
-    const identity = await openIdentity();
-    try {
-      checkAbsent(identity, governance, email);
-      const secret = password ?? generatePassword();
+    const identity = openIdentity();
+    const existing = await standing(identity, governance, email);
+    if (existing !== null) {
+      if (password !== undefined) {
+        throw new Refusal(`${email} is already in Okta, and this command never changes an existing person's password. Leave out --password`);
+      }
+      const change = addSubject(governance, subject, actor);
+      console.log(`added ${email}: ${name}, role ${role}, clearance ${clearance}`);
+      console.log(describeChange(change));
+      console.log(adoptedLine(existing));
+    } else {
+      const secret = password ?? generatePassword(email);
       const change = await createUser(identity, governance, subject, secret);
-
       console.log(`added ${email}: ${name}, role ${role}, clearance ${clearance}`);
       console.log(describeChange(change));
       if (password === undefined) console.log(describeGeneratedPassword(email, secret));
-      const reminder = inviteReminder(governance, subject);
-      if (reminder) console.log(reminder);
-    } finally {
-      identity.close();
     }
+    const reminder = inviteReminder(governance, subject);
+    if (reminder) console.log(reminder);
   } finally {
     governance.close();
   }
@@ -339,10 +379,16 @@ async function add(args: string[]): Promise<void> {
 async function list(args: string[]): Promise<void> {
   if (args.length > 0) throw new UsageError("list takes no arguments");
   const governance = openControlPlane();
-  const identity = await openIdentity();
   try {
-    const people = new Map(identity.list().map((person) => [person.email.toLowerCase(), person]));
+    const identity = openIdentity();
+    const people = new Map((await identity.list()).map((person) => [person.email, person]));
     const subjects = new Map(listSubjects(governance).map((subject) => [subjectId(subject.user_id), subject]));
+    // A subject for somebody this command did not create is looked up one by one.
+    for (const email of subjects.keys()) {
+      if (people.has(email)) continue;
+      const person = await identity.find(email);
+      if (person) people.set(email, person);
+    }
     const emails = [...new Set([...people.keys(), ...subjects.keys()])].sort();
     if (emails.length === 0) {
       console.log("no users. Add one with `bun run users add`.");
@@ -352,18 +398,23 @@ async function list(args: string[]): Promise<void> {
     const rows = emails.map((email) => {
       const person = people.get(email);
       const subject = subjects.get(email);
+      const active = person?.status === "ACTIVE";
       const note =
         person && !subject
-          ? "can sign in, but has no subject: denied at every hook"
+          ? "in Okta, but has no subject: denied at every hook"
           : subject && !person
-            ? "has a subject, but no identity: cannot sign in"
-            : "";
+            ? "has a subject, but no identity in Okta: cannot sign in"
+            : person && !active
+              ? `Okta status ${person.status.toLowerCase()}: cannot sign in until it is active`
+              : person && !person.ours
+                ? "was in Okta already: remove keeps their Okta account"
+                : "";
       return [
         email,
         person?.name ?? subject?.display_name ?? "",
         subject?.role ?? "-",
         subject ? String(subject.clearance) : "-",
-        person ? "yes" : "no",
+        active ? "yes" : "no",
         subject ? "yes" : "no",
         note,
       ];
@@ -374,7 +425,6 @@ async function list(args: string[]): Promise<void> {
       console.log(row.map((cell, column) => cell.padEnd(widths[column]!)).join("  ").trimEnd());
     }
   } finally {
-    identity.close();
     governance.close();
   }
 }
@@ -424,24 +474,20 @@ async function remove(args: string[]): Promise<void> {
   if (args.length !== 1) throw new UsageError("remove takes one email");
   const email = parseEmail(args[0]);
   const governance = openControlPlane();
-  const identity = await openIdentity();
   try {
+    const identity = openIdentity();
     // The subject first: from this commit on, every hook denies them.
     const change = removeSubject(governance, email, actor);
-    const removal = identity.remove(email);
+    const removal = await identity.remove(email);
     if (change === null && removal === null) throw new Refusal(`there is no user ${email}`);
 
     console.log(`removed ${email}`);
     if (change) console.log(describeChange(change));
     else console.log("  subject    none in governance.db");
-    if (removal) {
-      console.log(
-        `  identity   removed from idp.db, with ${removal.sessions} session(s), ${removal.accessTokens} access token(s), ` +
-          `${removal.refreshTokens} refresh token(s) and ${removal.consents} consent(s) revoked`,
-      );
-    } else console.log("  identity   none in idp.db");
+    if (removal === "deleted") console.log("  identity   deactivated and deleted in Okta, with their sessions and tokens");
+    else if (removal === "kept") console.log("  identity   left in Okta: they were there before `bun run users` gave them a subject");
+    else console.log("  identity   none in Okta");
   } finally {
-    identity.close();
     governance.close();
   }
 }
@@ -515,33 +561,48 @@ async function seedDemo(args: string[]): Promise<void> {
   }
   const distinct = new Set(emails.values());
   if (distinct.size !== cast.length) throw new UsageError("seed-demo needs a different email for each person");
+  if (password !== undefined) for (const email of distinct) checkPassword(password, email);
 
   const governance = openControlPlane();
-  const identity = await openIdentity();
   const problems: string[] = [];
   try {
+    const identity = openIdentity();
     for (const person of cast) {
       const email = emails.get(person.flag)!;
       const subject: NewSubject = { user_id: email, display_name: person.name, role: person.role, clearance: person.clearance };
-      const hasPerson = identity.find(email) !== null;
+      const found = await identity.find(email);
       const existing = readSubject(governance, email);
 
-      if (hasPerson && existing) {
+      if (found && existing) {
         const differs = existing.role !== person.role || existing.clearance !== person.clearance;
         console.log(
           `${person.name}: ${email} already present, role ${existing.role}, clearance ${existing.clearance}` +
             (differs ? ` (the demo's is ${person.role}, ${person.clearance}; left as it is)` : ""),
         );
-      } else if (hasPerson || existing) {
+      } else if (existing) {
         problems.push(
-          `${person.name}: ${email} is half there (${hasPerson ? "an identity but no subject" : "a subject but no identity"}); ` +
+          `${person.name}: ${email} is half there (a subject but no identity in Okta); ` +
             `run \`bun run users remove ${email}\` and seed again`,
         );
         continue;
+      } else if (found) {
+        // Already in the org, the admin seeded as one of the cast, say: a subject, and Okta left alone.
+        checkRole(governance, person.role);
+        const change = addSubject(governance, subject, actor);
+        console.log(`${person.name}: added ${email}, role ${person.role}, clearance ${person.clearance}`);
+        console.log(describeChange(change));
+        console.log(adoptedLine(found));
       } else {
         checkRole(governance, person.role);
-        const secret = password ?? generatePassword();
-        const change = await createUser(identity, governance, subject, secret);
+        const secret = password ?? generatePassword(email);
+        let change: SubjectChange;
+        try {
+          change = await createUser(identity, governance, subject, secret);
+        } catch (cause) {
+          if (!(cause instanceof Refusal)) throw cause;
+          problems.push(`${person.name}: ${cause.message}`);
+          continue;
+        }
         console.log(`${person.name}: added ${email}, role ${person.role}, clearance ${person.clearance}`);
         console.log(describeChange(change));
         if (password === undefined) console.log(describeGeneratedPassword(email, secret));
@@ -552,7 +613,6 @@ async function seedDemo(args: string[]): Promise<void> {
       if (reminder) console.log(reminder);
     }
   } finally {
-    identity.close();
     governance.close();
   }
   if (problems.length > 0) throw new Refusal(problems.join("\n"));
@@ -584,6 +644,11 @@ try {
   }
   if (cause instanceof Refusal) {
     console.error(`users ${command}: ${cause.message}`);
+    process.exit(1);
+  }
+  if (cause instanceof OktaError) {
+    const hint = cause.status === 401 ? " (check OKTA_API_TOKEN is a live token for this org)" : "";
+    console.error(`users ${command}: Okta's ${cause.message}${hint}`);
     process.exit(1);
   }
   throw cause;

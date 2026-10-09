@@ -15,7 +15,7 @@
  * "nothing is streamed" claim below is asserted as the absence of the panel
  * itself rather than as an absence of events.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,13 +24,24 @@ import { renderToStaticMarkup } from "react-dom/server";
 import PanelPage from "../app/panel/page.tsx";
 import { GET as health } from "../app/health/route.ts";
 import { resolvePanelStream } from "../lib/governance/stream-url.ts";
+import { startOidcStandIn } from "../scripts/oidc-stand-in.ts";
+import { forgetDiscovery } from "../auth/discovery.ts";
 import { bootTestControlPlane } from "./control-plane-instance.ts";
-import { openTestIdentity } from "./identity-instance.ts";
 import { openTestLoanBook } from "./loan-module-instance.ts";
 
 bootTestControlPlane();
-await openTestIdentity();
 openTestLoanBook();
+
+/**
+ * An identity provider whose discovery document answers, standing in for
+ * Okta: `/health` reads `IDP_ISSUER`'s, and anything but an answer is
+ * `degraded`, which would hide what the panel alone does to `status`.
+ */
+const idp = await startOidcStandIn();
+afterAll(() => {
+  idp.stop();
+  forgetDiscovery();
+});
 
 /**
  * The variables that decide the panel's stream, and the only ones these tests
@@ -44,6 +55,7 @@ const STREAM_KEYS = [
   // Identity, because `/health`'s `status` folds four fields together and
   // "degraded" proves nothing about the panel on a deployment where sign-in is
   // also unset — which is every deployment this suite builds by default.
+  "IDP_ISSUER",
   "IDP_CLIENT_ID",
   "IDP_CLIENT_SECRET",
   "SESSION_SECRET",
@@ -108,12 +120,13 @@ const HOOKS_HOST = "cg-hooks.example.com";
  * panel's doing and nothing else's. `openssl rand -hex 32`, written out.
  */
 const IDENTITY = {
+  IDP_ISSUER: idp.issuer,
   IDP_CLIENT_ID: "client-c",
   IDP_CLIENT_SECRET: "client-c-secret",
   SESSION_SECRET: "3f9a1c7e5b2d84069a1fe73c05b8d42e6c917ab3fd50e28c47196baf3d0c5e81",
   ARCADE_GATEWAY_ID: "cg-demo-us",
   ARCADE_API_KEY: "arcade-key",
-} as const;
+};
 
 describe("a deployed panel that was never told which stream to watch", () => {
   // The measured state of the stage demo's deployed /panel on 2026-09-11: its

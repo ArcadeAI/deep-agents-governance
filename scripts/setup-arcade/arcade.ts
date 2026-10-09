@@ -66,11 +66,10 @@
  * selects the project (spec `securitySchemes.Bearer`).
  */
 /**
- * The hop-2 provider id, fixed because `mcp/loan_desk/loans.py` reads `OAuth2(id=...)` at
- * import. A literal rather than an import of the identity provider's
- * constant: nothing outside `auth/` imports the provider's internals
- * (`only-identity-mints.test.ts`). `app-test/identity/provider-id.test.ts`
- * fails if this, the provider's and `mcp/loan_desk/loans.py`'s ever disagree.
+ * The hop-2 provider id, fixed because `mcp/loan_desk/loans.py` reads
+ * `OAuth2(id=...)` at import. `app-test/auth-config.test.ts` fails if this,
+ * `auth-config/app-identity-provider.json`'s and `mcp/loan_desk/loans.py`'s
+ * ever disagree.
  */
 export const PROVIDER_ID = "app-identity";
 
@@ -79,33 +78,35 @@ export interface Registration {
   host: string;
   /** `https://<host>`. */
   origin: string;
-  /** The `arcade` OAuth client at the app's identity provider. */
-  arcadeClientId: string;
-  arcadeClientSecret: string;
+  /** The identity provider's endpoints, from `IDP_ISSUER`'s discovery document. */
+  endpoints: { authorize: string; token: string; userinfo: string };
+  /** The OIDC client at the identity provider: `IDP_CLIENT_ID`, the same one the app signs in with. */
+  clientId: string;
+  clientSecret: string;
   approvalsStoreToken: string;
 }
 
 /**
  * The hop-2 provider, in the shape the demo's working `cg-idp` registration
- * was read back in (the custom-verifier spike, against a real Arcade project)
- * with only the host and the id changed: HTTP Basic on the token
- * request, the client credentials also kept as request parameters (DESIGN.md:
- * those parameters stay, and the app accepts both), PKCE S256, and the user id
- * read from userinfo at `$.email`, which is what makes the email the join key.
+ * was read back in (the custom-verifier spike, against a real Arcade project),
+ * pointed at the identity provider's discovered endpoints: HTTP Basic on the
+ * token request and no credentials in the body (Okta refuses a request that
+ * carries both), PKCE S256, and the user id read from userinfo at `$.email`,
+ * which is what makes the email the join key.
  */
 export function providerBody(registration: Registration) {
-  const { origin } = registration;
+  const { endpoints } = registration;
   return {
     id: PROVIDER_ID,
     type: "oauth2",
-    description: "The Loans Approval Limits app's own identity provider (hop 2)",
+    description: "The Loans Approval Limits app's identity provider (hop 2)",
     oauth2: {
-      client_id: registration.arcadeClientId,
-      client_secret: registration.arcadeClientSecret,
+      client_id: registration.clientId,
+      client_secret: registration.clientSecret,
       scope_delimiter: " ",
       pkce: { enabled: true, code_challenge_method: "S256" },
       authorize_request: {
-        endpoint: `${origin}/oauth2/authorize`,
+        endpoint: endpoints.authorize,
         params: {
           response_type: "code",
           client_id: "{{client_id}}",
@@ -114,20 +115,18 @@ export function providerBody(registration: Registration) {
         },
       },
       token_request: {
-        endpoint: `${origin}/oauth2/token`,
+        endpoint: endpoints.token,
         method: "POST",
         auth_method: "client_secret_basic",
         params: {
           grant_type: "authorization_code",
           redirect_uri: "{{redirect_uri}}",
-          client_id: "{{client_id}}",
-          client_secret: "{{client_secret}}",
         },
         request_content_type: "application/x-www-form-urlencoded",
         response_content_type: "application/json",
       },
       user_info_request: {
-        endpoint: `${origin}/oauth2/userinfo`,
+        endpoint: endpoints.userinfo,
         method: "GET",
         auth_method: "bearer_access_token",
         response_content_type: "application/json",
