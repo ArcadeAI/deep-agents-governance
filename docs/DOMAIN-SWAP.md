@@ -24,7 +24,7 @@ control layers, two OAuth hops, three databases.
 | `api/` | **replace** | The system of record, a module of the app served under `/bank`. A plain HTTP API over `loans.db`. Yours already exists — you probably delete this directory rather than edit it |
 | `mcp/loan_desk/loans.py` | **replace** | Four Python `arcade-mcp` tools, each a stateless client of the API above |
 | `gate/policies/governance.json` | **rewrite** | The catalogue, the demo cast, the rules. Your own people come from `bun run users` (§3) |
-| `auth/provider/` | **delete** | The enterprise IdP, as a demo fixture the app serves on its own port. You have an Okta |
+| `IDP_ISSUER` | **repoint** | The app signs in through an Okta org already. Point it at yours, or at any OIDC provider (§4) |
 | `auth/session.ts` | **repoint** | One function pair, `readSession` / `readSessionFromCookies` |
 | the rest of the app (`app/`, `components/`, `lib/`) | **keep** | Chat, panel, approval page, the bank's screen |
 | `gate/service/` | **keep** | `/hooks/access`, `/hooks/pre`, `/hooks/post`, audit, SSE, reset |
@@ -289,40 +289,32 @@ notes, re-run both suites.
 
 ---
 
-## 4. Identity — `auth/provider/` and the session seam
+## 4. Identity: Okta, and the session seam
 
-`auth/provider/` is a demo fixture standing in for the enterprise's real IdP:
-Better Auth as an OAuth 2.1 server, owning `idp.db`, serving a login page and a consent
-page. The app serves it on its own port (#6). **You delete it and point at your Okta.**
+There is no identity provider in the template to delete. The app, the agent and Arcade
+are ordinary OpenID Connect clients of `IDP_ISSUER`, an Okta authorization server in the
+workshop, and each reads the endpoints from the issuer's discovery document
+(`auth/discovery.ts`). Nothing spells an Okta path, so pointing at your own Okta org, or
+at Auth0 or any other provider that publishes discovery, is configuration:
+`IDP_ISSUER`, `IDP_CLIENT_ID` and `IDP_CLIENT_SECRET`. [`okta.md`](./okta.md) has the
+redirect URIs the client needs.
 
-It is deliberately easy to delete. It declares no `@cg/*` dependency and declares
-`"cg": { "external": true }` — `app-test/identity/knows-people-not-loans.test.ts` holds
-that half, and `app-test/identity/only-identity-mints.test.ts` fails if any other module
-reaches its signing keys or its token issuance. The app mounts it, so deleting it is the
-directory plus what mounts it:
+Okta-specific code is in two commands, and only there:
 
-- the routes under `app/oauth2/`, `app/login/`, `app/consent/`, `app/jwks/`,
-  `app/.well-known/`, `app/sign-in/` and `app/identity/`;
-- `scripts/identity.ts` and `scripts/identity/`, and the root `package.json` scripts
-  that run them (`identity`, `oauth-client`, `identity:reset`, `generate:identity-schema`);
-- the two readers of its state, `app/health/route.ts` (the `identity` field) and
-  `instrumentation.ts`;
-- `auth/provider` in the root `package.json`'s `workspaces`, then `bun install`
-  to drop it from the lockfile.
+- `bun run okta-setup` (`scripts/okta-setup.ts`, `scripts/okta/setup.ts`) makes the
+  client in an Okta org. On another provider, make it by hand.
+- `bun run users` (`scripts/users.ts`) writes the identity half of each person to Okta
+  through `scripts/okta/people.ts`, and the control-plane half through
+  `gate/service/subjects.ts`. On another provider, keep the control-plane half and create
+  the people at your provider: every person who signs in still needs a `subjects` row
+  under the email your IdP asserts, or every hook denies them.
 
-`bun run users` goes with it in part. `scripts/users.ts` writes the identity half of each
-person through `scripts/identity/people.ts`, which is in the list above, and the
-control-plane half through `gate/service/subjects.ts`, which stays. Your IdP owns the
-accounts, so keep the control-plane half and drop the identity half: every person who
-signs in still needs a `subjects` row under the email your IdP asserts, or every hook
-denies them.
-
-Two places reference it from outside and both are configuration rather than code:
+Two places reference the issuer from outside and both are configuration rather than code:
 
 | | |
 |---|---|
-| **Arcade** | one custom OAuth provider (hop 2, id `app-identity`), registered by `bun run setup-arcade`, and one User Source (hop 1), created in the dashboard from the form it prints. Both point at issuer URLs. Point them at yours |
-| **`api/`** | validates bearer tokens at `IDENTITY_HOST` + `/oauth2/userinfo` and reads `$.email`. `IDENTITY_HOST` defaults to the app's own listener; set it to your IdP |
+| **Arcade** | one custom OAuth provider (hop 2, id `app-identity`) and one User Source (hop 1), both registered by `bun run setup-arcade` from `IDP_ISSUER`'s discovery document. Rerun it after repointing |
+| **`api/`** | validates bearer tokens at the issuer's discovered userinfo endpoint (`api/actor.ts`) and reads `$.email` |
 
 The application seam is one function pair:
 
@@ -332,7 +324,7 @@ The application seam is one function pair:
 | **returns** | `Session { email, gateway?, signed_in_at }`, or `null` |
 | **callers** | `lib/approval-status.ts`, `lib/approvals/opener.ts`, `auth/handlers.ts`, `app/api/loans/route.ts`, `app/loans/page.tsx`, `app/page.tsx` |
 | **keep** | the two signatures, and `email` being the join key |
-| **delete** | `auth/provider/` (above), `auth/oidc.ts`, `auth/personas.ts`, `auth/roster.ts`, `components/identity/SessionChrome.tsx` |
+| **replace** | `auth/oidc.ts`, `auth/personas.ts`, `auth/roster.ts`, `components/identity/SessionChrome.tsx`, if your app has a sign-in of its own |
 
 Point `readSession` at your own session store and return a `Session` whose `email` is
 the address your directory knows the person by. Nothing downstream reads an identity
@@ -539,9 +531,8 @@ system and the two tests would contradict each other (#33).
 The flag is read off the manifest rather than matched on a directory name on purpose:
 `gate/` keeps business-domain code out of its runtime source, so a forker marking
 their own app inherits both halves automatically. There is a sibling,
-`"cg": { "external": true }`, which `auth/provider/` carries — it means "stands in
-for a system outside the template", and it exempts the directory from the same sweep
-without claiming it is governed.
+`"cg": { "external": true }`, for a module that stands in for a system outside the
+template: it exempts the directory from the same sweep without claiming it is governed.
 
 Copy `app-test/loans/knows-nothing-about-governance.test.ts` beside your module, point
 its `SRC` at your directory and edit
@@ -633,7 +624,7 @@ try once it runs is its Try it out section.
 - [ ] `gate/policies/governance.json` rewritten: catalogue, demo cast, policy rules, output rules
 - [ ] Your people added with `bun run users add`, or, with your own IdP, each given a `subjects` row under the email it asserts
 - [ ] Every injection pattern has both halves of a corpus entry; `bun test ./app-test/control-plane/` green
-- [ ] `readSession` pointed at your IdP; `auth/provider/` and its routes deleted; Arcade's provider and User Source repointed
+- [ ] `IDP_ISSUER` pointed at your IdP, or `readSession` at your own sign-in; `bun run setup-arcade` rerun so Arcade's provider and User Source follow
 - [ ] `"cg": { "governed": true }` on your app's manifest, and its `knows-nothing` test shipped
 - [ ] Both boundary tests green
 - [ ] One act driven end to end, and a `/pre` row in the audit log with your `user_id` on it

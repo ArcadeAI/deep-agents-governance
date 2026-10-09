@@ -13,7 +13,7 @@
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -326,6 +326,21 @@ describe("users add", () => {
     expect(run.code).toBe(1);
     expect(run.stderr).toContain("OKTA_API_TOKEN is not set");
     expect(run.stderr).toContain("op run");
+  });
+
+  test("a token in .env is refused before any call, and never echoed", async () => {
+    writeFileSync(join(dir, ".env"), `OKTA_API_TOKEN=${MANAGEMENT_TOKEN}\n`);
+    const child = spawnChild(["bun", "--no-env-file", join(ROOT, "scripts/users.ts"), "list"], {
+      cwd: dir,
+      env: childEnv({ GOVERNANCE_DB_PATH: governancePath(), OKTA_ORG_URL: okta.url, OKTA_API_TOKEN: MANAGEMENT_TOKEN }),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stderr, code] = await Promise.all([new Response(child.stderr).text(), child.exited]);
+    expect(code).toBe(78);
+    expect(stderr).toContain("OKTA_API_TOKEN is set in .env");
+    expect(stderr).not.toContain(MANAGEMENT_TOKEN);
+    expect(okta.log).toEqual([]);
   });
 
   test("the org can come from IDP_ISSUER's origin", async () => {

@@ -81,15 +81,13 @@ starts, answers every hook 503 and says why on `/health`, because the same proce
 sign-in and the bank — because a control
 plane that came up on a known token would accept hook calls from anyone, and an approvals
 store that did would accept the record a human then acts on from anyone. Booting the app's
-image locally therefore needs both, and `BETTER_AUTH_SECRET` for the identity module beside
-them:
+image locally therefore needs both:
 
 ```sh
 docker build -t cg-web:local .
 docker run --rm -p 8080:8080 -e PORT=8080 \
   -e ARCADE_HOOK_SIGNING_SECRET=local-only \
   -e APPROVALS_STORE_TOKEN=local-only \
-  -e BETTER_AUTH_SECRET=local-only-not-a-real-secret-0000 \
   cg-web:local
 curl -fsS http://localhost:8080/health
 ```
@@ -274,10 +272,9 @@ line below is the 473 MB synthetic run above, not the live disk:
 [hooks] MIGRATED ONCE: schema 2 → 4; 750,000 audit rows; DDL 8978ms; VACUUM 714ms, 472.8MB → 157.5MB
 ```
 
-Two things in the fixture are substituted at seed time and nowhere else: the toolkit names
-(`$TOOLKIT`, `$TOOLKIT` → `ARCADE_TOOLKIT`, `ARCADE_TOOLKIT`) and the persona
-emails (the same four role variables the identity module, `auth/provider/`, reads, so the two databases
-cannot disagree about who a persona is). Tool names are PascalCase — `ApproveLoan`, not
+One thing in the fixture is substituted at seed time and nowhere else: the toolkit name
+(`$TOOLKIT` → `ARCADE_TOOLKIT`). The fixture's demo cast is not seeded at all (#33):
+`bun run users seed-demo` adds it, in Okta and here, under the addresses it is given. Tool names are PascalCase — `ApproveLoan`, not
 `approve_loan` — because that is what `arcade-mcp` produces (measured, #35). A rule keyed on the
 wrong string is refused at boot by `compilePolicy`; it does not silently match nothing.
 

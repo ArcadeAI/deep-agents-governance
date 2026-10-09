@@ -7,7 +7,7 @@
  * policy does not know, a clearance it requires and the line leaves out) reads
  * exactly like one that works until somebody types it. So this reads the
  * commands out of the README, fills in the placeholders, and runs each one
- * against a scratch pair of databases, the way `app-test/users-cli.test.ts`
+ * against a scratch database and a stand-in Okta org, the way `app-test/users-cli.test.ts`
  * runs the command: `--no-env-file` and an allowlisted environment, so nothing
  * from this checkout's `.env` files reaches it.
  *
@@ -21,8 +21,10 @@ import { join } from "node:path";
 
 import { spawnChild } from "../app-test/child.ts";
 import { childEnv } from "../app-test/child-env.ts";
+import { type OidcStandIn, startOidcStandIn } from "../scripts/oidc-stand-in.ts";
 
 const REPO = join(import.meta.dir, "..");
+const TOKEN = `readme-users-${crypto.randomUUID()}`;
 const README = readFileSync(join(REPO, "README.md"), "utf8");
 const DOMAIN_SWAP = readFileSync(join(REPO, "docs", "DOMAIN-SWAP.md"), "utf8");
 /** The FAQ moved out of the README into its own page, one H2 per question (#58). */
@@ -94,10 +96,10 @@ interface Run {
   stderr: string;
 }
 
-async function users(dir: string, args: string[]): Promise<Run> {
+async function users(dir: string, okta: OidcStandIn, args: string[]): Promise<Run> {
   const child = spawnChild(["bun", "--no-env-file", "scripts/users.ts", ...args], {
     cwd: REPO,
-    env: childEnv({ IDP_DB_PATH: join(dir, "idp.db"), GOVERNANCE_DB_PATH: join(dir, "governance.db") }),
+    env: childEnv({ GOVERNANCE_DB_PATH: join(dir, "governance.db"), OKTA_ORG_URL: okta.url, OKTA_API_TOKEN: TOKEN }),
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -109,16 +111,21 @@ async function users(dir: string, args: string[]): Promise<Run> {
   return { code, stdout, stderr };
 }
 
-/** Runs every command against one fresh pair of databases; the failures, by command. */
+/** Runs every command against a fresh database and an empty stand-in Okta org; the failures, by command. */
 async function runAll(commands: string[][]): Promise<{ failures: string[]; list: string }> {
   const dir = mkdtempSync(join(scratch, "case-"));
-  const failures: string[] = [];
-  for (const [i, argv] of commands.entries()) {
-    const run = await users(dir, filled(argv, i));
-    if (run.code !== 0) failures.push(`users ${argv.join(" ")} exited ${run.code}: ${run.stderr.trim()}`);
+  const okta = await startOidcStandIn({ managementToken: TOKEN });
+  try {
+    const failures: string[] = [];
+    for (const [i, argv] of commands.entries()) {
+      const run = await users(dir, okta, filled(argv, i));
+      if (run.code !== 0) failures.push(`users ${argv.join(" ")} exited ${run.code}: ${run.stderr.trim()}`);
+    }
+    const list = await users(dir, okta, ["list"]);
+    return { failures, list: list.stdout };
+  } finally {
+    okta.stop();
   }
-  const list = await users(dir, ["list"]);
-  return { failures, list: list.stdout };
 }
 
 describe("the README's users commands", () => {

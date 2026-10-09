@@ -88,6 +88,7 @@
  */
 import type { Database } from "bun:sqlite";
 import { userInfo } from "node:os";
+import { join } from "node:path";
 import { parseArgs } from "node:util";
 
 import { readConfig } from "../gate/service/config.ts";
@@ -107,6 +108,7 @@ import {
   type SubjectChange,
 } from "../gate/service/subjects.ts";
 import { OktaError } from "./okta/client.ts";
+import { parseEnv, readEnvFile } from "./setup-arcade/env-file.ts";
 import {
   generatePassword,
   type OktaPeople,
@@ -141,6 +143,15 @@ add, list, remove and seed-demo reach Okta, with OKTA_API_TOKEN from the environ
 class Refusal extends Error {}
 /** A command line this script cannot read: exit 2. */
 class UsageError extends Error {}
+
+// The API token reaches this command through the environment only (op run). One in a file
+// Bun loads would be used without a word, so it is refused, by name and never by value.
+for (const file of [".env", ".env.local"]) {
+  if ((parseEnv(readEnvFile(join(process.cwd(), file))).OKTA_API_TOKEN ?? "").trim() !== "") {
+    console.error(`users: OKTA_API_TOKEN is set in ${file}. Take it out: it reaches this command through the environment only (op run), never through a file.`);
+    process.exit(78);
+  }
+}
 
 const config = readConfig();
 const seedOptions = {
