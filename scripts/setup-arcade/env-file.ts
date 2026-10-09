@@ -11,7 +11,7 @@
  * filled where it stands; a key that is absent is appended under one header.
  * Comments and order survive, so the file stays the one the developer copied.
  */
-import { writeFileSync } from "node:fs";
+import { chmodSync, writeFileSync } from "node:fs";
 
 import { isOverrideWarned, parseEnv, readEnvText } from "../env-overrides.ts";
 
@@ -60,6 +60,8 @@ export function fillBlanks(text: string, values: Record<string, string>, by = "s
 
 export function writeEnvFile(path: string, text: string): void {
   writeFileSync(path, text, { mode: 0o600 });
+  // `mode` only applies to a new file: an existing one keeps its own, and a secret is about to be in it.
+  chmodSync(path, 0o600);
 }
 
 /**
