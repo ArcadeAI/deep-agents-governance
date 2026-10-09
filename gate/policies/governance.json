@@ -37,6 +37,9 @@
         "note?",
         "approval?"
       ]
+    },
+    "Gmail": {
+      "SendEmail": []
     }
   },
   "subjects": [

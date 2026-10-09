@@ -110,7 +110,8 @@ describe("the seed", () => {
 
   test("keys every rule and the catalogue on the configured toolkit name, not on a literal", () => {
     const data = loadSeed({ toolkit: "LoanBook" });
-    expect(Object.keys(data.catalogue)).toEqual(["LoanBook"]);
+    // Gmail is a toolkit Arcade hosts, so its name is a literal on purpose.
+    expect(Object.keys(data.catalogue)).toEqual(["LoanBook", "Gmail"]);
     expect(Object.keys(data.catalogue.LoanBook!)).toHaveLength(6);
     // Every rule is keyed on the configured name and on no literal: a rule
     // left pointing at "$TOOLKIT", or at the default "LoanDesk" when the
@@ -142,8 +143,8 @@ describe("seeding", () => {
     const db = bare();
     expect(counts(db)).toMatchObject({
       subjects: 0,
-      // The six LoanDesk tools.
-      catalogue: 6,
+      // The six LoanDesk tools, and Gmail.SendEmail.
+      catalogue: 7,
       // One access rule, one approve rule, four decide guards.
       policy_rules: 6,
       // Act 3 and act 4.
