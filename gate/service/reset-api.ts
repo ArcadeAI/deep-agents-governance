@@ -25,10 +25,10 @@
  *            The rehearsal reset — the state a fresh disk comes up in, so the
  *            next take starts from nothing.
  *
- * Neither mode touches **`idp.db`**. The OAuth client credentials registered in
- * the Arcade dashboard live there (DESIGN.md), and regenerating them turns a
- * demo reset into a re-registration nobody asked for. This service does not
- * hold a handle to that database and this endpoint does not open one.
+ * Neither mode touches **the identity provider**. People and the OAuth client
+ * Arcade is registered against live in Okta (DESIGN.md), and a demo reset that
+ * changed them would be a re-registration nobody asked for. This service holds
+ * no Okta credential, and this endpoint calls nothing outside the app.
  *
  * Neither mode touches **`loans.db`** either, and that is a boundary rather
  * than an omission: it belongs to `apps/loan-app`, which knows nothing about
@@ -205,7 +205,7 @@ export async function handleReset(
     // presenter who ran "demo" and believes the loan book is back to seed.
     not_reset: {
       "loans.db": "owned by the loan module; reset with POST /bank/admin/reset",
-      "idp.db": "never reset from here — it holds the OAuth client Arcade is registered against",
+      identity: "held by the identity provider (Okta); never reset from here",
     },
   });
 }

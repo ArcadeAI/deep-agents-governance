@@ -499,7 +499,7 @@ describe("POST /admin/reset (#106)", () => {
     const body = (await (await reset(instance.base, { mode: "demo" })).json()) as {
       not_reset: Record<string, string>;
     };
-    expect(Object.keys(body.not_reset).sort()).toEqual(["idp.db", "loans.db"]);
+    expect(Object.keys(body.not_reset).sort()).toEqual(["identity", "loans.db"]);
   });
 
   test("defaults to the narrow mode and refuses one it does not know", async () => {

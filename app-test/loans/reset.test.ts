@@ -174,10 +174,10 @@ describe("the seeded book comes back", () => {
     expect(listed.count).toBeGreaterThan(1);
   });
 
-  test("the response names the two databases it did not touch", async () => {
+  test("the response names what it did not touch: governance.db and the identity provider", async () => {
     const body = (await (await reset(live.baseUrl)).json()) as ResetBody;
     expect(body.reset).toBe("loans.db");
-    expect(Object.keys(body.not_reset).sort()).toEqual(["governance.db", "idp.db"]);
+    expect(Object.keys(body.not_reset).sort()).toEqual(["governance.db", "identity"]);
   });
 });
 

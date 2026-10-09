@@ -554,8 +554,8 @@ function columnExists(db: Database, table: string, column: string): boolean {
  * otherwise brings its schema up to `SCHEMA_VERSION` without touching a row.
  *
  * **The seed writes the policy and no people** (#33). The catalogue and the
- * rules come from the fixture; `subjects` starts empty, the same as `idp.db`,
- * and `bun run users add` or `bun run users seed-demo` fills it. Seeding the
+ * rules come from the fixture; `subjects` starts empty, and `bun run users add`
+ * or `bun run users seed-demo` fills it, creating each person in Okta too. Seeding the
  * demo cast here would leave four subjects nobody can sign in as, and approval
  * routing picks from every subject: a fresh deployment would route a $95K
  * request to `charlie@bank.example`, who does not exist.
