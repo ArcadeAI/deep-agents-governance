@@ -26,7 +26,6 @@ const ROOT = join(import.meta.dir, "..");
 /** #54's list, and a spread of `IDP_*`: the ones `.env.example` ships and two it leaves commented out. */
 const WARNED = [
   "SESSION_SECRET",
-  "BETTER_AUTH_SECRET",
   "APP_PUBLIC_HOST",
   "ARCADE_API_KEY",
   "ARCADE_HOOK_SIGNING_SECRET",
@@ -128,10 +127,10 @@ describe("each identity or secret key the shell sets", () => {
   });
 
   test("the warning names every key, says the shell's value wins, and says how to stop it", () => {
-    const line = overrideWarning(["BETTER_AUTH_SECRET", "IDP_CLIENT_ID"], "bun run dev");
-    expect(line).toContain("BETTER_AUTH_SECRET, IDP_CLIENT_ID are set in this shell");
+    const line = overrideWarning(["SESSION_SECRET", "IDP_CLIENT_ID"], "bun run dev");
+    expect(line).toContain("SESSION_SECRET, IDP_CLIENT_ID are set in this shell");
     expect(line).toContain("the shell's value wins: `bun run dev` runs on them, not on .env");
-    expect(line).toContain("unset BETTER_AUTH_SECRET IDP_CLIENT_ID");
+    expect(line).toContain("unset SESSION_SECRET IDP_CLIENT_ID");
     expect(overrideWarning(["IDP_CLIENT_ID"], "bun run dev")).toContain("IDP_CLIENT_ID is set in this shell to a value");
   });
 });
@@ -197,7 +196,7 @@ test("`bun run dev` names each key a shell sets to a value .env does not hold, o
 }, 60_000);
 
 test("`bun run dev` says nothing when the shell exports what .env holds, or nothing at all", async () => {
-  const dotenv = { IDP_CLIENT_ID: "the-same-client", BETTER_AUTH_SECRET: "the-same-secret" };
+  const dotenv = { IDP_CLIENT_ID: "the-same-client", SESSION_SECRET: "the-same-secret" };
   const dir = await devProject(dotenv);
   for (const shell of [dotenv, {}]) {
     const output = await dev(dir, shell);

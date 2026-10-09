@@ -6,9 +6,8 @@
  * Next's under it. That is right for a host that injects its
  * configuration, and it is a trap on a laptop. On the #52 live test the
  * human's terminal still exported an older clone's `.env`: `bun run dev` ran on
- * that clone's `IDP_CLIENT_ID`, sign-in failed with `invalid_client`, and the
- * same stale `BETTER_AUTH_SECRET` encrypted `idp.db`'s signing key, so the next
- * clean boot refused it. Nothing said the shell was involved.
+ * that clone's `IDP_CLIENT_ID`, sign-in failed with `invalid_client`, and
+ * nothing said the shell was involved.
  *
  * So that command names, on start, every identity or secret key the
  * shell sets to a value other than the one the `.env` files give, and says the
@@ -19,9 +18,7 @@
  * what to register from `.env` alone.
  *
  * The launcher calls it, `scripts/next.ts`, before the app starts, and never
- * the app itself: comparing `BETTER_AUTH_SECRET` means reading it, and no app
- * source outside the identity provider does
- * (`app-test/identity/only-identity-mints.test.ts`). `scripts/` is not in the image.
+ * the app itself. `scripts/` is not in the image.
  */
 import { readFileSync } from "node:fs";
 
@@ -58,13 +55,13 @@ export function readEnvText(path: string): string {
 /**
  * The keys a shell override is worth a warning for: every `IDP_*`, and the
  * secrets and host the identity and the Arcade registration are keyed on. The
- * first five are #54's list; `ARCADE_HOOK_SIGNING_SECRET` and
+ * first four are #54's list (its fifth, the bundled provider's secret, went
+ * with the provider); `ARCADE_HOOK_SIGNING_SECRET` and
  * `APPROVALS_STORE_TOKEN` are the other two secrets `setup-arcade` writes and
  * registers with Arcade, so a stale one fails the same way, out of sight.
  */
 export const OVERRIDE_WARNED_KEYS = [
   "SESSION_SECRET",
-  "BETTER_AUTH_SECRET",
   "APP_PUBLIC_HOST",
   "ARCADE_API_KEY",
   "ARCADE_HOOK_SIGNING_SECRET",

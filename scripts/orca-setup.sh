@@ -5,13 +5,13 @@
 #   1. Claim a block of ports no other live worktree holds, and write them to
 #      an untracked .env.local.
 #   2. Install dependencies. One `bun install` at the root covers every
-#      workspace, the identity provider (auth/provider) included.
+#      workspace.
 #
 # Wire it up in the Orca app: Repo settings -> hooks -> setup script:
 #   bash scripts/orca-setup.sh
 # Set the repo's setup policy to wait-for-setup, not start-immediately: an
 # agent that begins before the install finishes runs `bun test` against a
-# half-installed tree, gets "Cannot find module 'better-auth'", reads it as a
+# half-installed tree, gets "Cannot find module 'next'", reads it as a
 # broken repo, and starts fixing what is not wrong.
 #
 # Idempotent: re-running keeps the block this worktree already holds.
@@ -138,10 +138,10 @@ WEB=$((BASE + 0)); HOOKS=$((BASE + 1)); LOAN=$((BASE + 2)); IDP=$((BASE + 3))
 shared() {
   cat <<ENVEOF
 # Host-form, matching .env.example: consumers add the scheme. One host since
-# #6: the control plane (#4), the loan API (#5, under /bank) and the identity
-# provider (#6) are all the app, on the app's port, and so is the issuer.
-# IDENTITY_HOST and CONTROL_PLANE_HOST are unset on purpose: both default to
-# the app's own listener. CG_PORT_HOOKS, CG_PORT_LOAN_APP and CG_PORT_IDP stay
+# #6: the control plane (#4) and the loan API (#5, under /bank) are the app,
+# on the app's port. The identity provider is Okta (IDP_ISSUER in .env).
+# CONTROL_PLANE_HOST is unset on purpose: it defaults to the app's own
+# listener. CG_PORT_HOOKS, CG_PORT_LOAN_APP and CG_PORT_IDP stay
 # claimed in the block and nothing binds them.
 APP_PUBLIC_HOST=localhost:$WEB
 ENVEOF

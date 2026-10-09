@@ -1093,7 +1093,7 @@ function authorizationChallenge(authorizationUrl: string): string {
  * and nothing was listening where anybody was calling.
  *
  * That is #56's bug exactly, and this is #56's fix:
- * `scripts/dev-idp.ts` reads the port out of `IDENTITY_HOST` —
+ * `scripts/dev-idp.ts` reads the port out of `IDP_ISSUER` —
  * the address the loan API already asks for — so the two agree by construction.
  * `ARCADE_API_URL` is the same kind of value here: it is where the app is
  * told to reach Arcade, so binding it leaves no second number to keep in step.

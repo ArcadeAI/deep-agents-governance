@@ -1,8 +1,7 @@
 /**
  * The origin trap (#9, from #6's assumptions on #7).
  *
- * Better Auth's session cookie, the app's sealed session and the custom
- * verifier all live on one origin, `https://<APP_PUBLIC_HOST>`. A browser on
+ * The app's sealed session cookie and the custom verifier both live on one origin, `https://<APP_PUBLIC_HOST>`. A browser on
  * `http://localhost:<port>` has none of them: sign-in sets its cookies for the
  * other host, and when Arcade sends that browser to the verifier it arrives
  * signed out and is sent to sign in again. Nothing fails loudly; it just never
