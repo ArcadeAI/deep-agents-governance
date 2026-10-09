@@ -14,7 +14,9 @@
  *   it, so "the IdP still knows who you are" is a real condition here;
  * - `/v1/token`: `authorization_code` and `refresh_token`, with the client
  *   authenticated by HTTP Basic or by the body, never both (Okta refuses a
- *   request that carries both, and so does this);
+ *   request that carries both, and so does this). A refresh token comes only
+ *   with `offline_access`, rotates on every use, and a spent one presented
+ *   again revokes every token of its grant;
  * - `/v1/userinfo`: `sub`, `email`, `email_verified` and `name` for a live
  *   access token;
  * - `/v1/keys`: the RS256 key every ID token is signed with.
@@ -138,8 +140,14 @@ export async function startOidcStandIn(options: OidcStandInOptions = {}): Promis
     string,
     { clientId: string; redirectUri: string; challenge: string; email: string; nonce: string | null; scope: string }
   >();
-  const access = new Map<string, { email: string; expires: number }>();
-  const refresh = new Map<string, { clientId: string; email: string; scope: string }>();
+  const access = new Map<string, { email: string; expires: number; family: string }>();
+  const refresh = new Map<string, { clientId: string; email: string; scope: string; family: string }>();
+  /** Refresh tokens already redeemed, by the family they belonged to: presenting one again revokes the family. */
+  const spent = new Map<string, string>();
+  const revokeFamily = (family: string) => {
+    for (const [token, held] of access) if (held.family === family) access.delete(token);
+    for (const [token, held] of refresh) if (held.family === family) refresh.delete(token);
+  };
   const lifetime = options.accessTokenSeconds ?? 3600;
   const cookieName = "standin_sid";
 
@@ -193,16 +201,22 @@ export async function startOidcStandIn(options: OidcStandInOptions = {}): Promis
     return `${header}.${payload}.${b64url(signature)}`;
   }
 
-  async function tokens(clientId: string, email: string, scope: string, nonce: string | null) {
+  /**
+   * A refresh token only for `offline_access`, as Okta issues one, and rotated
+   * on every use with no grace period: the strictest setting an Okta app can
+   * have, so a caller that replays a spent token is caught here.
+   */
+  async function tokens(clientId: string, email: string, scope: string, nonce: string | null, family = random()) {
     const accessToken = `standin-access-${random()}`;
-    access.set(accessToken, { email, expires: Date.now() + lifetime * 1000 });
-    const refreshToken = `standin-refresh-${random()}`;
-    refresh.set(refreshToken, { clientId, email, scope });
+    access.set(accessToken, { email, expires: Date.now() + lifetime * 1000, family });
+    const offline = scope.split(" ").includes("offline_access");
+    const refreshToken = offline ? `standin-refresh-${random()}` : null;
+    if (refreshToken) refresh.set(refreshToken, { clientId, email, scope, family });
     return {
       token_type: "Bearer",
       expires_in: lifetime,
       access_token: accessToken,
-      refresh_token: refreshToken,
+      ...(refreshToken ? { refresh_token: refreshToken } : {}),
       scope,
       ...(scope.split(" ").includes("openid") ? { id_token: await idToken(clientId, email, nonce) } : {}),
     };
@@ -434,11 +448,16 @@ export async function startOidcStandIn(options: OidcStandInOptions = {}): Promis
           return json(await tokens(client.clientId, code.email, code.scope, code.nonce));
         }
         if (grant === "refresh_token") {
-          const held = refresh.get(body.get("refresh_token") ?? "");
+          const presented = body.get("refresh_token") ?? "";
+          const replayed = spent.get(presented);
+          if (replayed !== undefined) revokeFamily(replayed);
+          const held = refresh.get(presented);
           if (!held || held.clientId !== client.clientId || !people.has(held.email)) {
             return oauthError("invalid_grant", "The refresh token is invalid or expired.");
           }
-          return json(await tokens(client.clientId, held.email, held.scope, null));
+          refresh.delete(presented);
+          spent.set(presented, held.family);
+          return json(await tokens(client.clientId, held.email, held.scope, null, held.family));
         }
         return oauthError("unsupported_grant_type", `${grant || "(none)"} is not supported`);
       }

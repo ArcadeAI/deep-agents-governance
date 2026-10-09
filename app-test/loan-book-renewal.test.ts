@@ -2,8 +2,9 @@
  * The failure round 1 of #160's review found: a server render that spends a
  * rotating refresh token and has nowhere to put the replacement.
  *
- * `apps/idp` rotates, and the rotation is destructive to what the cookie still
- * holds. Measured here, in this order, because the order is the whole point:
+ * An Okta app can rotate refresh tokens on every use, and at its strictest
+ * (no grace period) the rotation is destructive to what the cookie still
+ * holds. Pinned here, in this order, because the order is the whole point:
  *
  *   1. a clean rotation leaves **both** access tokens working — the one in the
  *      cookie and the one just minted;
@@ -18,11 +19,12 @@
  * are server components and cannot set a cookie, so they are exactly the
  * callers that must not renew.
  *
- * Everything here is real: a real `apps/idp` subprocess, a real
- * authorization-code + PKCE flow asking for `offline_access`, a real
- * loan module (`api/`) with a real `loans.db`, and the real `readLoanBook`. A
- * counting proxy sits in front of the IdP so "the refresh token was not spent"
- * is a number this file reads back rather than a claim it makes.
+ * The identity provider is the OIDC stand-in (`scripts/oidc-stand-in.ts`),
+ * set to that strictest rotation; the rest is real: an authorization-code +
+ * PKCE flow asking for `offline_access`, a loan module (`api/`) with a real
+ * `loans.db`, and the real `readLoanBook`. The stand-in logs every grant its
+ * token endpoint is asked for, so "the refresh token was not spent" is a
+ * number this file reads back rather than a claim it makes.
  *
  * Every port is `:0` or taken from the OS.
  */
@@ -31,7 +33,6 @@ import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { identityLink, linkIdentity } from "../auth/link.ts";
 import { nonce, pkce } from "../auth/oidc.ts";
 import { readLoanBook } from "../lib/loan-context/read.ts";
 import { openLoanBook } from "../api/db.ts";
@@ -42,9 +43,16 @@ let identity: IdentityHarness;
 /** A real loan module over its own `loans.db`, handed to the reader in-process (#5). */
 let loans: LoanModule;
 let workspace: string;
-/** Every `grant_type` the IdP's token endpoint was asked for, counted at the in-process link. */
-let grants: string[] = [];
-/** What `readLoanBook` is told the IdP is: the harness's, whose token calls are counted below. */
+/** Every `grant_type` the IdP's token endpoint was asked for since the test last cleared it. */
+const grants = {
+  get list(): string[] {
+    return identity.idp.grants;
+  },
+  clear(): void {
+    identity.idp.grants.length = 0;
+  },
+};
+/** What `readLoanBook` is told the IdP is: the harness's. */
 let idpConfig: { issuer: string; clientId: string; clientSecret: string };
 
 beforeAll(async () => {
@@ -54,28 +62,9 @@ beforeAll(async () => {
 
   loans = createLoanModule({
     db: openLoanBook(join(workspace, "loans.db")),
-    // The loan book validates bearers against the IdP itself, not the proxy:
-    // the proxy exists to count what `readLoanBook` asks for, and putting it
-    // on this leg too would blur the two.
-    idpIssuer: new URL(identity.idpUrl).host,
+    // The loan book validates bearers at the same issuer's userinfo endpoint.
+    idpIssuer: identity.idpUrl,
     resetToken: "",
-  });
-
-  // Every refresh the reader makes reaches the provider in-process since #6
-  // (`auth/link.ts`), not over HTTP, so the counting sits where the
-  // proxy used to: around the linked provider, passing every request on
-  // untouched.
-  const linked = identityLink();
-  if (linked === undefined) throw new Error("the identity harness linked no provider");
-  linkIdentity({
-    failure: linked.failure,
-    async fetch(request) {
-      const url = new URL(request.url);
-      if (url.pathname === "/oauth2/token" && request.method === "POST") {
-        grants.push(new URLSearchParams(await request.clone().text()).get("grant_type") ?? "unknown");
-      }
-      return linked.fetch(request);
-    },
   });
 
   idpConfig = {
@@ -95,9 +84,9 @@ afterAll(async () => {
  * A real grant that carries a refresh token.
  *
  * The ordinary sign-in cannot produce one: `IDP_SCOPES` defaults to
- * `openid email` and `apps/idp` issues no refresh token for it (measured
- * 2026-09-18). So this drives the same authorization-code + PKCE flow against
- * the same real IdP with `offline_access` added — which is exactly what a
+ * `openid email` and Okta issues no refresh token for it. So this drives the
+ * same authorization-code + PKCE flow against the same IdP with
+ * `offline_access` added, which is exactly what a
  * deployment that sets `IDP_SCOPES=openid email offline_access` gets, and the
  * only configuration in which the renewal path exists at all.
  */
@@ -108,7 +97,7 @@ async function grantWithRefreshToken(persona: keyof typeof PEOPLE): Promise<IdpT
   const state = nonce();
   const browser = new Browser();
   const landed = await browser.follow(
-    `${identity.idpUrl}/oauth2/authorize?` +
+    `${identity.idp.endpoints.authorize}?` +
       new URLSearchParams({
         response_type: "code",
         client_id: identity.config.identity.idpClientId,
@@ -129,7 +118,7 @@ async function grantWithRefreshToken(persona: keyof typeof PEOPLE): Promise<IdpT
   const code = new URL(landed.url).searchParams.get("code");
   if (code === null) throw new Error(`no authorization code for ${persona}; landed at ${landed.url}`);
 
-  const response = await fetch(`${identity.idpUrl}/oauth2/token`, {
+  const response = await fetch(identity.idp.endpoints.token, {
     method: "POST",
     headers: {
       "content-type": "application/x-www-form-urlencoded",
@@ -141,13 +130,12 @@ async function grantWithRefreshToken(persona: keyof typeof PEOPLE): Promise<IdpT
       grant_type: "authorization_code",
       code,
       redirect_uri: redirectUri,
-      client_id: identity.config.identity.idpClientId,
       code_verifier: verifier,
     }).toString(),
   });
   const token = (await response.json()) as { access_token: string; refresh_token?: string };
   if (token.refresh_token === undefined) {
-    throw new Error("apps/idp issued no refresh token for `openid email offline_access`");
+    throw new Error("the identity provider issued no refresh token for `openid email offline_access`");
   }
   return { access_token: token.access_token, refresh_token: token.refresh_token, expires_at: 0 };
 }
@@ -182,7 +170,7 @@ describe("a server render, which cannot store a renewed token", () => {
   test("two loads in a row both work, and neither spends the refresh token", async () => {
     const token = await grantWithRefreshToken("dana");
     const session = sessionWith(token, PEOPLE.dana.email);
-    grants = [];
+    grants.clear();
 
     const first = await read(session);
     const second = await read(session);
@@ -190,7 +178,7 @@ describe("a server render, which cannot store a renewed token", () => {
     expect(first.status).toBe("loaded");
     expect(second.status).toBe("loaded");
     // The number, not the narrative: the token endpoint was never asked.
-    expect(grants).toEqual([]);
+    expect(grants.list).toEqual([]);
   }, 60_000);
 
   /**
@@ -208,12 +196,12 @@ describe("a server render, which cannot store a renewed token", () => {
     await read(session);
     await read(session);
 
-    grants = [];
+    grants.clear();
     const resealed: Session[] = [];
     const routed = await read(session, { onRenewed: (next) => resealed.push(next) });
 
     expect(routed.status).toBe("loaded");
-    expect(grants).toEqual(["refresh_token"]);
+    expect(grants.list).toEqual(["refresh_token"]);
     const stored = resealed[0]?.idp;
     expect(stored).toBeDefined();
     expect(stored?.access_token).not.toBe(token.access_token);
@@ -246,11 +234,11 @@ describe("a route handler, which can", () => {
     const token = await grantWithRefreshToken("riley");
     const session = sessionWith(token, PEOPLE.riley.email);
 
-    grants = [];
+    grants.clear();
     const resealed: Session[] = [];
     const first = await read(session, { onRenewed: (next) => resealed.push(next) });
     expect(first.status).toBe("loaded");
-    expect(grants).toEqual(["refresh_token"]);
+    expect(grants.list).toEqual(["refresh_token"]);
 
     const next = resealed[0];
     if (next === undefined) throw new Error("the renewal handed back no session");
@@ -260,20 +248,22 @@ describe("a route handler, which can", () => {
     // Still one: the resealed session's expiry is in the future, so the second
     // read spends nothing. A renewal per poll would be a refresh token spent
     // every two seconds.
-    expect(grants).toEqual(["refresh_token"]);
+    expect(grants.list).toEqual(["refresh_token"]);
     expect(resealed).toHaveLength(1);
   }, 60_000);
 
   /**
-   * The measurement this whole file rests on, made against the real IdP so it
-   * cannot rot quietly: a redeemed refresh token is refused **and** takes the
-   * access token minted alongside it down with it.
+   * The behaviour this whole file rests on: a redeemed refresh token is
+   * refused **and** takes the access token minted alongside it down with it.
+   * That is Okta's rotation with no grace period; with Okta's default 30
+   * seconds of grace a quick replay is forgiven, which makes the app's
+   * behaviour above safe under either setting.
    *
-   * If `apps/idp` ever stops behaving this way the tests above would still
+   * If the stand-in ever stops behaving this way the tests above would still
    * pass while no longer proving anything, and this is the one that would fail
    * and say so.
    */
-  test("apps/idp rotates destructively: a replayed refresh token revokes the family", async () => {
+  test("strict rotation: a replayed refresh token revokes the family", async () => {
     const token = await grantWithRefreshToken("morgan");
     const resealed: Session[] = [];
     await read(sessionWith(token, PEOPLE.morgan.email), { onRenewed: (next) => resealed.push(next) });
@@ -295,11 +285,11 @@ describe("a route handler, which can", () => {
 });
 
 function userinfo(accessToken: string): Promise<Response> {
-  return fetch(`${identity.idpUrl}/oauth2/userinfo`, { headers: { authorization: `Bearer ${accessToken}` } });
+  return fetch(identity.idp.endpoints.userinfo, { headers: { authorization: `Bearer ${accessToken}` } });
 }
 
 function refresh(refreshToken: string): Promise<Response> {
-  return fetch(`${identity.idpUrl}/oauth2/token`, {
+  return fetch(identity.idp.endpoints.token, {
     method: "POST",
     headers: {
       "content-type": "application/x-www-form-urlencoded",
@@ -310,7 +300,6 @@ function refresh(refreshToken: string): Promise<Response> {
     body: new URLSearchParams({
       grant_type: "refresh_token",
       refresh_token: refreshToken,
-      client_id: identity.config.identity.idpClientId,
     }).toString(),
   });
 }
