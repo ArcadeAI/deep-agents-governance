@@ -46,7 +46,7 @@
  * answer; `api/actor.ts`). Stated rather than hidden: if the book ever
  * grows, this is the line that has to change.
  */
-import { appOrigin, type WebConfig } from "../config.ts";
+import type { WebConfig } from "../config.ts";
 import { rosterNames } from "../../auth/roster.ts";
 import { refreshIdpToken, tokenExpiry } from "../../auth/oidc.ts";
 import { withIdpToken, type IdpToken, type Session } from "../../auth/session.ts";
@@ -86,7 +86,7 @@ export interface ReadLoanBookOptions {
   /**
    * Called when the bearer was renewed, so the caller can reseal the cookie.
    *
-   * **Its presence is what permits a renewal at all.** `apps/idp` rotates
+   * **Its presence is what permits a renewal at all.** A provider that rotates
    * refresh tokens and replaying a spent one revokes the grant family
    * (measured; see {@link usableToken}), so a caller that cannot store the
    * replacement must not mint one — it would leave the cookie holding a token
@@ -265,9 +265,11 @@ async function ask(
  *
  * ## A refresh token is only ever spent where the replacement can be stored
  *
- * `apps/idp` **rotates**, and a rotation is destructive to whatever the cookie
+ * A rotating provider (Okta with refresh token rotation on, and the bundled
+ * Better Auth this repo used before Okta, where this was measured) is
+ * destructive to whatever the cookie
  * still holds. Measured 2026-09-18, in this order: a clean rotation leaves both
- * the old and the new access token working (`/oauth2/userinfo` answers 200 for
+ * the old and the new access token working (userinfo answers 200 for
  * each), but presenting a refresh token that has already been redeemed answers
  * `400 invalid_grant` **and revokes the grant family** — the access token
  * minted by that rotation went from 200 to 401 the moment the spent one was
@@ -306,9 +308,7 @@ async function usableToken(session: Session, options: ReadLoanBookOptions): Prom
   if (held.refresh_token === undefined) return held;
 
   const idp = options.idp ?? {
-    // The app's own origin since #6; the refresh itself is in-process
-    // (`refreshIdpToken` → `auth/link.ts`), never over the tunnel.
-    issuer: appOrigin(process.env),
+    issuer: (process.env.IDP_ISSUER ?? "").trim(),
     clientId: (process.env.IDP_CLIENT_ID ?? "").trim(),
     clientSecret: (process.env.IDP_CLIENT_SECRET ?? "").trim(),
   };

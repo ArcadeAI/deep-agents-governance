@@ -34,13 +34,13 @@ import { sessionSecretProblem } from "../auth/seal.ts";
  */
 export interface IdentityConfig {
   /**
-   * The identity provider's public origin and OAuth issuer, no trailing slash:
-   * `appOrigin`, since #6 folded `apps/idp` into the app. It was `IDP_ISSUER`.
-   * Only a browser is ever sent here; this server reaches the provider
-   * in-process (`auth/link.ts`).
+   * `IDP_ISSUER`: the identity provider's OAuth issuer, no trailing slash. An
+   * Okta custom authorization server in the workshop
+   * (`https://<org>.okta.com/oauth2/default`). Every endpoint is read from its
+   * discovery document (`auth/discovery.ts`), never spelled here.
    */
   idpIssuer: string;
-  /** Client C: this service's own registration at the IdP, separate from the two Arcade holds. */
+  /** The Okta Web app's client id and secret, shared with the two registrations Arcade holds. */
   idpClientId: string;
   idpClientSecret: string;
   /** What sign-in asks for. `email` is the join key, so it is not optional. */
@@ -49,16 +49,15 @@ export interface IdentityConfig {
   sessionSecret: string;
   /**
    * This app's own public origin, no trailing slash. Every redirect_uri is
-   * built from it. `appOrigin` since #6; it was `PUBLIC_URL`, and it cannot
-   * differ from `idpIssuer` any more — see `appPublicHost`.
+   * built from it. `appOrigin` since #6; it was `PUBLIC_URL`.
    */
   publicUrl: string;
   /**
-   * Whether `APP_PUBLIC_HOST` is set, rather than `idpIssuer` and `publicUrl`
-   * being the localhost fallback. The sign-in and the verifier refuse to run
-   * on the fallback: a deployment that forgot the variable would otherwise
-   * register `http://localhost:3000/...` redirect URIs and name a localhost
-   * issuer, and the failure would land at Arcade, where no hook fires.
+   * Whether `APP_PUBLIC_HOST` is set, rather than `publicUrl` being the
+   * localhost fallback. The sign-in and the verifier refuse to run on the
+   * fallback: a deployment that forgot the variable would otherwise send
+   * `http://localhost:3000/...` redirect URIs, and the failure would land at
+   * Arcade, where no hook fires.
    */
   publicHostConfigured: boolean;
   /** `ARCADE_GATEWAY_ID` — `cg-demo-us`, the User Source gateway hop 1 authorizes against. */
@@ -157,7 +156,7 @@ export function readIdentitySurface(
     arcadeApiUrl: trimUrl(env.ARCADE_API_URL) || "https://api.arcade.dev",
     arcadeApiKey: env.ARCADE_API_KEY?.trim() ?? "",
     identity: {
-      idpIssuer: appOrigin(env),
+      idpIssuer: trimUrl(env.IDP_ISSUER),
       idpClientId: env.IDP_CLIENT_ID?.trim() ?? "",
       idpClientSecret: env.IDP_CLIENT_SECRET?.trim() ?? "",
       // `openid` for an ID token, `email` because the address is the join key
@@ -325,6 +324,7 @@ export function signinProblems(config: IdentitySurface): string[] {
   const secret = sessionSecretProblem(identity.sessionSecret);
   return [
     ...(identity.publicHostConfigured ? [] : ["APP_PUBLIC_HOST is not set"]),
+    ...(identity.idpIssuer ? [] : ["IDP_ISSUER is not set"]),
     ...(identity.idpClientId ? [] : ["IDP_CLIENT_ID is not set"]),
     ...(identity.idpClientSecret ? [] : ["IDP_CLIENT_SECRET is not set"]),
     ...(secret ? [secret] : []),
@@ -375,19 +375,17 @@ export function cookiesAreSecure(config: IdentitySurface): boolean {
  * The ngrok host in a real run, and the one Arcade tool secret besides the
  * store token: `mcp/loan_desk/loans.py` and `mcp/loan_desk/approvals.py` read it too. It replaced
  * one host variable per service — the loan API's, the control plane's and the
- * web UI's, three services that are now one app — and the identity module's
- * `IDP_PUBLIC_URL`, the sign-in's `IDP_ISSUER` and the app's `PUBLIC_URL`,
- * which have to be the same origin once the identity provider is part of the
- * app: Better Auth's session cookie, the app's sealed one and the custom
- * verifier all live on it.
+ * web UI's, three services that are now one app — and the app's `PUBLIC_URL`.
+ * The app's sealed session cookie and the custom verifier live on it. The
+ * identity provider does not: it is Okta, at `IDP_ISSUER`.
  *
  * HOST-form like every address here. Unset, it is this process's own port on
  * localhost, which is what a local run without a tunnel wants.
  *
  * **Addressed to the outside world only.** A server-side read of the app's own
  * modules never goes through it: the tunnel would carry the app's own traffic
- * out and back in. Those reads go in-process, or to `CONTROL_PLANE_HOST` and
- * `IDENTITY_HOST`, which are local. `app-test/server-side-readers.test.ts`
+ * out and back in. Those reads go in-process, or to `CONTROL_PLANE_HOST`,
+ * which is local. `app-test/server-side-readers.test.ts`
  * fails if one targets this host.
  */
 export function appPublicHost(env: Record<string, string | undefined> = process.env): string {
@@ -401,7 +399,7 @@ export function appPublicHostIsFallback(env: Record<string, string | undefined> 
 
 /**
  * `APP_PUBLIC_HOST` with its scheme, and no trailing slash: the app's public
- * origin, the identity module's OAuth issuer and the base of every
+ * origin and the base of every
  * `redirect_uri` this app registers. http for localhost and 127.0.0.1, https
  * for everything else (see {@link baseUrl}).
  */

@@ -33,7 +33,7 @@ let status: number | null = null;
 let calls = 0;
 
 let idp: Server<unknown>;
-let idpHost: string;
+let idpIssuer: string;
 
 beforeAll(() => {
   idp = Bun.serve({
@@ -53,7 +53,7 @@ beforeAll(() => {
       return Response.json({ sub: email, email, email_verified: true });
     },
   });
-  idpHost = `localhost:${idp.port}`;
+  idpIssuer = `localhost:${idp.port}`;
 });
 
 afterAll(() => {
@@ -86,7 +86,7 @@ describe("how often the provider is asked", () => {
     answers = { "tok-alice": ALICE };
 
     const seen = [];
-    for (let poll = 0; poll < 30; poll++) seen.push(await actorFromRequest(read("tok-alice"), idpHost));
+    for (let poll = 0; poll < 30; poll++) seen.push(await actorFromRequest(read("tok-alice"), idpIssuer));
 
     // 30 polls is a minute of one screen at #157's 2s interval. The provider's
     // measured ceiling on this endpoint is 60 requests, so before this was
@@ -98,10 +98,10 @@ describe("how often the provider is asked", () => {
   test("two people are two answers, not one shared one", async () => {
     answers = { "tok-alice": ALICE, "tok-bob": BOB };
 
-    expect(await actorFromRequest(read("tok-alice"), idpHost)).toBe(ALICE);
-    expect(await actorFromRequest(read("tok-bob"), idpHost)).toBe(BOB);
-    expect(await actorFromRequest(read("tok-alice"), idpHost)).toBe(ALICE);
-    expect(await actorFromRequest(read("tok-bob"), idpHost)).toBe(BOB);
+    expect(await actorFromRequest(read("tok-alice"), idpIssuer)).toBe(ALICE);
+    expect(await actorFromRequest(read("tok-bob"), idpIssuer)).toBe(BOB);
+    expect(await actorFromRequest(read("tok-alice"), idpIssuer)).toBe(ALICE);
+    expect(await actorFromRequest(read("tok-bob"), idpIssuer)).toBe(BOB);
 
     expect(calls).toBe(2);
   });
@@ -109,11 +109,11 @@ describe("how often the provider is asked", () => {
   test("a write asks every time, however recently a read was answered", async () => {
     answers = { "tok-alice": ALICE };
 
-    await actorFromRequest(read("tok-alice"), idpHost);
+    await actorFromRequest(read("tok-alice"), idpIssuer);
     expect(calls).toBe(1);
 
-    expect(await actorFromRequest(write("tok-alice"), idpHost)).toBe(ALICE);
-    expect(await actorFromRequest(write("tok-alice"), idpHost)).toBe(ALICE);
+    expect(await actorFromRequest(write("tok-alice"), idpIssuer)).toBe(ALICE);
+    expect(await actorFromRequest(write("tok-alice"), idpIssuer)).toBe(ALICE);
 
     // No entry in the loan book's decision history is taken on a remembered
     // token; that is what keeps the staleness bound from mattering.
@@ -126,8 +126,8 @@ describe("how long an answer lasts", () => {
     answers = { "tok-alice": ALICE };
     const start = 1_700_000_000_000;
 
-    await actorFromRequest(read("tok-alice"), idpHost, start);
-    expect(await actorFromRequest(read("tok-alice"), idpHost, start + RESOLUTION_TTL_MS - 1)).toBe(ALICE);
+    await actorFromRequest(read("tok-alice"), idpIssuer, start);
+    expect(await actorFromRequest(read("tok-alice"), idpIssuer, start + RESOLUTION_TTL_MS - 1)).toBe(ALICE);
 
     expect(calls).toBe(1);
   });
@@ -136,8 +136,8 @@ describe("how long an answer lasts", () => {
     answers = { "tok-alice": ALICE };
     const start = 1_700_000_000_000;
 
-    await actorFromRequest(read("tok-alice"), idpHost, start);
-    await actorFromRequest(read("tok-alice"), idpHost, start + RESOLUTION_TTL_MS);
+    await actorFromRequest(read("tok-alice"), idpIssuer, start);
+    await actorFromRequest(read("tok-alice"), idpIssuer, start + RESOLUTION_TTL_MS);
 
     expect(calls).toBe(2);
   });
@@ -146,14 +146,14 @@ describe("how long an answer lasts", () => {
     answers = { "tok-alice": ALICE };
     const start = 1_700_000_000_000;
 
-    expect(await actorFromRequest(read("tok-alice"), idpHost, start)).toBe(ALICE);
+    expect(await actorFromRequest(read("tok-alice"), idpIssuer, start)).toBe(ALICE);
 
     // The provider stops recognising it — the person signed out, or an admin
     // revoked the grant.
     answers = {};
 
-    expect(await actorFromRequest(read("tok-alice"), idpHost, start + 1)).toBe(ALICE);
-    await expect(actorFromRequest(read("tok-alice"), idpHost, start + RESOLUTION_TTL_MS)).rejects.toThrow(
+    expect(await actorFromRequest(read("tok-alice"), idpIssuer, start + 1)).toBe(ALICE);
+    await expect(actorFromRequest(read("tok-alice"), idpIssuer, start + RESOLUTION_TTL_MS)).rejects.toThrow(
       /rejected the token/,
     );
   });
@@ -161,14 +161,14 @@ describe("how long an answer lasts", () => {
   test("a revoked token is refused on a write immediately, and the read stops working too", async () => {
     answers = { "tok-alice": ALICE };
 
-    await actorFromRequest(read("tok-alice"), idpHost);
+    await actorFromRequest(read("tok-alice"), idpIssuer);
     answers = {};
 
-    await expect(actorFromRequest(write("tok-alice"), idpHost)).rejects.toThrow(/rejected the token/);
+    await expect(actorFromRequest(write("tok-alice"), idpIssuer)).rejects.toThrow(/rejected the token/);
     // The refusal erased what was held, so the next read does not sail on for
     // another minute on an answer the provider has just contradicted.
     expect(rememberedKeys()).toEqual([]);
-    await expect(actorFromRequest(read("tok-alice"), idpHost)).rejects.toThrow(/rejected the token/);
+    await expect(actorFromRequest(read("tok-alice"), idpIssuer)).rejects.toThrow(/rejected the token/);
   });
 });
 
@@ -177,7 +177,7 @@ describe("what is never remembered", () => {
     answers = { "tok-alice": ALICE };
     status = 401;
 
-    await expect(actorFromRequest(read("tok-alice"), idpHost)).rejects.toThrow(ActorError);
+    await expect(actorFromRequest(read("tok-alice"), idpIssuer)).rejects.toThrow(ActorError);
     expect(rememberedKeys()).toEqual([]);
   });
 
@@ -189,7 +189,7 @@ describe("what is never remembered", () => {
     // saying something about itself. A person told their grant was rejected
     // would go and authorize again, which is not the recovery for this and
     // costs the one thing a rehearsal does not have (#123).
-    const refusal = await actorFromRequest(read("tok-alice"), idpHost).then(
+    const refusal = await actorFromRequest(read("tok-alice"), idpIssuer).then(
       (email) => new Error(`expected a refusal, resolved to ${email}`),
       (cause: unknown) => cause,
     );
@@ -207,7 +207,7 @@ describe("what is never remembered", () => {
     // refusal window into a second minute of the loan book refusing everyone,
     // which is worse than the thing being fixed.
     status = null;
-    expect(await actorFromRequest(read("tok-alice"), idpHost)).toBe(ALICE);
+    expect(await actorFromRequest(read("tok-alice"), idpIssuer)).toBe(ALICE);
     expect(calls).toBe(2);
   });
 
@@ -236,7 +236,7 @@ describe("what is never remembered", () => {
   test("the bearer itself. Answers are filed under a digest of it", async () => {
     answers = { "tok-alice": ALICE };
 
-    await actorFromRequest(read("tok-alice"), idpHost);
+    await actorFromRequest(read("tok-alice"), idpIssuer);
 
     const keys = rememberedKeys();
     expect(keys).toEqual([tokenFingerprint("tok-alice")]);

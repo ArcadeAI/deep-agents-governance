@@ -49,10 +49,42 @@ export class ActorError extends Error {
   }
 }
 
-/** Hosts are HOST-form (see `.env.example`); the consumer adds the scheme. */
-function baseUrl(host: string): string {
-  const local = host.startsWith("localhost") || host.startsWith("127.0.0.1");
-  return `${local ? "http" : "https"}://${host}`;
+/**
+ * Where the issuer's userinfo endpoint is, read from its OIDC discovery
+ * document (`$IDP_ISSUER/.well-known/openid-configuration`) once per issuer
+ * and kept. On Okta that is `.../oauth2/default/v1/userinfo`; nothing here
+ * spells it, so any OIDC provider works.
+ *
+ * Its own small copy rather than `auth/discovery.ts`: the loan module imports
+ * nothing from the app. A failed read is not kept, so a provider that was
+ * down for a minute is retried on the next request.
+ */
+const userinfoEndpoints = new Map<string, Promise<string>>();
+
+export function userinfoEndpoint(issuer: string): Promise<string> {
+  const key = issuer.trim().replace(/\/+$/, "");
+  const held = userinfoEndpoints.get(key);
+  if (held) return held;
+  const pending = (async () => {
+    if (!key) throw new Error("IDP_ISSUER is not set");
+    const response = await fetch(`${key}/.well-known/openid-configuration`, {
+      headers: { accept: "application/json" },
+    });
+    if (!response.ok) throw new Error(`discovery answered ${response.status}`);
+    const document = (await response.json()) as { userinfo_endpoint?: unknown };
+    if (typeof document.userinfo_endpoint !== "string" || document.userinfo_endpoint === "") {
+      throw new Error("the discovery document has no userinfo_endpoint");
+    }
+    return document.userinfo_endpoint;
+  })();
+  userinfoEndpoints.set(key, pending);
+  pending.catch(() => userinfoEndpoints.delete(key));
+  return pending;
+}
+
+/** Drop every discovered endpoint. Used by tests that point one process at many issuers. */
+export function forgetUserinfoEndpoints(): void {
+  userinfoEndpoints.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -70,48 +102,15 @@ function baseUrl(host: string): string {
  * that into one call per T per person: at T = 60_000 it is 60/min → 1/min,
  * 59 of every 60 calls gone.
  *
- * **What the provider actually enforces**, measured 2026-09-18 against
- * `apps/idp` booted the way its Dockerfile boots it. Not Better Auth's own
- * default — `@better-auth/oauth-provider@1.7.2` declares a rule for this path
- * that overrides it:
- *
- *     pathMatcher: (path) => path === "/oauth2/userinfo",
- *     window: opts.rateLimit?.userinfo?.window ?? 60,
- *     max:    opts.rateLimit?.userinfo?.max    ?? 60
- *
- * **60 requests per 60-second window**, and the counter resets only after a
- * full window with *no allowed request* on that path — every allowed request
- * slides the window forward. A 2-second poll therefore never lets it reset: it
- * ratchets to the ceiling within a minute or two, depending on how many screens
- * are open, and then refuses everything for a minute. That is what stopped
- * sign-in — `apps/web` reads the same endpoint from the same bucket.
- *
- * **T therefore equals the window; it does not clear it.** There is no margin
- * here, and the thing that looks like margin is Better Auth's own default
- * (`window: 10`, `max: 100`, in `context/create-context.mjs`), which this path
- * never uses. What T = 60s actually buys is this:
- *
- *  - **One signed-in person is safe.** Their single cached answer expires, and
- *    the next 2-second poll re-resolves it, so calls land 60–62 seconds apart
- *    — just over the window, so the counter resets every time and never passes
- *    1. Measured at a 61-second interval: five calls, none refused.
- *  - **Four personas are not.** Four calls a minute spaced ~15 seconds apart
- *    never leave the window quiet, so the count still ratchets — to 60 in
- *    about fifteen minutes rather than about fifteen seconds, ending in a
- *    one-minute refusal window and roughly 6% of calls refused against ~80%
- *    before this existed.
- *
- * **A longer T does not close that.** Silence for a whole window means one
- * call per minute *in total*, so N signed-in people would need T ≥ N × 60s:
- * the requirement grows with the audience, which makes it a race rather than a
- * fix, and every second of it is staleness below. T = 60s is the smallest
- * value that keeps a lone person at one call per window, and the largest whose
- * staleness is still the one minute this file promises. Closing the residual
- * needs the thing this service cannot do from here: an explicit `rateLimit`
- * block at the provider (the rule above reads `?? 60`, so it is overridable
- * without touching token format or registration), or registering an
- * `oauthResource` so tokens are JWTs verified offline against `/jwks` and this
- * endpoint is not called at all. Both are #166, and both are the human's.
+ * **Why the provider's rate is the constraint.** The bundled identity
+ * provider this app shipped before Okta allowed 60 userinfo calls per
+ * 60-second window, measured 2026-09-18, and a 2-second poll ratcheted into
+ * that ceiling within a minute and stopped sign-in, which reads the same
+ * endpoint (#166). Okta meters its userinfo endpoint per org as well, so the
+ * same arithmetic holds there: one remembered answer per person per minute
+ * keeps a lone signed-in person at one call a minute, whatever the screens
+ * poll. A longer T would trade more staleness for headroom; one minute is the
+ * staleness this file promises.
  *
  * **Staleness bound.** An answer may be up to {@link RESOLUTION_TTL_MS}
  * milliseconds — 60 seconds — older than the moment it is used. A token
@@ -215,7 +214,7 @@ function remember(key: string, email: string, now: number): void {
  */
 export async function actorFromRequest(
   request: Request,
-  idpHost: string,
+  idpIssuer: string,
   now: number = Date.now(),
 ): Promise<string> {
   const match = /^Bearer\s+(\S+)$/i.exec(request.headers.get("authorization") ?? "");
@@ -234,12 +233,13 @@ export async function actorFromRequest(
 
   let response: Response;
   try {
-    response = await fetch(`${baseUrl(idpHost)}/oauth2/userinfo`, {
+    response = await fetch(await userinfoEndpoint(idpIssuer), {
       headers: { authorization: `Bearer ${match[1]}` },
     });
-  } catch {
+  } catch (cause) {
     remembered.delete(key);
-    throw new ActorError("The identity provider could not be reached.", 503);
+    const why = cause instanceof Error ? cause.message : String(cause);
+    throw new ActorError(`The identity provider could not be reached: ${why}`, 503);
   }
 
   if (!response.ok) {

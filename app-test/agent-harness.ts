@@ -134,7 +134,7 @@ export interface AgentHarness {
    */
   loansDbPath: string;
   /** The dev IdP's HOST-form address, which the loan module validates bearers against. */
-  idpHost: string;
+  idpIssuer: string;
   /**
    * Take the loan book away, for the one test that needs a tool to fail for a
    * reason no hook had anything to do with.
@@ -198,7 +198,7 @@ export async function startAgentHarness(
       }),
     { ready: async (port, output) => output().includes(`listening on :${port}`), timeoutMs: 20_000 },
   );
-  const idpHost = `localhost:${idpPort}`;
+  const idpIssuer = `localhost:${idpPort}`;
 
   // A first boot seeds nobody (#33): the demo cast goes into the file first,
   // under the toolkit names this control plane is about to be given.
@@ -239,7 +239,7 @@ export async function startAgentHarness(
       ...process.env,
       PORT: "0",
       LOANS_DB_PATH: join(workspace, "loans.db"),
-      IDENTITY_HOST: idpHost,
+      IDENTITY_HOST: idpIssuer,
       NODE_ENV: "test",
     },
     stdout: "pipe",
@@ -290,7 +290,7 @@ export async function startAgentHarness(
     loanAppHost,
     governanceDbPath: join(workspace, "governance.db"),
     loansDbPath: join(workspace, "loans.db"),
-    idpHost,
+    idpIssuer,
     calls,
     lists,
     tokenFor: (email) => gateway.issueToken(email),

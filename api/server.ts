@@ -48,8 +48,8 @@ export const MOUNT = "/bank";
 export interface LoanModuleOptions {
   /** The open loan book. See `openLoanBook`. */
   db: Database;
-  /** HOST-form. Where bearers are presented, at `/oauth2/userinfo`. */
-  idpHost: string;
+  /** `IDP_ISSUER`. Bearers are presented at the userinfo endpoint its discovery document names. */
+  idpIssuer: string;
   /**
    * Blank is a state, not a default: with no value the reset route does not
    * exist at all and `/health` says so. There is no development fallback,
@@ -71,7 +71,7 @@ export interface LoanModule {
   fetch(request: Request): Promise<Response>;
   health(): LoanModuleHealth;
   db: Database;
-  idpHost: string;
+  idpIssuer: string;
 }
 
 const searchQuery = z.object({
@@ -106,7 +106,7 @@ async function readJson(request: Request): Promise<unknown> {
 }
 
 async function handleLoans(
-  { db, idpHost }: LoanModuleOptions,
+  { db, idpIssuer }: LoanModuleOptions,
   request: Request,
   url: URL,
 ): Promise<Response> {
@@ -119,7 +119,7 @@ async function handleLoans(
   const expected = action === undefined ? "GET" : "POST";
   if (request.method !== expected) return error(405, "Method not allowed");
 
-  const actor = await actorFromRequest(request, idpHost);
+  const actor = await actorFromRequest(request, idpIssuer);
 
   if (match === null) {
     const query = searchQuery.safeParse(Object.fromEntries(url.searchParams));
@@ -209,7 +209,7 @@ export function createLoanModule(options: LoanModuleOptions): LoanModule {
     return error(404, "Not found");
   }
 
-  return { fetch, health, db, idpHost: options.idpHost };
+  return { fetch, health, db, idpIssuer: options.idpIssuer };
 }
 
 /**

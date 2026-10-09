@@ -2,16 +2,14 @@
  * Every identity route, as plain `(Request) => Promise<Response>` functions.
  *
  * `app/api/**` is a one-line adapter onto each of these. The indirection buys
- * one thing and it is the thing this slice needs most: `app-test/identity-flow.test.ts`
- * mounts these same functions behind a real `Bun.serve` and drives them with a
- * cookie jar over real HTTP, against a real `apps/idp` subprocess. So the suite
- * exercises the `Set-Cookie` header a browser would actually receive and the
- * redirect chain a browser would actually walk — no framework mock, and no
- * stand-in anywhere except at the network edge where Arcade Cloud is.
+ * one thing: a test can mount these same functions behind a real `Bun.serve`
+ * and drive them with a cookie jar over real HTTP, so it exercises the
+ * `Set-Cookie` header a browser would actually receive and the redirect chain
+ * a browser would actually walk, with no framework mock.
  *
  * The five routes, and the two hops they make up:
  *
- *   GET  /api/auth/signin     start sign-in at apps/idp as client C   ─┐ hop 0:
+ *   GET  /api/auth/signin     start sign-in at IDP_ISSUER (Okta)      ─┐ hop 0:
  *   GET  /api/auth/callback   the IdP's return leg; the session is made ┘ who you are
  *   GET  /api/arcade/start    begin the gateway authorization         ─┐ hop 1:
  *   GET  /api/arcade/callback the gateway's return leg; the token      ┘ the bearer
@@ -133,8 +131,9 @@ export async function signin(request: Request, config: IdentitySurface = readIde
   };
   await writeLeg(headers, SIGNIN_COOKIE, leg, config);
 
-  return redirect(
-    authorizeUrl({
+  let location: string;
+  try {
+    location = await authorizeUrl({
       issuer: config.identity.idpIssuer,
       clientId: config.identity.idpClientId,
       redirectUri: redirectUri(config, SIGNIN_CALLBACK_PATH),
@@ -142,9 +141,18 @@ export async function signin(request: Request, config: IdentitySurface = readIde
       state,
       challenge,
       prompt: "login",
-    }),
-    headers,
-  );
+    });
+  } catch (cause) {
+    // Discovery failed: the issuer is unreachable, or `IDP_ISSUER` is not the
+    // authorization server's issuer. Say which, rather than redirect nowhere.
+    return page(
+      "The identity provider could not be found",
+      verbatim(cause instanceof Error ? cause.message : String(cause)),
+      502,
+      headers,
+    );
+  }
+  return redirect(location, headers);
 }
 
 /**
@@ -177,7 +185,7 @@ function userinfoFailurePage(userinfo: {
     return {
       title: "The identity provider's answer could not be read",
       explanation:
-        `<p><code>/oauth2/userinfo</code> answered ${userinfo.status}, and the body was not JSON. ` +
+        `<p>The userinfo endpoint answered ${userinfo.status}, and the body was not JSON. ` +
         "It is shown below exactly as it arrived.</p>",
     };
   }
@@ -187,7 +195,7 @@ function userinfoFailurePage(userinfo: {
       title: "The identity provider is refusing requests for now",
       explanation:
         "<p>Your password was accepted and the token exchange succeeded — the last step, reading " +
-        "your email back from <code>/oauth2/userinfo</code>, was turned away with <strong>429 Too " +
+        "your email back from the userinfo endpoint, was turned away with <strong>429 Too " +
         "Many Requests</strong>. That is the provider throttling this application, not anything " +
         "about your account.</p>" +
         "<p>It clears on its own. Closing any open loan screens makes it clear sooner, because " +
@@ -199,7 +207,7 @@ function userinfoFailurePage(userinfo: {
     title: `The identity provider refused to say who you are (HTTP ${userinfo.status})`,
     explanation:
       "<p>Your password was accepted and the token exchange succeeded; the request that reads your " +
-      "email back from <code>/oauth2/userinfo</code> was refused. What it answered is below.</p>",
+      "email back from the userinfo endpoint was refused. What it answered is below.</p>",
   };
 }
 
@@ -252,26 +260,36 @@ export async function signinCallback(request: Request, config: IdentitySurface =
   const code = url.searchParams.get("code");
   if (!code) return page("No authorization code", "<p>The callback carried no <code>code</code>.</p>", 400, headers);
 
-  const exchanged = await exchangeCode({
-    issuer: config.identity.idpIssuer,
-    clientId: config.identity.idpClientId,
-    clientSecret: config.identity.idpClientSecret,
-    redirectUri: redirectUri(config, SIGNIN_CALLBACK_PATH),
-    code,
-    codeVerifier: leg.verifier,
-  });
-  if (!exchanged.ok) {
-    return page("Token exchange failed", verbatim(`${exchanged.status} ${exchanged.body}`), 502, headers);
+  let exchanged: Awaited<ReturnType<typeof exchangeCode>>;
+  let userinfo: Awaited<ReturnType<typeof fetchUserinfo>>;
+  try {
+    exchanged = await exchangeCode({
+      issuer: config.identity.idpIssuer,
+      clientId: config.identity.idpClientId,
+      clientSecret: config.identity.idpClientSecret,
+      redirectUri: redirectUri(config, SIGNIN_CALLBACK_PATH),
+      code,
+      codeVerifier: leg.verifier,
+    });
+    if (!exchanged.ok) {
+      return page("Token exchange failed", verbatim(`${exchanged.status} ${exchanged.body}`), 502, headers);
+    }
+    userinfo = await fetchUserinfo(config.identity.idpIssuer, exchanged.token.access_token);
+  } catch (cause) {
+    return page(
+      "The identity provider could not be found",
+      verbatim(cause instanceof Error ? cause.message : String(cause)),
+      502,
+      headers,
+    );
   }
-
-  const userinfo = await fetchUserinfo(config.identity.idpIssuer, exchanged.token.access_token);
   if (!userinfo.ok) {
     const { title, explanation } = userinfoFailurePage(userinfo);
     return page(title, explanation + verbatim(`${userinfo.status} ${userinfo.body}`), 502, headers);
   }
 
   // The bearer is kept, not dropped (#157). The loan module derives the actor
-  // from it at `/oauth2/userinfo` — the same endpoint that just named this
+  // from it at the userinfo endpoint — the same endpoint that just named this
   // person — so the bank's own screens read the loan book as them and not as a
   // service account. `refresh_token` is present only when `IDP_SCOPES` asked
   // for `offline_access`; `session.ts` records what that costs.
@@ -731,9 +749,10 @@ export async function completeVerification(
   //
   // #100 established the half of this that is not negotiable: the browser must
   // never be sent to `next_uri`, because the server fetch has already redeemed
-  // that authorization code at cg-idp and Better Auth answers the replay with
-  // `invalid_grant "invalid code"` *and* revokes the tokens the first exchange
-  // minted — the grant is destroyed rather than merely unfinished, and
+  // that authorization code at the identity provider, and a provider that
+  // follows RFC 6749 §4.1.2 answers the replay with `invalid_grant` *and* may
+  // revoke the tokens the first exchange minted (the bundled Better Auth did,
+  // measured on #100); the grant is destroyed rather than merely unfinished, and
   // `get_loan` fails at `userinfo` a turn later. #100 then forwarded Arcade's
   // `Location` instead, with a guard to catch the cases where that `Location`
   // was `next_uri` written differently.

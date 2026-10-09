@@ -57,7 +57,7 @@ beforeAll(async () => {
     // The loan book validates bearers against the IdP itself, not the proxy:
     // the proxy exists to count what `readLoanBook` asks for, and putting it
     // on this leg too would blur the two.
-    idpHost: new URL(identity.idpUrl).host,
+    idpIssuer: new URL(identity.idpUrl).host,
     resetToken: "",
   });
 

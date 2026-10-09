@@ -144,11 +144,11 @@ describe("with APP_PUBLIC_HOST set to the tunnel", () => {
 
   test("the loan module validates a bearer at the app's own listener", async () => {
     reset();
-    const { idpHost } = loanModuleConfig();
-    expect(idpHost).toBe(`localhost:${PORT}`);
+    const { idpIssuer } = loanModuleConfig();
+    expect(idpIssuer).toBe(`localhost:${PORT}`);
     await actorFromRequest(
       new Request("http://localhost/loans", { headers: { authorization: "Bearer a-token-nobody-issued" } }),
-      idpHost,
+      idpIssuer,
     ).catch(() => undefined);
     expect(requested.length).toBeGreaterThan(0);
     expect(hosts(requested)).toEqual([`localhost:${PORT}`]);

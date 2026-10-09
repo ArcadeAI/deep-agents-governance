@@ -1,32 +1,27 @@
 /**
- * Sign-in against the app's own Better Auth as **client C**.
+ * Sign-in against the identity provider at `IDP_ISSUER`, as an ordinary OIDC
+ * client.
  *
- * `DESIGN.md` → **Identity**: every persona is a real person in the app's own
- * Better Auth (`auth/provider/`, `apps/idp` until #6) and the web UI is
- * a real sign-in against it, under its own OAuth client. Client C is separate
- * from the two registrations Arcade holds (the User Source's and the
- * `app-identity` auth provider's) — spike #75 settled that one client per relying
- * party is the shape, after a shared one left hop 2 failing at the token
- * endpoint.
+ * `DESIGN.md` → **Identity**: every persona is a real person in the bank's
+ * identity provider, an Okta org in the workshop, and the web UI is a real
+ * sign-in against it. The app, Arcade's `app-identity` provider and the User
+ * Source all present one Okta Web app's client id and secret
+ * (`IDP_CLIENT_ID`, `IDP_CLIENT_SECRET`); Okta tells them apart by redirect
+ * URI, not by client.
  *
  * Authorization code + PKCE, `openid email`. Sign-in itself wants one thing
- * from the access token — the **email**, read from `/oauth2/userinfo` — and
- * since #157 the token is kept afterwards rather than dropped, because the
- * bank's own screens read the loan module with it as the signed-in person.
- * `auth/session.ts` → `IdpToken` has the argument and the measurement;
- * this module's job is only to obtain and renew one.
+ * from the access token, the **email**, read from the provider's userinfo
+ * endpoint, and since #157 the token is kept afterwards rather than dropped,
+ * because the bank's own screens read the loan module with it as the
+ * signed-in person. `auth/session.ts` → `IdpToken` has the argument; this
+ * module's job is only to obtain and renew one.
  *
- * **Every server-side call here is in-process since #6.** The provider is part
- * of the app, and its issuer is `APP_PUBLIC_HOST`, the tunnel: a `fetch` to it
- * would carry the app's own traffic out through ngrok and back in (the finding
- * from #4). So the token exchange, the refresh, userinfo and the auth-method
- * lookup are `Request`s handed to this process's provider through
- * `identityFetch` (`link.ts`), and never touch the network. Only
- * `authorizeUrl` names the public issuer, because a browser follows it.
+ * **Every endpoint comes from discovery** (`./discovery.ts`). Nothing here
+ * names an Okta path, so another OIDC provider is a change of `IDP_ISSUER`.
  */
-import { identityFetch } from "./link.ts";
+import { discover } from "./discovery.ts";
 
-/** What `/oauth2/userinfo` answers with. `email` is the only field this service needs. */
+/** What the userinfo endpoint answers with. `email` is the only field this service needs. */
 export interface Userinfo {
   sub?: string;
   email?: string;
@@ -45,22 +40,20 @@ export interface AuthorizeRequest {
   state: string;
   challenge: string;
   /**
-   * `prompt=login` — force a fresh authentication even when the browser already
+   * `prompt=login`: force a fresh authentication even when the browser already
    * holds an IdP session.
    *
    * This is what makes "Sign in as Bob" land on a login page rather than
-   * silently continue as Alice. `@better-auth/oauth-provider` implements it
-   * (`authorize`'s `promptSet?.has("login")` branch, which redirects to the
-   * login page before it looks at the session) and `app-test/identity-flow.test.ts`
-   * measures it against a real `apps/idp` rather than taking the source's word
-   * for it — the issue asked for a measurement and the failure it guards
-   * against is the whole demo quietly running as one persona.
+   * silently continue as Alice. OIDC Core §3.1.2.1 defines it and Okta honours
+   * it on its authorize endpoint; the failure it guards against is the whole
+   * demo quietly running as one persona.
    */
   prompt?: "login";
 }
 
-/** The URL the browser is sent to. Every parameter is one the IdP's plugin reads. */
-export function authorizeUrl(request: AuthorizeRequest): string {
+/** The URL the browser is sent to: the discovered authorization endpoint, with PKCE. */
+export async function authorizeUrl(request: AuthorizeRequest): Promise<string> {
+  const { authorization_endpoint } = await discover(request.issuer);
   const params = new URLSearchParams({
     response_type: "code",
     client_id: request.clientId,
@@ -71,34 +64,7 @@ export function authorizeUrl(request: AuthorizeRequest): string {
     code_challenge_method: "S256",
   });
   if (request.prompt) params.set("prompt", request.prompt);
-  return `${request.issuer}/oauth2/authorize?${params}`;
-}
-
-/**
- * Which client authentication method the IdP has this client registered for.
- *
- * Read off `/health` rather than hardcoded, and the other method is tried once
- * if the first is refused for being the wrong one. This project has been bitten
- * in both directions inside one afternoon (#61, then spike #75's verifier), and
- * the failure mode is the expensive kind: a relying party that looks correctly
- * configured, fails at a step no hook observes, and gets blamed on the other
- * end. The provider publishes the method per client since #79, at
- * `/identity/health` since #6, so the lookup is by client id with the
- * top-level field as the fallback.
- */
-async function advertisedAuthMethod(issuer: string, clientId: string): Promise<string | undefined> {
-  const health = (await identityFetch(new Request(`${issuer}/identity/health`))
-    .then((response) => (response.ok ? response.json() : null))
-    .catch(() => null)) as
-    | {
-        oauth?: {
-          token_endpoint_auth_method?: string;
-          clients?: Array<{ client_id?: string; token_endpoint_auth_method?: string }>;
-        };
-      }
-    | null;
-  const ours = health?.oauth?.clients?.find((each) => each.client_id === clientId);
-  return ours?.token_endpoint_auth_method ?? health?.oauth?.token_endpoint_auth_method;
+  return `${authorization_endpoint}?${params}`;
 }
 
 export interface TokenSet {
@@ -136,12 +102,9 @@ export async function exchangeCode(
  * Renew the IdP bearer this browser holds, when the IdP issued a refresh token
  * to renew it with.
  *
- * Only reachable on a deployment whose `IDP_SCOPES` asks for `offline_access`:
- * measured 2026-09-18, `apps/idp` answers `openid email` with no refresh token
- * at all, so the default path never calls this and an expired bearer is a
- * re-sign-in. Kept here rather than inlined at the call site because the client
- * authentication negotiation below is the part that has bitten this repo twice
- * (#61, #75) and a second copy of it is a second thing to get wrong.
+ * Only reachable on a deployment whose `IDP_SCOPES` asks for `offline_access`
+ * and whose Okta app allows the refresh token grant. The default `openid
+ * email` sign-in gets no refresh token, so an expired bearer is a re-sign-in.
  */
 export async function refreshIdpToken(
   options: { issuer: string; refreshToken: string } & ClientCredentials,
@@ -150,24 +113,41 @@ export async function refreshIdpToken(
 }
 
 /**
- * One `POST /oauth2/token`, authenticated the way this IdP wants.
+ * The order to try client authentication methods in, from what the provider
+ * publishes as `token_endpoint_auth_methods_supported`. Basic first when it is
+ * offered, since RFC 6749 §2.3.1 makes it the one every server must accept.
+ */
+export function authMethodOrder(supported: string[] | undefined): Array<"basic" | "post"> {
+  const offered = supported ?? ["client_secret_basic"];
+  const order: Array<"basic" | "post"> = [];
+  if (offered.includes("client_secret_basic")) order.push("basic");
+  if (offered.includes("client_secret_post")) order.push("post");
+  return order.length > 0 ? order : ["basic"];
+}
+
+/**
+ * One `POST` to the discovered token endpoint, authenticated the way the
+ * provider says it accepts.
  *
- * `apps/idp` enforces **one** method per client and refuses the other outright
- * rather than accepting either, so the order comes from what it publishes. Only
- * an explicit method mismatch is retried: a wrong secret, a spent code or an
- * expired one must not be, because a second attempt doubles the noise in the
- * IdP's log and tells nobody anything.
+ * Okta accepts either method by default, but an app can be pinned to one, and
+ * then the other is refused with `invalid_client`. So a refusal that names the
+ * client is retried once with the next published method. A spent or expired
+ * code is not retried: a second attempt doubles the noise in the provider's
+ * log and tells nobody anything.
  */
 async function tokenRequest(
   options: { issuer: string } & ClientCredentials,
   grant: Record<string, string>,
 ): Promise<TokenResult> {
-  const advertised = await advertisedAuthMethod(options.issuer, options.clientId);
-  const order = advertised === "client_secret_post" ? (["post", "basic"] as const) : (["basic", "post"] as const);
+  const { token_endpoint, token_endpoint_auth_methods_supported } = await discover(options.issuer);
+  const order = authMethodOrder(token_endpoint_auth_methods_supported);
 
   let last: { status: number; body: string } = { status: 0, body: "no token request was made" };
   for (const method of order) {
-    const headers: Record<string, string> = { "content-type": "application/x-www-form-urlencoded" };
+    const headers: Record<string, string> = {
+      "content-type": "application/x-www-form-urlencoded",
+      accept: "application/json",
+    };
     const form: Record<string, string> = { ...grant, client_id: options.clientId };
     if (method === "basic") {
       headers.authorization = `Basic ${basic(options)}`;
@@ -175,17 +155,16 @@ async function tokenRequest(
       form.client_secret = options.clientSecret;
     }
 
-    const response = await identityFetch(
-      new Request(`${options.issuer}/oauth2/token`, {
-        method: "POST",
-        headers,
-        body: new URLSearchParams(form).toString(),
-      }),
-    );
+    let response: Response;
+    try {
+      response = await fetch(token_endpoint, { method: "POST", headers, body: new URLSearchParams(form).toString() });
+    } catch (cause) {
+      return { ok: false, status: 0, body: `${token_endpoint} could not be reached: ${String(cause)}` };
+    }
     const body = await response.text();
     if (response.ok) return { ok: true, token: JSON.parse(body) as TokenSet };
     last = { status: response.status, body };
-    if (!/cannot use client_secret_(post|basic)/.test(body)) break;
+    if (!/invalid_client|client_secret_(post|basic)/.test(body)) break;
   }
   return { ok: false, ...last };
 }
@@ -194,10 +173,10 @@ async function tokenRequest(
  * `expires_in` seconds, as the absolute epoch-millisecond instant the session
  * records.
  *
- * An hour when the IdP says nothing, which is what `apps/idp` issues anyway
- * (measured 2026-09-18) — a token with no stated lifetime is still a token with
- * a lifetime, and treating it as immortal would put the re-sign-in prompt on
- * screen only once the loan book had already refused the read.
+ * An hour when the IdP says nothing, which is also Okta's default access token
+ * lifetime. A token with no stated lifetime is still a token with a lifetime,
+ * and treating it as immortal would put the re-sign-in prompt on screen only
+ * once the loan book had already refused the read.
  */
 export function tokenExpiry(token: TokenSet, now = Date.now()): number {
   const seconds = typeof token.expires_in === "number" && Number.isFinite(token.expires_in)
@@ -220,11 +199,13 @@ function basic({ clientId, clientSecret }: ClientCredentials): string {
  * page that reports them has to be able to tell them apart: only one of them
  * is the provider saying anything at all about an email.
  *
- * - `request-failed` — the provider refused the request. A 401, a 403, a 429,
- *   a 500. It said nothing about email, and a page that claims it did is
- *   asserting something that did not happen (#166, same family as #151).
- * - `unreadable` — it answered, and the answer was not JSON.
- * - `no-email-claim` — it answered with a user, and that user has no `email`.
+ * - `request-failed`: the provider refused the request, or could not be
+ *   reached. A 401, a 403, a 429, a 500. It said nothing about email, and a
+ *   page that claims it did is asserting something that did not happen (#166,
+ *   same family as #151).
+ * - `unreadable`: it answered, and the answer was not JSON.
+ * - `no-email-claim`: it answered with a user, and that user has no `email`.
+ *   On Okta that is usually a token issued without the `email` scope.
  */
 export type UserinfoFailure = "request-failed" | "unreadable" | "no-email-claim";
 
@@ -234,9 +215,18 @@ export type UserinfoResult =
 
 /** The signed-in person's email, lowercase, or the reason there is none. */
 export async function fetchUserinfo(issuer: string, accessToken: string): Promise<UserinfoResult> {
-  const response = await identityFetch(
-    new Request(`${issuer}/oauth2/userinfo`, { headers: { authorization: `Bearer ${accessToken}` } }),
-  );
+  const { userinfo_endpoint } = await discover(issuer);
+  let response: Response;
+  try {
+    response = await fetch(userinfo_endpoint, { headers: { authorization: `Bearer ${accessToken}` } });
+  } catch (cause) {
+    return {
+      ok: false,
+      failure: "request-failed",
+      status: 0,
+      body: `${userinfo_endpoint} could not be reached: ${String(cause)}`,
+    };
+  }
   const body = await response.text();
   if (!response.ok) return { ok: false, failure: "request-failed", status: response.status, body };
 
@@ -250,8 +240,8 @@ export async function fetchUserinfo(issuer: string, accessToken: string): Promis
     return { ok: false, failure: "no-email-claim", status: response.status, body };
   }
   // DESIGN.md rule 3: the Arcade user_id, the OAuth subject and the loan book's
-  // actor column are one string. Lowercased here as well as at the IdP, because
-  // this is the value that ends up on every hook payload.
+  // actor column are one string. Lowercased here because this is the value
+  // that ends up on every hook payload.
   return { ok: true, email: userinfo.email.toLowerCase() };
 }
 
