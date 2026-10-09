@@ -103,11 +103,8 @@ test.skipIf(chromeResolution.path === null && !REQUIRED)(
             SESSION_SECRET,
             ...appIdentity.env,
             // The app's loan module: its own `loans.db` in this test's
-            // workspace, and bearers checked at the app's own identity
-            // provider, over its local listener — the default, stated because
-            // the ambient environment may carry another.
+            // workspace; bearers are checked at `appIdentity.env`'s issuer.
             LOANS_DB_PATH: join(dir, "loans.db"),
-            IDENTITY_HOST: `localhost:${webPort}`,
             // So the decision line can name the person rather than the address.
             // The gateway is not configured on purpose: nothing about the loan
             // cards depends on hop 1 since #157, and a page that still needed it
