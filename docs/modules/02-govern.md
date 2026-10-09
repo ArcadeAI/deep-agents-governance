@@ -17,7 +17,7 @@ catches all four while the model never gets a vote. Give the agent a real model 
    Charlie's email is the one thing that has to be real: the escalation finds the approver in
    Slack by it. In the room, everyone's Charlie is the host's address, so every DM lands with
    the host and every request is posted in `#deal-desk-approvals`. Approving is still yours:
-   Charlie signs in on *your* app, with the password the seed printed, in a second browser
+   Charlie signs in to *your* app at your Okta org, with the password the seed printed, in a second browser
    profile. Nobody else's Charlie is involved.
 2. Confirm the hooks are on: `/hooks/health` reports `status: healthy` and `setup-arcade`
    printed *hooks: … status active (read back)*. Hooks are created disabled and turned on

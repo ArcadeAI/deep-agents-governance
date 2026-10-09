@@ -61,7 +61,7 @@ demo:
 
 1. **It derives the actor from the bearer token, never from a request parameter.**
    `api/actor.ts` validates every token against the identity provider's
-   `/oauth2/userinfo` and records the email that comes back as `decided_by`. A body
+   userinfo endpoint, found by discovery, and records the email that comes back as `decided_by`. A body
    that tries to name an actor is a `400`. An actor passed as an argument is an actor
    the model can forge.
 2. **It knows nothing about governance**, and that is enforced rather than asserted —
@@ -218,8 +218,8 @@ bun run users remove <email>
 bun run users list
 ```
 
-Each command writes the person's `subjects` row in `governance.db` and their sign-in in the
-identity provider's `idp.db`, both or neither, and records the change in `governance.db`'s
+Each command writes the person's `subjects` row in `governance.db` and, for `add`, `remove`
+and `seed-demo`, their account in Okta, both or neither, and records the change in `governance.db`'s
 append-only `subject_changes`. A running app sees the change within one poll, so there is
 no restart and no reset. A reset leaves these people as they are (#32). It puts back only a
 demo-cast row at the fixture's own address, and those are the only `subjects` rows
@@ -462,11 +462,11 @@ the leftover this guide exists to prevent.
 
 ```sh
 grep -ril --exclude-dir=node_modules loan app components lib \
-  | grep -v '^api/\|^gate/service/\|^auth/provider/'
+  | grep -v '^api/\|^gate/service/'
 ```
 
-The three excluded directories are §1's module, which you replace whole, the control
-plane, which you keep whole, and §4's provider. **51 files on `ba0c1fe`**, and **27 of
+The two excluded directories are §1's module, which you replace whole, and the control
+plane, which you keep whole. **51 files on `ba0c1fe`**, before the bundled provider was removed, and **27 of
 them match only in comments** — every occurrence is explanatory prose in a docblock. The
 other 24 are the files named above, `app/bank/[...path]/route.ts` (the mount §1 names),
 and a handful that name the loans toolkit or the loan book in a string.
@@ -488,7 +488,7 @@ overrides with their defaults. The domain swap touches:
 | `ARCADE_TOOLKIT` | your toolkit name, **measured off a real deploy**, not derived |
 | `ARCADE_TOOLKIT` | unchanged unless you rename `mcp/loan_desk/approvals.py` |
 | `APP_PUBLIC_HOST` | the app's public host, which is also where `mcp/loan_desk/loans.py` finds the API (under `API_BASE_PATH`). If your API lives on a host of its own, give the toolkit a secret of its own for it |
-| `IDENTITY_HOST` | where `api/` validates bearers; unset, the app's own listener. Point it at your IdP (§4) |
+| `IDP_ISSUER` | the issuer `api/` and the app sign in through, and validate bearers at. Point it at your IdP (§4) |
 | `LOANS_DB_PATH` | only if you keep a database of your own |
 
 Your people are not configuration, and nothing seeds them. Add each one with

@@ -206,8 +206,8 @@ The tables you can read at a glance, because one gets edited live on stage:
 
 Seeded from `gate/policies/governance.json` **only when the database has no
 schema** (decided on #29). **The seed writes the policy and nobody** (#33): `catalogue`,
-`policy_rules` and `output_rules` come from the fixture, and `subjects` starts empty, the same as
-`idp.db`. People are added with `bun run users add`, or the demo cast with
+`policy_rules` and `output_rules` come from the fixture, and `subjects` starts empty. People are
+created in Okta and given a subject by `bun run users add` with `bun run users add`, or the demo cast by
 `bun run users seed-demo`. The fixture's `subjects` are that demo cast, at their `@bank.example`
 addresses, and are written only by `seed-demo`: seeding them at first boot would leave four
 subjects nobody can sign in as, and approval routing picks from every subject. It sits wherever `GOVERNANCE_DB_PATH` points (`./governance.db` by
@@ -320,12 +320,12 @@ on she is a real user like any other: a reset keeps her clearance as it is inste
 demo's back, and her row is not compared to the fixture. `seed-demo` says so when it adds her.
 Seed the cast at the `@bank.example` addresses to keep the reset and the drift check on it.
 
-**Who can sign in, against who the hooks know.** The app's `/health` (not this module's) holds
-`idp.db`'s people against `subjects` and reports any difference as `user_drift`, by address:
-`identity_without_subject` (can sign in, denied at every hook) and `subject_without_identity`
-(cannot sign in, and approval routing can still pick them). Either makes `/health` `degraded`.
-`bun run users` writes both halves or neither, so this only happens when one half is deleted by
-hand, or one disk is recreated without the other.
+**Who can sign in, against who the hooks know.** People live in Okta and their subjects here, and
+the app holds no Okta credential, so `/health` cannot compare the two. `bun run users list` does,
+with the API token: it names a subject with no identity in Okta (cannot sign in, and approval
+routing can still pick them) and a person in the app's Okta group with no subject (can sign in,
+denied at every hook). `bun run users` writes both halves or neither, so this only happens when
+one half is deleted by hand, or `governance.db` is recreated.
 
 **The outage.** `/health` used to answer 503 while the policy failed to compile. The stage
 demo's host health-checked that path, so when #89's compile guard met a disk still holding the
@@ -384,11 +384,9 @@ compiled into the image that is *running*. A `sqlite3` session in a shell on the
 promise that, and on 2026-09-14 two of the three manual reseeds were attached to a rolled-back instance
 and wrote the old text back — so the next deploy failed closed again.
 
-Neither mode touches **`idp.db`** (it holds the OAuth client Arcade is registered against —
-DESIGN.md) or **`loans.db`** (it belongs to the loan module, `api/`, which knows nothing
+Neither mode touches Okta or **`loans.db`** (it belongs to the loan module, `api/`, which knows nothing
 about governance and must keep not knowing; approved loans are reset by that module's own
-endpoint, `/bank/admin/reset`, #23). `bun run reset` calls both, and `--hard` the identity
-module's too. Every response names both, so a presenter is not left believing the loan book moved.
+endpoint, `/bank/admin/reset`, #23). `bun run reset` calls both. Every response names both, so a presenter is not left believing the loan book moved.
 
 `demo` mode drops the trigger that makes `audit_log` append-only, empties it, and puts the
 trigger back inside the same transaction. That is deliberately awkward: the one code path

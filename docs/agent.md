@@ -7,10 +7,10 @@ owns. [`agent/README.md`](../agent/README.md) has the commands.
 ## One question, end to end
 
 1. **The caller signs in to the app.** `ask.py` runs an OAuth authorization-code flow with
-   PKCE against the app's identity provider, as the app's web client, and gets an ID token
-   for Alice.
-2. **MDA checks the token.** `agent/identity.py` accepts only a token the app signed, for the
-   web client's audience. The `email` claim becomes the run's principal.
+   PKCE against Okta, the app's identity provider, as the app's Okta client, and gets an ID
+   token for Alice.
+2. **MDA checks the token.** `agent/identity.py` accepts only a token `IDP_ISSUER` signed, for
+   the app's client id as audience. The `email` claim becomes the run's principal.
 3. **The agent selects its tools.** The model sees one tool, `arcade_select_tools`. It
    describes the task, and Arcade answers with the tools that fit from the gateway
    `ARCADE_GATEWAY_ID` names, and from nowhere else. The chosen tools are promoted under their

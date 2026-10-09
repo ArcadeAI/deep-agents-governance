@@ -435,10 +435,10 @@ const MOVED: Array<{ page: string; headings: string[]; facts: string[] }> = [
     headings: ["Deploying"],
     facts: [
       "build the root `Dockerfile`",
-      "without `ARCADE_HOOK_SIGNING_SECRET`, `APPROVALS_STORE_TOKEN` and `BETTER_AUTH_SECRET` the app still starts, but the control plane and the identity provider refuse to",
-      "**One persistent disk holds all three databases.**",
+      "without `ARCADE_HOOK_SIGNING_SECRET` and `APPROVALS_STORE_TOKEN` the app still starts, but the control plane refuses to",
+      "**One persistent disk holds both databases.**",
       "**A redeploy is not a reset.**",
-      "**The disk holds the OAuth clients Arcade is registered against.**",
+      "**People live in Okta, their roles on the disk.**",
     ],
   },
 ];

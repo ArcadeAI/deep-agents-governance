@@ -45,7 +45,7 @@ host shares a model key in the room for module 2.
 
 - `agent/agent.py`: the whole agent is `define_deep_agent` plus one middleware. No tools are
   listed in code; they come from the gateway.
-- `agent/identity.py`: MDA accepts only the app's own ID tokens, and the `email` claim is who
+- `agent/identity.py`: MDA accepts only ID tokens Okta issued for the app, and the `email` claim is who
   every tool call runs as.
 - `agent/instructions.md`: what the agent is told. It describes the tools and carries no
   limits; read [`docs/agent.md`](../agent.md) for why.

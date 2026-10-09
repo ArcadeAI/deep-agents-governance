@@ -32,7 +32,7 @@ Conflating them cost a day. The full diagram is in [`DESIGN.md`](../DESIGN.md#id
 
 | | hop | mechanism |
 |---|---|---|
-| **1** | MCP client → gateway | the gateway's **User Source**, whose issuer is the app's own sign-in |
+| **1** | MCP client → gateway | the gateway's **User Source**, whose issuer is Okta, the app's identity provider |
 | **2** | tool → the loan API | the `app-identity` auth provider, plus a **custom user verifier** route in the app, `/api/arcade/verify` |
 | **2** | `LoanDesk_RequestApproval` → Slack | Arcade's stock Slack provider, which goes through **Arcade's own verifier**: the requester must be a member of the Arcade project |
 
@@ -52,8 +52,8 @@ gate/service/              /hooks/access, /hooks/pre, /hooks/post: the policy en
                            `bun run gate` starts it (with the rest of the app) and prints the rules.
 api/                       The loan REST API, the bank's system of record, served under /bank.
                            Owns loans.db. No MCP, no Arcade, no governance.
-auth/                      Sign-in, sessions and the custom verifier. auth/provider/ is the app's
-                           own OAuth 2.1 provider (Better Auth). Owns idp.db.
+auth/                      Sign-in as an OIDC client of Okta (IDP_ISSUER, by discovery), sessions
+                           and the custom verifier. No identity provider of its own.
 auth-config/               What to register at Arcade, one copy-paste JSON body each, as
                            setup-arcade sends it.
 app/                       The pages: the bank at /, the loan board at /loans, the panel at /panel,

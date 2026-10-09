@@ -1,7 +1,7 @@
 # Deep Agents Loan Desk with Arcade
 
 **This repository is a fork of the Mastra partnership template below, with the agent
-replaced** (2026-10-06). Read this section first: it supersedes every decision further down
+replaced** (2026-10-06) **and the bundled identity provider replaced by Okta** (2026-10-09). Read this section first: it supersedes every decision further down
 that names Mastra, Studio, the chat, `lib/agent`, `src/mastra`, `memory.db`, Anthropic or
 Elasticsearch. Those decisions are kept as the record of why the template is shaped the way it
 is, and none of them describes this repository's agent.
@@ -9,7 +9,8 @@ is, and none of them describes this repository's agent.
 | Decision | This repository |
 |---|---|
 | **The agent** | A LangChain Deep Agent on Managed Deep Agents, in `agent/` (Python, `uv`). Its tools come through Arcade's LangChain middleware (`agent/langchain_arcade`, vendored), which selects from one gateway and calls every tool as the signed-in caller. [`docs/agent.md`](./docs/agent.md). |
-| **No chat, no Studio** | The web app has no chat route and no Mastra runtime. A question goes from `agent/ask.py`, which signs the caller in to the app's identity provider and sends the ID token, to the agent. `agent/identity.py` verifies the token against the app's `/jwks`. |
+| **No chat, no Studio** | The web app has no chat route and no Mastra runtime. A question goes from `agent/ask.py`, which signs the caller in at Okta and sends the ID token, to the agent. `agent/identity.py` verifies the token against the keys Okta's discovery document names. |
+| **Identity provider: Okta** (2026-10-09) | **The app has no identity provider of its own.** The bundled Better Auth provider (`auth/provider/`, `idp.db`, `BETTER_AUTH_SECRET`, the login and consent pages, `IDENTITY_HOST`, the identity reset and `bun run reset --hard`) is deleted. Okta is the one IdP: `IDP_ISSUER` is an Okta custom authorization server (`https://<org>.okta.com/oauth2/default`), and the app (`auth/oidc.ts`), the loan API (`api/actor.ts`), the agent (`agent/identity.py`, `ask.py`) and `setup-arcade` are ordinary OIDC clients of it that read every endpoint from its discovery document (`auth/discovery.ts`), so an Auth0 or Keycloak issuer works with no code change. One Okta app serves the app's sign-in, hop 1's User Source and hop 2's `app-identity` provider, with four redirect URIs (`scripts/okta/setup.ts`). `bun run okta-setup` makes it, and `bun run users` creates each person in Okta through the Management API with an `SSWS` token that reaches it only through `op run`. Roles and clearances stay in `governance.db`; `user_id` stays `$.email`. This supersedes every decision further down that names Better Auth, `auth/provider/`, `idp.db`, `BETTER_AUTH_SECRET`, the identity module, its reset, or "the app's own" provider, issuer or sign-in. [`docs/okta.md`](./docs/okta.md). |
 | **The model** | Scripted by default (`agent/scripted.py`), so the wiring runs with no model key. `MODEL_ID` picks a real one through `init_chat_model`. No `ANTHROPIC_API_KEY` in the app. |
 | **Tools** | One gateway: the six `LoanDesk` tools from the one `arcade deploy`, and Arcade's own `Gmail.SendEmail`, `Gmail.ListEmails` and `Slack.SendMessage`. |
 | **Loans, not a deal desk** | Back to the template's own loan domain (2026-10-07), as the architecture sketch from the 2026-10-06 call has it: a Loan MCP over a Loan REST API. The toolkit is `LoanDesk`, so a project that also holds the Elastic workshop's `DealDesk` keeps both apart. |
@@ -139,8 +140,8 @@ extension base URL is `<APP_PUBLIC_HOST>/hooks`, so Arcade calls `/hooks/access`
                        Owns governance.db. Policies: gate/policies/governance.json.
       api/             the loan REST API, the bank's system of record. Owns loans.db.
                        No MCP, no Arcade, no governance.
-      auth/            Better Auth: users, OAuth 2.1 provider, login and consent pages,
-                       the custom verifier. Owns idp.db.
+      auth/            Sign-in as an OIDC client of Okta (IDP_ISSUER), sessions, the custom
+                       verifier. No identity provider and no database (2026-10-09).
       auth-config/     what to register at Arcade, one JSON body each, as setup-arcade sends it.
 
     mcp/  One Python arcade-mcp server, one toolkit (LoanDesk), one arcade deploy:
@@ -170,10 +171,9 @@ failing on a planted violation.
   import appears in its source, and `policy-schema`'s workspace sweep exempts it. Both
   halves read the same flag, so they cannot drift apart (#33 in the demo).
 - **`governance-core` depends on no app.** `no-app-dependencies.test.ts` holds.
-- **Only the identity module mints tokens.** No other module imports its signing keys or its
-  token issuance, and no app source outside `auth/provider/` reads `BETTER_AUTH_SECRET`
-  (`setup-arcade`, a script, generates it into `.env`). This is new with the fold, and
-  `app-test/identity/only-identity-mints.test.ts` holds it for app source.
+- **Nothing in the app mints identity tokens** (2026-10-09). The rule used to be "only the
+  identity module mints tokens"; with the provider gone, Okta mints every token the app,
+  Arcade and the agent accept, and the app holds no signing key.
 
 Forking means replacing the loan module, `mcp/loan_desk/loans.py` and the seed data, and touching
 nothing under `packages/`.
@@ -184,7 +184,7 @@ There are **two authentication hops** with two different mechanisms. Conflating 
 cost a day on #75.
 
     Alice, in her own browser profile
-      → the app  "Sign in"  (OIDC code + PKCE against the app's own Better Auth; Alice
+      → the app  "Sign in"  (OIDC code + PKCE against Okta, IDP_ISSUER; Alice
                     types her own password, and the page never names her)
         → sealed cookie { email, gateway tokens }
       → hop 1: the app drives the gateway OAuth against the template's User Source gateway (
@@ -205,7 +205,7 @@ cost a day on #75.
               · no session → park flow_id in a short-lived signed cookie, send the
                 browser to sign-in, and complete the same two calls from the sign-in
                 callback. The verifier never reads the persona from the query string.
-          then Arcade exchanges the code at the app's Better Auth (hop 2)
+          then Arcade exchanges the code at Okta (hop 2)
         → /pre      hooks see user_id = alice@…            ← layer 3
           → mcp/loan_desk/loans.py (arcade deploy) receives Alice's OAuth token
             → the loan module validates it, actor = alice@…
@@ -233,6 +233,11 @@ Three rules this has to hold to:
 3. **Email is the join key.** Arcade `user_id`, OAuth subject, and `loans.db`'s actor
    column are the same string.
 
+**Superseded 2026-10-09: the provider is Okta, outside the app,** which answers the objection
+below the way the demo's #36 did, with a process boundary, and more strongly: the app cannot
+mint itself a token because it holds no signing key. The paragraphs that follow are the record
+of the fold it replaces.
+
 **The provider lives inside the app, and that reverses the demo's #36.** The demo kept
 Better Auth in its own service, `apps/idp`, as a stand-in for the enterprise IdP. It refused
 to fold it into `apps/web` because an enterprise audience would ask whether the web app
@@ -255,7 +260,10 @@ OIDC discovery — endpoints are configured explicitly. It extracts the user's i
 `/oauth2/userinfo` via a JSONPath expression, **which is what turns rule 3 from a
 convention into a mechanism**.
 
-⚠️ **Resetting `idp.db` must not rotate the OAuth client credentials. Rotating them silently breaks the
+Since 2026-10-09 `setup-arcade` does read the issuer's discovery document, and registers the
+authorize, token and userinfo endpoints it names, so no Okta path is spelled in the repo.
+
+⚠️ (Before 2026-10-09.) **Resetting `idp.db` must not rotate the OAuth client credentials. Rotating them silently breaks the
 registration held in Arcade** at the authorize step, which fires no hook,
 so the panel stays dark and nothing on screen explains why. The reset must leave the OAuth
 client alone. Owned by the demo's #36. `auth/provider/reset.ts` reads the client ids
