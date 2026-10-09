@@ -1,36 +1,45 @@
 /**
  * `bun run users` (#31), driven the way a person drives it: the command, in a
- * child process, against a fresh pair of databases, read back afterwards.
+ * child process, against a fresh `governance.db` and a fresh Okta org, read
+ * back afterwards.
  *
- * What the app does with the rows (sign-in, `/hooks/pre`, the policy poll) is
- * `users-live.test.ts`, against the real app. This file is the command's own
+ * The org is the OIDC stand-in with its Management API slice switched on
+ * (`scripts/oidc-stand-in.ts`), so every call the command makes is the call it
+ * would make to Okta, and every user it creates can sign in at the stand-in's
+ * authorize endpoint. What the app does with the rows (sign-in, `/hooks/pre`,
+ * the policy poll) is `users-live.test.ts`. This file is the command's own
  * contract: both halves or neither, the role read from the policy, every
- * change recorded, and the password never kept.
+ * change recorded, and the password held to Okta's policy and never kept.
  */
-import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { verifyPassword } from "better-auth/crypto";
-
+import { type OidcStandIn, startOidcStandIn } from "../scripts/oidc-stand-in.ts";
+import { passwordProblem } from "../scripts/okta/people.ts";
+import { USERS_GROUP } from "../scripts/okta/setup.ts";
 import { childEnv } from "./child-env.ts";
 import { spawnChild } from "./child.ts";
 
 const ROOT = join(import.meta.dir, "..");
 const INVITE = "Arcade dashboard (https://api.arcade.dev/dashboard), your project, Members: invite";
+const MANAGEMENT_TOKEN = `users-cli-${crypto.randomUUID()}`;
 
 const scratch = mkdtempSync(join(tmpdir(), "cg-users-cli-"));
 let dir = "";
+let okta: OidcStandIn;
 
 afterAll(() => rmSync(scratch, { recursive: true, force: true }));
 
-beforeEach(() => {
+beforeEach(async () => {
   dir = mkdtempSync(join(scratch, "case-"));
+  okta = await startOidcStandIn({ managementToken: MANAGEMENT_TOKEN });
 });
 
-const idpPath = () => join(dir, "idp.db");
+afterEach(() => okta.stop());
+
 const governancePath = () => join(dir, "governance.db");
 
 interface Run {
@@ -41,12 +50,12 @@ interface Run {
 
 /**
  * The command, with nothing from this checkout's `.env` files: `--no-env-file`,
- * and an allowlisted environment naming this case's two databases.
+ * and an allowlisted environment naming this case's database and org.
  */
-async function users(args: string[], stdin?: string): Promise<Run> {
+async function users(args: string[], stdin?: string, env: Record<string, string> = {}): Promise<Run> {
   const child = spawnChild(["bun", "--no-env-file", "scripts/users.ts", ...args], {
     cwd: ROOT,
-    env: childEnv({ IDP_DB_PATH: idpPath(), GOVERNANCE_DB_PATH: governancePath() }),
+    env: childEnv({ GOVERNANCE_DB_PATH: governancePath(), OKTA_ORG_URL: okta.url, OKTA_API_TOKEN: MANAGEMENT_TOKEN, ...env }),
     stdin: stdin === undefined ? "ignore" : new Blob([stdin]),
     stdout: "pipe",
     stderr: "pipe",
@@ -65,8 +74,8 @@ async function ok(args: string[], stdin?: string): Promise<Run> {
   return run;
 }
 
-function query<T>(path: string, sql: string, ...params: string[]): T[] {
-  const db = new Database(path, { readonly: true });
+function query<T>(sql: string, ...params: string[]): T[] {
+  const db = new Database(governancePath(), { readonly: true });
   try {
     return db.query<T, string[]>(sql).all(...params);
   } finally {
@@ -74,40 +83,35 @@ function query<T>(path: string, sql: string, ...params: string[]): T[] {
   }
 }
 
-const person = (email: string) =>
-  query<{ id: string; name: string; email: string }>(idpPath(), 'SELECT id, name, email FROM "user" WHERE email = ?', email)[0];
-const credential = (userId: string) =>
-  query<{ providerId: string; password: string }>(
-    idpPath(),
-    'SELECT providerId, password FROM "account" WHERE userId = ?',
-    userId,
-  );
+/** The Okta user with this login, as the org holds them. */
+const person = (email: string) => [...okta.users.values()].find((user) => user.email === email);
+/** Whether they are in the group `bun run users` keeps the people it made in. */
+const ours = (email: string) => {
+  const group = [...okta.groups.values()].find((each) => each.name === USERS_GROUP);
+  return group !== undefined && person(email)?.groups.has(group.id) === true;
+};
 const subject = (email: string) =>
   query<{ user_id: string; display_name: string; role: string; clearance: number }>(
-    governancePath(),
     "SELECT user_id, display_name, role, clearance FROM subjects WHERE user_id = ?",
     email,
   )[0];
 const changes = (email?: string) =>
   query<Record<string, string | number | null>>(
-    governancePath(),
-    email === undefined
-      ? "SELECT * FROM subject_changes ORDER BY seq"
-      : "SELECT * FROM subject_changes WHERE user_id = ? ORDER BY seq",
+    email === undefined ? "SELECT * FROM subject_changes ORDER BY seq" : "SELECT * FROM subject_changes WHERE user_id = ? ORDER BY seq",
     ...(email === undefined ? [] : [email]),
   );
 const counts = () => ({
-  people: query<{ n: number }>(idpPath(), 'SELECT COUNT(*) AS n FROM "user"')[0]!.n,
-  subjects: query<{ n: number }>(governancePath(), "SELECT COUNT(*) AS n FROM subjects")[0]!.n,
-  changes: query<{ n: number }>(governancePath(), "SELECT COUNT(*) AS n FROM subject_changes")[0]!.n,
+  people: okta.users.size,
+  subjects: query<{ n: number }>("SELECT COUNT(*) AS n FROM subjects")[0]!.n,
+  changes: query<{ n: number }>("SELECT COUNT(*) AS n FROM subject_changes")[0]!.n,
 });
 
-/** Opens both databases once, the way the app's first boot would, so a refusal test has something to compare. */
+/** Opens the database once, the way the app's first boot would, so a refusal test has something to compare. */
 async function bootstrap(): Promise<void> {
   await ok(["list"]);
 }
 
-/** The generated password `add` printed, and how many times it appears. */
+/** The generated password `add` printed. */
 function printedPassword(stdout: string): string {
   const match = stdout.match(/^ {2}password {3}(\S+)$/m);
   if (!match) throw new Error(`no password line in:\n${stdout}`);
@@ -121,8 +125,8 @@ function onDisk(path: string): string {
     .join("");
 }
 
-function plant(path: string, sql: string): void {
-  const db = new Database(path);
+function plant(sql: string): void {
+  const db = new Database(governancePath());
   try {
     db.exec(sql);
   } finally {
@@ -131,14 +135,12 @@ function plant(path: string, sql: string): void {
 }
 
 describe("users add", () => {
-  test("creates the identity and the subject, lowercased, and prints the change row", async () => {
+  test("creates the Okta user and the subject, lowercased, and prints the change row", async () => {
     const run = await ok(["add", "Dana.Lee@Example.COM", "--name", "Dana Lee", "--role", "loan_officer", "--clearance", "75000"]);
 
     const who = person("dana.lee@example.com");
-    expect(who).toMatchObject({ name: "Dana Lee", email: "dana.lee@example.com" });
-    const accounts = credential(who!.id);
-    expect(accounts).toHaveLength(1);
-    expect(accounts[0]!.providerId).toBe("credential");
+    expect(who).toMatchObject({ status: "ACTIVE", firstName: "Dana", lastName: "Lee" });
+    expect(ours("dana.lee@example.com")).toBe(true);
 
     expect(subject("dana.lee@example.com")).toEqual({
       user_id: "dana.lee@example.com",
@@ -164,29 +166,40 @@ describe("users add", () => {
     );
   });
 
-  test("a generated password is printed once, verifies against the stored hash, and is nowhere on disk", async () => {
+  test("a generated password is printed once, meets Okta's policy, is the one Okta got, and is nowhere on disk", async () => {
     const run = await ok(["add", "erin@example.com", "--name", "Erin", "--role", "vp_credit", "--clearance", "250000"]);
     const password = printedPassword(run.stdout);
     expect(password).toMatch(/^[A-Za-z0-9]{20}$/);
+    expect(passwordProblem(password, "erin@example.com")).toBeNull();
     expect(run.stdout.split(password)).toHaveLength(2);
     expect(run.stderr).not.toContain(password);
-
-    const [account] = credential(person("erin@example.com")!.id);
-    // Hashed the way the seed hashes (`hashPassword` in `db.ts`), so Better Auth's own verifier accepts it.
-    expect(await verifyPassword({ hash: account!.password, password })).toBe(true);
-    expect(account!.password).not.toContain(password);
-
-    for (const path of [idpPath(), governancePath()]) expect(onDisk(path)).not.toContain(password);
+    expect(person("erin@example.com")?.password).toBe(password);
+    expect(onDisk(governancePath())).not.toContain(password);
   });
 
   test("--password is used as given and not echoed", async () => {
-    const run = await ok([
-      "add", "finn@example.com", "--name", "Finn", "--role", "loan_officer", "--clearance", "1000", "--password", "correct-horse-battery",
-    ]);
-    expect(run.stdout).not.toContain("correct-horse-battery");
+    const given = "Granite-Harbor-42";
+    const run = await ok(["add", "finn@example.com", "--name", "Finn", "--role", "loan_officer", "--clearance", "1000", "--password", given]);
+    expect(run.stdout).not.toContain(given);
     expect(run.stdout).not.toMatch(/^ {2}password /m);
-    const [account] = credential(person("finn@example.com")!.id);
-    expect(await verifyPassword({ hash: account!.password, password: "correct-horse-battery" })).toBe(true);
+    expect(person("finn@example.com")?.password).toBe(given);
+  });
+
+  test("a --password Okta's default policy would refuse is refused first, naming the rule, and nothing is written", async () => {
+    await bootstrap();
+    const before = counts();
+    const cases: Array<[string, string]> = [
+      ["correct-horse-battery", "needs an uppercase letter"],
+      ["Short-1", "must be 8 to 72 characters"],
+      ["Gabriel-Example-9", 'must not contain part of the username ("example")'],
+    ];
+    for (const [password, why] of cases) {
+      const run = await users(["add", "gabe@example.com", "--name", "Gabe", "--role", "loan_officer", "--clearance", "5", "--password", password]);
+      expect(run.code).toBe(2);
+      expect(run.stderr).toContain(why);
+      expect(run.stderr).not.toContain(password);
+    }
+    expect(counts()).toEqual(before);
   });
 
   test("without --role it refuses before writing anything", async () => {
@@ -213,7 +226,6 @@ describe("users add", () => {
   test("the roles come from the policy: a role a rule names is accepted, and a role outlives its last holder", async () => {
     await bootstrap();
     plant(
-      governancePath(),
       `INSERT INTO policy_rules (id, description, hook, toolkit, tool, subjects, conditions, effect, reason, priority)
        VALUES ('access.auditors-cannot-see-deny', '', 'access', 'LoanDesk', 'DenyLoan',
                '{"user_ids":null,"roles":["auditor"],"clearance_below":null,"clearance_at_least":null}',
@@ -223,7 +235,7 @@ describe("users add", () => {
     expect(subject("hana@example.com")?.role).toBe("auditor");
 
     // Every loan officer gone from governance.db: the role is still the fixture's.
-    plant(governancePath(), "DELETE FROM subjects WHERE role = 'loan_officer'");
+    plant("DELETE FROM subjects WHERE role = 'loan_officer'");
     await ok(["add", "ivan@example.com", "--name", "Ivan", "--role", "loan_officer", "--clearance", "10"]);
   });
 
@@ -249,41 +261,80 @@ describe("users add", () => {
 
   test("the implied 0 is the policy's: without the access rule, credit_analyst needs --clearance too", async () => {
     await bootstrap();
-    plant(governancePath(), "UPDATE policy_rules SET enabled = 0 WHERE id = 'access.analysts-cannot-see-approve'");
+    plant("UPDATE policy_rules SET enabled = 0 WHERE id = 'access.analysts-cannot-see-approve'");
     const run = await users(["add", "mo@example.com", "--name", "Mo", "--role", "credit_analyst"]);
     expect(run.code).toBe(2);
     expect(run.stderr).toContain("--clearance is required for role credit_analyst");
   });
 
-  test("an address either half already holds is refused, and nothing changes", async () => {
+  test("an address with a subject is refused, with or without its Okta user, and nothing changes", async () => {
     await ok(["add", "nia@example.com", "--name", "Nia", "--role", "loan_officer", "--clearance", "1"]);
     const before = counts();
     const again = await users(["add", "NIA@example.com", "--name", "Nia", "--role", "vp_credit", "--clearance", "2"]);
     expect(again.code).toBe(1);
     expect(again.stderr).toContain("nia@example.com already exists");
 
-    plant(governancePath(), "DELETE FROM subjects WHERE user_id = 'nia@example.com'");
+    okta.users.delete(person("nia@example.com")!.id);
     const half = await users(["add", "nia@example.com", "--name", "Nia", "--role", "vp_credit", "--clearance", "2"]);
     expect(half.code).toBe(1);
-    expect(half.stderr).toContain("half there: an identity in idp.db but no subject");
-    expect(counts()).toEqual({ ...before, subjects: before.subjects - 1 });
+    expect(half.stderr).toContain("half there: a subject in governance.db but no identity in Okta");
+    expect(counts()).toEqual({ ...before, people: before.people - 1 });
   });
 
-  test("both halves or neither: a subject that cannot be written takes the identity back out", async () => {
+  test("somebody already in the org gets a subject, keeps their password, and is not put in the group", async () => {
+    okta.addPerson({ email: "admin@example.com", password: "Their-Own-Pass-1", name: "Ada Admin" });
+    const run = await ok(["add", "admin@example.com", "--name", "Ada", "--role", "chief_credit_officer", "--clearance", "5000000"]);
+    expect(run.stdout).toContain("admin@example.com was already in Okta (active)");
+    expect(run.stdout).not.toMatch(/^ {2}password /m);
+    expect(person("admin@example.com")?.password).toBe("Their-Own-Pass-1");
+    expect(ours("admin@example.com")).toBe(false);
+    expect(subject("admin@example.com")?.role).toBe("chief_credit_officer");
+
+    // And --password is refused for them: this command never changes an existing person's password.
+    plant("DELETE FROM subjects WHERE user_id = 'admin@example.com'");
+    const withPassword = await users([
+      "add", "admin@example.com", "--name", "Ada", "--role", "vp_credit", "--clearance", "1", "--password", "Another-Pass-77",
+    ]);
+    expect(withPassword.code).toBe(1);
+    expect(withPassword.stderr).toContain("never changes an existing person's password");
+    expect(person("admin@example.com")?.password).toBe("Their-Own-Pass-1");
+  });
+
+  test("both halves or neither: a subject that cannot be written deletes the Okta user again", async () => {
     await bootstrap();
-    plant(
-      governancePath(),
-      "CREATE TRIGGER planted_refusal BEFORE INSERT ON subjects BEGIN SELECT RAISE(ABORT, 'planted refusal'); END;",
-    );
+    plant("CREATE TRIGGER planted_refusal BEFORE INSERT ON subjects BEGIN SELECT RAISE(ABORT, 'planted refusal'); END;");
     const before = counts();
     const run = await users(["add", "omar@example.com", "--name", "Omar", "--role", "loan_officer", "--clearance", "1"]);
     expect(run.code).toBe(1);
     expect(run.stderr).toContain("planted refusal");
-    expect(run.stderr).toContain("the identity was removed again and nothing was added");
+    expect(run.stderr).toContain("the identity was deleted again and nothing was added");
     expect(person("omar@example.com")).toBeUndefined();
     expect(counts()).toEqual(before);
     // And no password was handed out for an account that does not exist.
     expect(run.stdout).not.toMatch(/password/);
+  });
+
+  test("a refused API token is said plainly, without the token", async () => {
+    const run = await users(["list"], undefined, { OKTA_API_TOKEN: "not-the-token" });
+    expect(run.code).toBe(1);
+    expect(run.stderr).toContain("check OKTA_API_TOKEN is a live token for this org");
+    expect(run.stderr).not.toContain("not-the-token");
+  });
+
+  test("with no token at all it refuses, naming op run", async () => {
+    const run = await users(["list"], undefined, { OKTA_API_TOKEN: "" });
+    expect(run.code).toBe(1);
+    expect(run.stderr).toContain("OKTA_API_TOKEN is not set");
+    expect(run.stderr).toContain("op run");
+  });
+
+  test("the org can come from IDP_ISSUER's origin", async () => {
+    const run = await users(["add", "pia@example.com", "--name", "Pia", "--role", "loan_officer", "--clearance", "5"], undefined, {
+      OKTA_ORG_URL: "",
+      IDP_ISSUER: okta.issuer,
+    });
+    expect(run.code).toBe(0);
+    expect(person("pia@example.com")?.status).toBe("ACTIVE");
   });
 });
 
@@ -301,7 +352,6 @@ describe("the Arcade invite reminder", () => {
   test("is not printed for a role the policy hides the request tool from", async () => {
     await bootstrap();
     plant(
-      governancePath(),
       `INSERT INTO policy_rules (id, description, hook, toolkit, tool, subjects, conditions, effect, reason, priority)
        VALUES ('access.analysts-cannot-request', '', 'access', 'LoanDesk', 'RequestApproval',
                '{"user_ids":null,"roles":["credit_analyst"],"clearance_below":null,"clearance_at_least":null}',
@@ -315,13 +365,15 @@ describe("the Arcade invite reminder", () => {
 });
 
 describe("set-role and set-clearance", () => {
-  test("each change writes a row, with before and after", async () => {
+  test("each change writes a row, with before and after, and touches nothing in Okta", async () => {
     await ok(["add", "rae@example.com", "--name", "Rae", "--role", "loan_officer", "--clearance", "50000"]);
+    const calls = okta.log.length;
 
     const clearance = await ok(["set-clearance", "Rae@Example.com", "75000"]);
     expect(subject("rae@example.com")?.clearance).toBe(75000);
     const role = await ok(["set-role", "rae@example.com", "vp_credit"]);
     expect(subject("rae@example.com")?.role).toBe("vp_credit");
+    expect(okta.log.length).toBe(calls);
 
     const rows = changes("rae@example.com");
     expect(rows.map((row) => row.action)).toEqual(["add", "set-clearance", "set-role"]);
@@ -353,52 +405,42 @@ describe("set-role and set-clearance", () => {
 
   test("subject_changes is append-only", async () => {
     await ok(["add", "uma@example.com", "--name", "Uma", "--role", "loan_officer", "--clearance", "10"]);
-    expect(() => plant(governancePath(), "UPDATE subject_changes SET clearance_after = 999")).toThrow(/append-only/);
-    expect(() => plant(governancePath(), "DELETE FROM subject_changes")).toThrow(/append-only/);
+    expect(() => plant("UPDATE subject_changes SET clearance_after = 999")).toThrow(/append-only/);
+    expect(() => plant("DELETE FROM subject_changes")).toThrow(/append-only/);
     expect(changes("uma@example.com")).toHaveLength(1);
   });
 });
 
 describe("users remove", () => {
-  test("deletes both halves and revokes every session and token", async () => {
+  test("deletes the subject and the Okta user it created, deactivating first, and records the change", async () => {
     await ok(["add", "vic@example.com", "--name", "Vic", "--role", "loan_officer", "--clearance", "10"]);
     const { id } = person("vic@example.com")!;
-    const clientId = query<{ clientId: string }>(idpPath(), 'SELECT clientId FROM "oauthClient" LIMIT 1')[0]?.clientId;
-    const now = new Date().toISOString();
-    const later = new Date(Date.now() + 3_600_000).toISOString();
-    // A signed-in browser and an OAuth grant, as Better Auth writes them.
-    plant(
-      idpPath(),
-      `INSERT INTO "session" (id, expiresAt, token, createdAt, updatedAt, userId) VALUES ('s1', '${later}', 'tok-s1', '${now}', '${now}', '${id}');
-       INSERT INTO "session" (id, expiresAt, token, createdAt, updatedAt, userId) VALUES ('s2', '${later}', 'tok-s2', '${now}', '${now}', '${id}');
-       INSERT INTO "oauthClient" (id, clientId, redirectUris) SELECT 'c-test', 'client-test', '[]' WHERE ${clientId === undefined ? 1 : 0};
-       INSERT INTO "oauthRefreshToken" (id, token, clientId, sessionId, userId, expiresAt, createdAt, scopes)
-         VALUES ('r1', 'tok-r1', '${clientId ?? "client-test"}', 's1', '${id}', '${later}', '${now}', 'openid');
-       INSERT INTO "oauthAccessToken" (id, token, clientId, sessionId, userId, refreshId, expiresAt, createdAt, scopes)
-         VALUES ('a1', 'tok-a1', '${clientId ?? "client-test"}', 's1', '${id}', 'r1', '${later}', '${now}', 'openid');
-       INSERT INTO "oauthConsent" (id, clientId, userId, scopes, createdAt, updatedAt)
-         VALUES ('k1', '${clientId ?? "client-test"}', '${id}', 'openid', '${now}', '${now}');`,
-    );
-    const clientsBefore = query<{ n: number }>(idpPath(), 'SELECT COUNT(*) AS n FROM "oauthClient"')[0]!.n;
 
     const run = await ok(["remove", "VIC@example.com"]);
-    expect(run.stdout).toContain("2 session(s), 1 access token(s), 1 refresh token(s) and 1 consent(s) revoked");
-    expect(person("vic@example.com")).toBeUndefined();
+    expect(run.stdout).toContain("deactivated and deleted in Okta, with their sessions and tokens");
+    expect(okta.users.has(id)).toBe(false);
     expect(subject("vic@example.com")).toBeUndefined();
-    for (const table of ["session", "account", "oauthAccessToken", "oauthRefreshToken", "oauthConsent"]) {
-      expect(query<{ n: number }>(idpPath(), `SELECT COUNT(*) AS n FROM "${table}" WHERE userId = ?`, id)[0]!.n).toBe(0);
-    }
-    // The OAuth clients Arcade is registered against are not people.
-    expect(query<{ n: number }>(idpPath(), 'SELECT COUNT(*) AS n FROM "oauthClient"')[0]!.n).toBe(clientsBefore);
+    // Okta deletes only a deactivated user, so the deactivate came first.
+    const lifecycle = okta.log.filter((line) => line.includes(id));
+    expect(lifecycle.slice(-2)).toEqual([`POST /api/v1/users/${id}/lifecycle/deactivate`, `DELETE /api/v1/users/${id}`]);
 
     const last = changes("vic@example.com").at(-1);
     expect(last).toMatchObject({ action: "remove", role_before: "loan_officer", role_after: null, clearance_before: 10, clearance_after: null });
     expect(run.stdout).toContain(`subject_changes #${last!.seq} ${last!.id}`);
   });
 
+  test("somebody who was in the org already keeps their Okta account", async () => {
+    okta.addPerson({ email: "owner@example.com", password: "Their-Own-Pass-1", name: "Olu Owner" });
+    await ok(["add", "owner@example.com", "--name", "Olu", "--role", "vp_credit", "--clearance", "1"]);
+    const run = await ok(["remove", "owner@example.com"]);
+    expect(run.stdout).toContain("left in Okta");
+    expect(person("owner@example.com")?.status).toBe("ACTIVE");
+    expect(subject("owner@example.com")).toBeUndefined();
+  });
+
   test("removes whichever half is there, and refuses an address with neither", async () => {
     await ok(["add", "wen@example.com", "--name", "Wen", "--role", "loan_officer", "--clearance", "10"]);
-    plant(governancePath(), "DELETE FROM subjects WHERE user_id = 'wen@example.com'");
+    plant("DELETE FROM subjects WHERE user_id = 'wen@example.com'");
     const half = await ok(["remove", "wen@example.com"]);
     expect(half.stdout).toContain("subject    none in governance.db");
     expect(person("wen@example.com")).toBeUndefined();
@@ -410,7 +452,7 @@ describe("users remove", () => {
 });
 
 describe("a first boot (#33)", () => {
-  test("seeds nobody on either side: no identity, no subject, no change recorded", async () => {
+  test("seeds nobody on either side: no Okta user, no subject, no change recorded", async () => {
     const run = await ok(["list"]);
     expect(run.stdout.trim()).toBe("no users. Add one with `bun run users add`.");
     expect(counts()).toEqual({ people: 0, subjects: 0, changes: 0 });
@@ -421,10 +463,13 @@ describe("users list", () => {
   test("shows both halves side by side, and says what a half-present user cannot do", async () => {
     await ok(["add", "xan@example.com", "--name", "Xan", "--role", "vp_credit", "--clearance", "250000"]);
     await ok(["add", "yui@example.com", "--name", "Yui", "--role", "loan_officer", "--clearance", "5"]);
-    plant(governancePath(), "DELETE FROM subjects WHERE user_id = 'yui@example.com'");
+    await ok(["add", "zed@example.com", "--name", "Zed", "--role", "loan_officer", "--clearance", "5"]);
+    plant("DELETE FROM subjects WHERE user_id = 'yui@example.com'");
+    okta.users.delete(person("zed@example.com")!.id);
     const { stdout } = await ok(["list"]);
     expect(stdout).toMatch(/^xan@example\.com\s+Xan\s+vp_credit\s+250000\s+yes\s+yes$/m);
-    expect(stdout).toMatch(/^yui@example\.com\s+Yui\s+-\s+-\s+yes\s+no\s+can sign in, but has no subject: denied at every hook$/m);
+    expect(stdout).toMatch(/^yui@example\.com\s+Yui\s+-\s+-\s+yes\s+no\s+in Okta, but has no subject: denied at every hook$/m);
+    expect(stdout).toMatch(/^zed@example\.com\s+Zed\s+loan_officer\s+5\s+no\s+yes\s+has a subject, but no identity in Okta: cannot sign in$/m);
   });
 });
 
@@ -437,15 +482,29 @@ describe("users seed-demo", () => {
     ["mi@demo.test", "Michael", "chief_credit_officer", 5_000_000],
   ] as const;
 
-  test("adds the four with today's roles and limits, each with a password and the invite reminder", async () => {
+  test("adds the four in Okta with today's roles and limits, each with a password and the invite reminder", async () => {
     const run = await ok(["seed-demo", ...FLAGS]);
     for (const [email, name, role, clearance] of CAST) {
-      expect(person(email)?.name).toBe(name);
+      expect(person(email)).toMatchObject({ status: "ACTIVE", firstName: name, lastName: "Loan Desk" });
+      expect(ours(email)).toBe(true);
       expect(subject(email)).toEqual({ user_id: email, display_name: name, role, clearance });
       expect(changes(email).map((row) => row.action)).toEqual(["add"]);
       expect(run.stdout).toContain(`${INVITE} ${email}`);
     }
-    expect(run.stdout.match(/^ {2}password {3}\S+$/gm)).toHaveLength(4);
+    const printed = run.stdout.match(/^ {2}password {3}\S+$/gm)!;
+    expect(printed).toHaveLength(4);
+    for (const [email] of CAST) expect(passwordProblem(person(email)!.password, email)).toBeNull();
+  });
+
+  test("one --password for all four is held to the policy for each of their emails", async () => {
+    // "demo" is part of every username here, so Okta would refuse it for all four.
+    const refused = await users(["seed-demo", ...FLAGS, "--password", "Demo-Desk-2026"]);
+    expect(refused.code).toBe(2);
+    expect(refused.stderr).toContain('must not contain part of the username ("demo")');
+    expect(okta.users.size).toBe(0);
+
+    await ok(["seed-demo", ...FLAGS, "--password", "Ledger-Desk-2026"]);
+    for (const [email] of CAST) expect(person(email)?.password).toBe("Ledger-Desk-2026");
   });
 
   test("is idempotent: a second run writes nothing and prints no password, and still reminds", async () => {
