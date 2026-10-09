@@ -19,13 +19,17 @@
  * - **The CLI's context** is a `credentials.yaml` in a throwaway `HOME`, in the
  *   shape `arcade_core.config_model.Config` writes, holding fake tokens that
  *   must never be printed.
+ * - **The identity provider** is a discovery document served on a port of its
+ *   own, as Okta's custom authorization server publishes it under
+ *   `/oauth2/default`. The run reads it for the provider's endpoints, and the
+ *   stand-in Coordinator reads the same state at its issuer check.
  *
  * Each test runs the real script in a throwaway project of its own: a git
- * repository whose `.env` is the repo's `.env.example` copied verbatim with only
- * `ARCADE_API_KEY` filled, which is where a developer stands after the
- * Quickstart's `cp .env.example .env`.
+ * repository whose `.env` is the repo's `.env.example` copied verbatim with
+ * `ARCADE_API_KEY` filled, and the identity provider's block filled the way
+ * `bun run okta-setup` fills it, which is where a developer stands after the
+ * Quickstart's `cp .env.example .env` and `okta-setup`.
  */
-import { Database } from "bun:sqlite";
 import { afterAll, beforeEach, expect, test } from "bun:test";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -33,13 +37,6 @@ import { join } from "node:path";
 
 import { spawnChild } from "./child.ts";
 import { childEnv } from "./child-env.ts";
-import { Browser } from "./identity-harness.ts";
-import { readWebConfig, type WebConfig } from "../lib/config.ts";
-import { signin, signinCallback } from "../auth/handlers.ts";
-import { linkIdentity } from "../auth/link.ts";
-import { readConfig as readIdpConfig } from "../auth/provider/config.ts";
-import { isIdentityPath, openIdentityProvider } from "../auth/provider/server.ts";
-import { SESSION_COOKIE } from "../auth/session.ts";
 
 const ROOT = join(import.meta.dir, "..");
 const SCRIPT = join(ROOT, "scripts", "setup-arcade.ts");
@@ -55,6 +52,10 @@ const SCOPED = `/v1/orgs/${ORG}/projects/${PROJECT}`;
 const USER_SOURCE = "us_2standinusersource";
 /** What the faked CLI's credentials hold besides the ids: never to be printed. */
 const CLI_TOKENS = ["cli-access-token-must-not-leak", "cli-refresh-token-must-not-leak", "cli-api-key-must-not-leak"];
+/** The Okta app's client, as `bun run okta-setup` writes it to `.env`. */
+const CLIENT_ID = "0oaStandInClient";
+/** Its secret: sent to Arcade, never printed. */
+const CLIENT_SECRET = "okta-client-secret-must-not-leak";
 
 interface Recorded {
   method: string;
@@ -72,8 +73,8 @@ const ROUTE_NOT_FOUND = { name: "route_not_found", message: "requested route is 
 
 /** The Coordinator's User Source routes the stand-in serves (#52), by the name a test injects an answer under. */
 type CoordinatorRoute = "list" | "get" | "test_issuer" | "create";
-/** What the app's discovery publishes as `scopes_supported` (`auth/provider/auth.ts`). */
-const APP_SCOPES = ["openid", "profile", "email", "offline_access"] as const;
+/** What an Okta custom authorization server publishes as `scopes_supported`, as far as this app asks. */
+const IDP_SCOPES = ["openid", "profile", "email", "offline_access"] as const;
 
 /**
  * What Arcade answered the fourth live run's `POST …/plugins` with, byte for
@@ -158,13 +159,13 @@ class StandIn {
   /** When set, the next Coordinator call to that route answers this instead. */
   nextCoordinator: Partial<Record<CoordinatorRoute, { status: number; body: unknown }>> = {};
   /**
-   * The app behind the tunnel: what its `/.well-known/openid-configuration`
-   * answers, to the run and to the Coordinator alike. The Coordinator reads it
-   * at the issuer check and at the create, so either one is refused with a 422
-   * while it is down, names another issuer, or has no signing key.
+   * The identity provider: what its discovery document answers, to the run and
+   * to the Coordinator alike. The Coordinator reads it at the issuer check and
+   * at the create, so either one is refused with a 422 while it is down, names
+   * another issuer, or has no signing key. `issuer` unset is its own.
    */
-  tunnel: { status: number; issuer?: string; scopes?: string[]; signingKeys?: number } = { status: 200, issuer: ORIGIN, scopes: [...APP_SCOPES], signingKeys: 1 };
-  tunnelRequests = 0;
+  idp: { status: number; issuer?: string; scopes?: string[]; signingKeys?: number } = { status: 200, scopes: [...IDP_SCOPES], signingKeys: 1 };
+  idpRequests = 0;
   /** Every request to either stand-in, in order, with which one got it: the ordering proof reads this. */
   timeline: string[] = [];
   /** The callback Arcade generates for the next provider created: one per provider, `…/oauth/<ap_ id>/callback`. */
@@ -185,33 +186,38 @@ class StandIn {
   /** Its own host, as `ARCADE_COORDINATOR_URL` names it: under `/api`, like the default `https://cloud.arcade.dev/api`. */
   private readonly coordinatorServer = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: (request) => this.handleCoordinator(request) });
   readonly coordinatorUrl = `http://127.0.0.1:${this.coordinatorServer.port}/api`;
-  /** The public host through ngrok, as `CG_SETUP_ARCADE_ISSUER_URL` points the run's check at it. */
-  private readonly tunnelServer = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: (request) => this.handleTunnel(request) });
-  readonly tunnelUrl = `http://127.0.0.1:${this.tunnelServer.port}`;
+  /** The identity provider's org, as `OKTA_ORG_URL` names it. */
+  private readonly idpServer = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: (request) => this.handleIdp(request) });
+  readonly idpUrl = `http://127.0.0.1:${this.idpServer.port}`;
+  /** Its `default` custom authorization server, as `IDP_ISSUER` names it. */
+  readonly issuer = `${this.idpUrl}/oauth2/default`;
 
   stop(): void {
     this.server.stop(true);
     this.coordinatorServer.stop(true);
-    this.tunnelServer.stop(true);
+    this.idpServer.stop(true);
   }
 
-  private handleTunnel(request: Request): Response {
-    this.tunnelRequests += 1;
-    this.timeline.push(`tunnel ${request.method} ${new URL(request.url).pathname}`);
-    if (new URL(request.url).pathname !== "/.well-known/openid-configuration") return new Response("not found", { status: 404 });
-    if (this.tunnel.status !== 200) return new Response("ERR_NGROK_8012", { status: this.tunnel.status });
+  private handleIdp(request: Request): Response {
+    this.idpRequests += 1;
+    this.timeline.push(`idp ${request.method} ${new URL(request.url).pathname}`);
+    if (new URL(request.url).pathname !== "/oauth2/default/.well-known/openid-configuration") return new Response("not found", { status: 404 });
+    if (this.idp.status !== 200) return new Response("unavailable", { status: this.idp.status });
     return Response.json(this.discoveryDocument());
   }
 
-  /** The app's discovery as Better Auth publishes it, from what `tunnel` says. */
+  /** The discovery document as Okta's custom authorization server publishes it, from what `idp` says. */
   private discoveryDocument(): Json {
-    const base = this.tunnel.issuer?.replace(/\/+$/, "");
+    const issuer = this.idp.issuer ?? this.issuer;
+    const base = issuer.replace(/\/+$/, "");
     return {
-      issuer: this.tunnel.issuer,
-      authorization_endpoint: `${base}/api/auth/oauth2/authorize`,
-      token_endpoint: `${base}/api/auth/oauth2/token`,
-      jwks_uri: `${base}/api/auth/jwks`,
-      ...(this.tunnel.scopes === undefined ? {} : { scopes_supported: this.tunnel.scopes }),
+      issuer,
+      authorization_endpoint: `${base}/v1/authorize`,
+      token_endpoint: `${base}/v1/token`,
+      userinfo_endpoint: `${base}/v1/userinfo`,
+      jwks_uri: `${base}/v1/keys`,
+      token_endpoint_auth_methods_supported: ["client_secret_basic", "client_secret_post"],
+      ...(this.idp.scopes === undefined ? {} : { scopes_supported: this.idp.scopes }),
     };
   }
 
@@ -220,14 +226,14 @@ class StandIn {
    * passes: the discovery at the issuer (trailing slash stripped), the issuer
    * in it byte for byte, both endpoints, a signing key in the JWKS, and every
    * scope asked for in `scopes_supported` when the app publishes it. The
-   * stand-in reads `tunnel` instead of the network.
+   * stand-in reads `idp` instead of the network.
    */
   private issuerRefusal(issuer: string, scopes: string[]): string | null {
     const url = `${issuer.replace(/\/+$/, "")}/.well-known/openid-configuration`;
-    if (this.tunnel.status !== 200 || issuer.replace(/\/+$/, "") !== ORIGIN) return `Could not reach \`${url}\` at this time. Try again.`;
+    if (this.idp.status !== 200 || issuer.replace(/\/+$/, "") !== this.issuer) return `Could not reach \`${url}\` at this time. Try again.`;
     const document = this.discoveryDocument();
     if (document.issuer !== issuer) return `The issuer in \`${url}\` is \`${document.issuer}\`, not \`${issuer}\`.`;
-    if ((this.tunnel.signingKeys ?? 0) < 1) return `The JWKS at \`${document.jwks_uri}\` has no signing key.`;
+    if ((this.idp.signingKeys ?? 0) < 1) return `The JWKS at \`${document.jwks_uri}\` has no signing key.`;
     const unsupported = document.scopes_supported === undefined ? [] : scopes.filter((scope) => !(document.scopes_supported as string[]).includes(scope));
     if (unsupported.length > 0) return `Scopes not supported by the issuer: ${unsupported.join(", ")}.`;
     return null;
@@ -539,8 +545,8 @@ function sourceId(label: string): string {
 function userSourceRecord(fields: Json): Json {
   return {
     name: "Loans Approval Limits",
-    description: "The app's own sign-in (hop 1)",
-    issuer: ORIGIN,
+    description: "The app's sign-in, through its identity provider (hop 1)",
+    issuer: arcade.issuer,
     binding_type: "project",
     protocol: "oidc",
     status: "active",
@@ -660,8 +666,21 @@ function project(
   git(dir, "init", "-q");
   writeFileSync(join(dir, ".gitignore"), ".env\n*.db\n*.db-*\n");
   copyFileSync(join(ROOT, ".env.example"), join(dir, ".env.example"));
-  const env = readFileSync(join(ROOT, ".env.example"), "utf8").replace(/^ARCADE_API_KEY=$/m, `ARCADE_API_KEY=${KEY}`);
-  if (env === readFileSync(join(ROOT, ".env.example"), "utf8")) throw new Error(".env.example has no blank ARCADE_API_KEY= line");
+  const example = readFileSync(join(ROOT, ".env.example"), "utf8");
+  // The key, and what `bun run okta-setup` writes.
+  const filled: Record<string, string> = {
+    ARCADE_API_KEY: KEY,
+    OKTA_ORG_URL: arcade.idpUrl,
+    IDP_ISSUER: arcade.issuer,
+    IDP_CLIENT_ID: CLIENT_ID,
+    IDP_CLIENT_SECRET: CLIENT_SECRET,
+  };
+  let env = example;
+  for (const [key, value] of Object.entries(filled)) {
+    const next = env.replace(new RegExp(`^${key}=$`, "m"), `${key}=${value}`);
+    if (next === env) throw new Error(`.env.example has no blank ${key}= line`);
+    env = next;
+  }
   writeFileSync(join(dir, ".env"), edit(env));
   const home = join(scratch, `${name}.home`);
   mkdirSync(home, { recursive: true });
@@ -697,7 +716,6 @@ async function setupArcade(cwd: string, ...args: Array<string | RunOptions>): Pr
       // Never the real Coordinator, whatever a test's shell says (#52): a test that
       // wants another host sets it in `shell`, which wins, and it is always a local one.
       ARCADE_COORDINATOR_URL: arcade.coordinatorUrl,
-      CG_SETUP_ARCADE_ISSUER_URL: arcade.tunnelUrl,
       ...(options.tty ? { CG_SETUP_ARCADE_TTY: "1" } : {}),
       ...options.shell,
       ARCADE_API_URL: arcade.url,
@@ -723,6 +741,7 @@ async function setupArcade(cwd: string, ...args: Array<string | RunOptions>): Pr
   ]);
   // The CLI's tokens are in the file the script reads: none may come out of it.
   for (const token of CLI_TOKENS) expect(`${stdout}${stderr}`, `the run printed the CLI's ${token}`).not.toContain(token);
+  expect(`${stdout}${stderr}`, "the run printed the Okta client's secret").not.toContain(CLIENT_SECRET);
   return { code, stdout, stderr };
 }
 
@@ -733,18 +752,6 @@ function envOf(dir: string): Record<string, string> {
     if (match) env[match[1]!] = match[2]!;
   }
   return env;
-}
-
-function clientsIn(dir: string): Record<string, { clientId: string; redirectUris: string[] }> {
-  const db = new Database(join(dir, "idp.db"), { readonly: true });
-  try {
-    const rows = db.query(`select id, clientId, redirectUris from oauthClient`).all() as Array<{ id: string; clientId: string; redirectUris: string }>;
-    return Object.fromEntries(
-      rows.map((row) => [row.id, { clientId: row.clientId, redirectUris: row.redirectUris.startsWith("[") ? (JSON.parse(row.redirectUris) as string[]) : row.redirectUris.split(",") }]),
-    );
-  } finally {
-    db.close();
-  }
 }
 
 /** `METHOD /path`, with the ids Arcade minted written `{id}`, so a real run and a dry run compare. */
@@ -798,7 +805,7 @@ const ONE_CLICK_COORDINATOR = [LIST, TEST_ISSUER, `POST ${USER_SOURCES}`, READ_B
 /** What a fresh one-click run adds on Arcade's API after the gateway check: the gateway created and read back, then the hooks on. */
 const ONE_CLICK_TAIL = [`POST ${SCOPED}/gateways`, `GET ${SCOPED}/gateways/{id}`, ...TURN_ON];
 /** Both stand-ins' requests, in the order they came, as one sequence: what a dry run describes. */
-const combined = () => arcade.timeline.filter((each) => !each.startsWith("tunnel ")).map((each) => normalise(each.replace(/^(arcade|coordinator) /, "")));
+const combined = () => arcade.timeline.filter((each) => !each.startsWith("idp ")).map((each) => normalise(each.replace(/^(arcade|coordinator) /, "")));
 const coordinatorSequence = () =>
   arcade.coordinatorRequests.map((each) => `${each.method} ${each.path.replace(/^\/api/, "").replace(/\/user_sources\/us_[0-9A-Za-z]+$/, "/user_sources/{id}")}`);
 
@@ -879,23 +886,22 @@ test("a first run registers every API-able piece with the hooks disabled, deploy
   for (const request of arcade.requests) expect(request.authorization).toBe(`Bearer ${KEY}`);
 
   const env = envOf(dir);
-  const clients = clientsIn(dir);
-  expect(Object.keys(clients).sort()).toEqual(["arcade", "arcade-user-source", "web"]);
 
-  // The provider: the app's own endpoints, its own `arcade` client, Basic plus PKCE, email as the user id.
+  // The provider: Okta's endpoints from discovery, the Okta app's client, Basic plus PKCE, email as the user id.
   const provider = arcade.requests[2]!.body as { id: string; oauth2: Record<string, any> };
   expect(provider.id).toBe("app-identity");
-  expect(provider.oauth2.client_id).toBe(clients.arcade!.clientId);
-  expect(provider.oauth2.client_secret).toMatch(/^\S{16,}$/);
-  expect(provider.oauth2.authorize_request.endpoint).toBe(`${ORIGIN}/oauth2/authorize`);
-  expect(provider.oauth2.token_request.endpoint).toBe(`${ORIGIN}/oauth2/token`);
+  expect(provider.oauth2.client_id).toBe(CLIENT_ID);
+  expect(provider.oauth2.client_secret).toBe(CLIENT_SECRET);
+  expect(provider.oauth2.authorize_request.endpoint).toBe(`${arcade.issuer}/v1/authorize`);
+  expect(provider.oauth2.token_request.endpoint).toBe(`${arcade.issuer}/v1/token`);
   expect(provider.oauth2.token_request.auth_method).toBe("client_secret_basic");
-  expect(provider.oauth2.user_info_request.endpoint).toBe(`${ORIGIN}/oauth2/userinfo`);
+  expect(provider.oauth2.user_info_request.endpoint).toBe(`${arcade.issuer}/v1/userinfo`);
   expect(provider.oauth2.user_info_request.response_map).toEqual({ user_id: "$.email" });
   expect(provider.oauth2.pkce).toEqual({ enabled: true, code_challenge_method: "S256" });
-  // Arcade's generated callback came back and is now allowlisted on that client.
-  expect(clients.arcade!.redirectUris).toContain(CALLBACK);
-  expect(env.IDP_OAUTH_REDIRECT_URIS_ARCADE).toBe(CALLBACK);
+  // Arcade's generated callback came back, and is in .env for `bun run okta-setup` to allowlist.
+  expect(env.ARCADE_PROVIDER_CALLBACK).toBe(CALLBACK);
+  expect(run.stdout).toContain(`wrote the provider's callback to .env: ${CALLBACK}`);
+  expect(run.stdout).toContain("Okta does not allowlist it until you run `bun run okta-setup` again");
 
   // The hooks: by API since #30, with the bearer the app checks, which is never printed,
   // and disabled since #48: the swagger's inactive value on the plugin and on every endpoint.
@@ -926,11 +932,8 @@ test("a first run registers every API-able piece with the hooks disabled, deploy
   expect(env.ARCADE_HOOK_SIGNING_SECRET).toMatch(/^[0-9a-f]{64}$/);
   expect(env.APPROVALS_STORE_TOKEN).toMatch(/^[0-9a-f]{64}$/);
   expect(new Set([env.SESSION_SECRET, env.ARCADE_HOOK_SIGNING_SECRET, env.APPROVALS_STORE_TOKEN]).size).toBe(3);
-  expect(env.IDP_OAUTH_CLIENTS).toBe("arcade,arcade-user-source,web");
-  expect(env.IDP_CLIENT_ID).toBe(clients.web!.clientId);
-  expect(env.IDP_CLIENT_SECRET).toMatch(/^\S{16,}$/);
-  expect(clients.web!.redirectUris).toEqual([`${ORIGIN}/api/auth/callback`, "http://127.0.0.1:8765/callback"]);
-  expect(clients["arcade-user-source"]!.redirectUris).toEqual(["https://cloud.arcade.dev/oauth2/intermediate_callback"]);
+  // What `bun run okta-setup` wrote is read, and left as it was.
+  expect([env.IDP_ISSUER, env.IDP_CLIENT_ID, env.IDP_CLIENT_SECRET]).toEqual([arcade.issuer, CLIENT_ID, CLIENT_SECRET]);
   expect(env.ARCADE_GATEWAY_ID).toBe("loan-desk-template-test");
   expect(env.GOVERNANCE_STREAM).toBe("hooks");
   // Every key .env.example says setup-arcade fills is filled.
@@ -940,11 +943,6 @@ test("a first run registers every API-able piece with the hooks disabled, deploy
   expect(owned.length).toBeGreaterThan(5);
   for (const key of owned) expect(env[key], `setup-arcade left ${key} blank`).toMatch(/\S/);
   expect(env.ARCADE_API_KEY).toBe(KEY);
-  // The identity provider's secret (#9): filled, fresh, and never printed.
-  expect(env.BETTER_AUTH_SECRET).toMatch(/^[0-9a-f]{64}$/);
-  expect(new Set([env.BETTER_AUTH_SECRET, env.SESSION_SECRET, env.ARCADE_HOOK_SIGNING_SECRET, env.APPROVALS_STORE_TOKEN]).size).toBe(4);
-  expect(run.stdout).toMatch(/filled\s+.*\bBETTER_AUTH_SECRET\b/);
-  expect(`${run.stdout}${run.stderr}`).not.toContain(env.BETTER_AUTH_SECRET!);
   // A value setup-arcade would otherwise have written, set by hand first: kept.
   expect(env.SESSION_SECRET).toBe(mine);
   expect(run.stdout).toMatch(/kept\s+SESSION_SECRET/);
@@ -956,8 +954,9 @@ test("a first run registers every API-able piece with the hooks disabled, deploy
   expect(run.stdout).toContain("hooks: left disabled, so the dashboard's gateway form lists the tools");
   expect(formOrder(run.stdout)).toEqual(["User Source", "gateway"]);
   expect(run.stdout).toContain("User Sources → Create User Source");
-  expect(run.stdout).toContain(`Issuer URL      ${ORIGIN}`);
-  expect(run.stdout).toContain(`Client ID       ${clients["arcade-user-source"]!.clientId}`);
+  expect(run.stdout).toContain(`Issuer URL      ${arcade.issuer}`);
+  expect(run.stdout).toContain(`Client ID       ${CLIENT_ID}`);
+  expect(run.stdout).toContain("Client Secret   IDP_CLIENT_SECRET from .env (not shown here)");
   expect(run.stdout).toMatch(/Subject Claim\s+email/);
   gatewayFormIsComplete(run.stdout);
   // Then the command for the second run, and the warning, last.
@@ -1073,10 +1072,13 @@ test("a dry run ends with the same steps", async () => {
  * The first step starts the app; it does not restart it (#26). A developer
  * following the Quickstart runs `setup-arcade` at step 4 and has never started
  * `bun run dev`: "Restart" told them to restart something that was not running.
+ * The one step allowed ahead of it is the Okta allowlist, when this run wrote a
+ * new provider callback: sign-in through Arcade fails until Okta knows it.
  */
 function startsTheApp(printed: string): void {
-  const first = printed.split("\n").find((line) => /^\s*1\./.test(line)) ?? "";
-  expect(first).toMatch(/^\s*1\. Start `bun run dev`/);
+  const numbered = printed.split("\n").filter((line) => /^\s*\d+\./.test(line));
+  const first = /bun run okta-setup/.test(numbered[0] ?? "") ? numbered[1] : numbered[0];
+  expect(first ?? "").toMatch(/^\s*\d\. Start `bun run dev`/);
   expect(printed).not.toMatch(/^\s*\d\. Restart/m);
 }
 
@@ -1106,26 +1108,25 @@ test("--dry-run from a fresh project prints the requests a real run makes, in or
   expect(plugin.webhook_config.auth).toEqual({ type: "bearer", token: "<generated ARCADE_HOOK_SIGNING_SECRET>" });
   expect(plugin.status).toBe("inactive");
   expect(plugin.webhook_config.endpoints.pre).toEqual({ url: `${ORIGIN}/hooks/pre`, phase: "before", failure_mode: "fail_closed", status: "inactive" });
-  // The User Source (#52): Arcade's issuer check, then the create, with the issuer the app's discovery names and
-  // the client's secret as placeholders, then the read-back by id.
-  const discovered = `<the issuer ${ORIGIN}/.well-known/openid-configuration names>`;
-  expect(bodyAfter(run.stdout, `  POST ${arcade.coordinatorUrl}${USER_SOURCES}/test_issuer\n`)).toEqual({ issuer: discovered });
+  // The User Source (#52): Arcade's issuer check, then the create, with IDP_ISSUER, the Okta app's client and
+  // its secret as a placeholder, then the read-back by id.
+  expect(bodyAfter(run.stdout, `  POST ${arcade.coordinatorUrl}${USER_SOURCES}/test_issuer\n`)).toEqual({ issuer: arcade.issuer });
   const source = bodyAfter(run.stdout, `  POST ${arcade.coordinatorUrl}${USER_SOURCES}\n`);
   expect(source).toEqual({
     name: "Loans Approval Limits",
-    description: "The app's own sign-in (hop 1)",
+    description: "The app's sign-in, through its identity provider (hop 1)",
     protocol: "oidc",
-    issuer: discovered,
-    client_id: "<the arcade-user-source client id in idp.db>",
-    client_secret: "<its secret, minted by this run>",
+    issuer: arcade.issuer,
+    client_id: CLIENT_ID,
+    client_secret: "<IDP_CLIENT_SECRET from .env>",
     subject_claim: "email",
     scopes: ["openid", "profile", "email"],
     status: "active",
   });
   expect(run.stdout).toContain(`  GET ${arcade.coordinatorUrl}${USER_SOURCES}?limit=100&offset=0\n`);
   expect(run.stdout).toContain(`  GET ${arcade.coordinatorUrl}${USER_SOURCES}/<user_source_id>\n`);
-  expect(run.stdout).toContain(`it reads the issuer from ${ORIGIN}/.well-known/openid-configuration through the tunnel, and has Arcade check it`);
-  expect(run.stdout).toContain("(204 creates it. A 422 prints Arcade's reason and asks again:)");
+  expect(run.stdout).toContain(`identity: a real run reads ${arcade.issuer}/.well-known/openid-configuration for the provider's endpoints`);
+  expect(run.stdout).toContain("(204 creates it. Anything else falls back to the dashboard forms, with Arcade's reason:)");
   // The gateway through it, then the hooks on, last; and what the fallback does instead.
   const gateway = bodyAfter(run.stdout, `  POST ${arcade.url}${SCOPED}/gateways\n`);
   expect(gateway.auth_type).toBe("user_source");
@@ -1137,7 +1138,8 @@ test("--dry-run from a fresh project prints the requests a real run makes, in or
     "Deploys, after the hooks and before the gateway check, each stopping the run if it fails, unless Arcade already runs it:\n  arcade deploy   (in mcp)",
   );
   expect(run.stdout).not.toContain("POST " + arcade.url + "/v1/admin/secrets");
-  expect(run.stdout).toMatch(/would fill .*\bBETTER_AUTH_SECRET\b/);
+  expect(run.stdout).toMatch(/would fill .*\bARCADE_PROVIDER_CALLBACK\b/);
+  expect(run.stdout).not.toContain(CLIENT_SECRET);
   expect(run.stdout).not.toContain(KEY);
   expect(formOrder(run.stdout)).toEqual(["User Source", "gateway"]);
 });
@@ -1428,7 +1430,7 @@ test("an existing provider that differs is reported and never edited, and nothin
   const run = await setupArcade(dir);
 
   expect(run.code).toBe(1);
-  expect(run.stdout).toContain("oauth2.token_request.endpoint: Arcade has \"https://old-host.example/oauth2/token\", this app needs \"https://template-test.ngrok.app/oauth2/token\"");
+  expect(run.stdout).toContain(`oauth2.token_request.endpoint: Arcade has "https://old-host.example/oauth2/token", this app needs "${arcade.issuer}/v1/token"`);
   expect(run.stdout).toContain("oauth2.client_id: Arcade has \"somebody-elses-client\"");
   expect(run.stderr).toContain("never edits an existing provider");
   // Two reads, and nothing after them: no PATCH, no DELETE, no re-create, no hooks, no deploys.
@@ -1454,8 +1456,9 @@ test("running it again changes nothing that is registered and rotates nothing Ar
   expect(JSON.stringify(arcade.providers.get("app-identity"))).toBe(providerAfterFirst);
   expect(JSON.stringify([...arcade.plugins.values()])).toBe(pluginAfterFirst);
   expect(readFileSync(join(dir, ".env"), "utf8")).toBe(envAfterFirst);
-  // The User Source's secret was shown once, on the first run, and is not re-minted.
-  expect(again.stdout).toContain("(unchanged, and not shown");
+  // The callback on file is the provider's, so Okta has nothing new to allowlist.
+  expect(again.stdout).not.toContain("provider's callback");
+  expect(thenList(again.stdout)).not.toContain("okta-setup");
 }, 60_000);
 
 test("hooks that differ are updated, because they are not the access model, and read back, keeping their status", async () => {
@@ -1493,16 +1496,6 @@ test("a verifier setting that does not read back fails the run, naming open risk
   expect(run.stderr).toContain("the custom verifier did not take");
   expect(run.stderr).toContain("open risk 2");
 });
-
-test("a BETTER_AUTH_SECRET the developer set is kept, and the clients are minted under it", async () => {
-  const mine = "a-developer-chosen-better-auth-secret-0123456789abcdef";
-  const dir = project("identity-secret", (env) => env.replace(/^BETTER_AUTH_SECRET=$/m, `BETTER_AUTH_SECRET=${mine}`));
-  const run = await setupArcade(dir);
-  expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(0);
-  expect(envOf(dir).BETTER_AUTH_SECRET).toBe(mine);
-  expect(run.stdout).toMatch(/kept\s+.*\bBETTER_AUTH_SECRET\b/);
-  expect(`${run.stdout}${run.stderr}`).not.toContain(mine);
-}, 60_000);
 
 /**
  * The stand-in is a test double for Arcade, so it refuses what Arcade refused
@@ -1557,12 +1550,13 @@ test("with no org and project anywhere, the hooks and the gateway fall back to t
   expect(formOrder(run.stdout)).toEqual(["User Source", "gateway", "hooks"]);
   hooksFormIsComplete(run.stdout);
   expect(thenList(run.stdout).split("\n").slice(1)).toEqual([
-    "  1. Start `bun run dev` (or restart it, if it is already running), so the app reads the new .env.",
-    `  2. Start the tunnel: ngrok http --url=${HOST} 3000`,
-    "  3. With the app reachable through the tunnel, fill in the User Source form above.",
-    "  4. Fill in the gateway form above. It authenticates through the User Source, and lists the toolkits' tools once they are deployed.",
-    "  5. Fill in the contextual access hooks form above. Arcade checks /hooks/health through the tunnel.",
-    `  6. Open ${ORIGIN}, never localhost, and sign in.`,
+    '  1. Allowlist the provider\'s callback on the Okta app: OKTA_API_TOKEN="op://<vault>/<item>/<field>" op run -- bun run okta-setup',
+    "  2. Start `bun run dev` (or restart it, if it is already running), so the app reads the new .env.",
+    `  3. Start the tunnel: ngrok http --url=${HOST} 3000`,
+    "  4. Fill in the User Source form above.",
+    "  5. Fill in the gateway form above. It authenticates through the User Source, and lists the toolkits' tools once they are deployed.",
+    "  6. Fill in the contextual access hooks form above. Arcade checks /hooks/health through the tunnel.",
+    `  7. Open ${ORIGIN}, never localhost, and sign in.`,
   ]);
 }, 60_000);
 
@@ -1637,7 +1631,7 @@ test("--skip-deploy runs no deploy, and the steps left say to deploy before the 
   expect(projects.get(dir)!.deploys()).toEqual([]);
   expect(run.stdout).toContain("Deploys: skipped (--skip-deploy).");
   const steps = thenList(run.stdout);
-  expect(steps).toContain("3. Deploy the toolkits (their secrets are set above): arcade deploy, in mcp.");
+  expect(steps).toContain("4. Deploy the toolkits (their secrets are set above): arcade deploy, in mcp.");
   const form = steps.search(/fill in the gateway form/i);
   expect(form).toBeGreaterThan(-1);
   expect(steps.indexOf("arcade deploy")).toBeLessThan(form);
@@ -1646,22 +1640,12 @@ test("--skip-deploy runs no deploy, and the steps left say to deploy before the 
 
 // --- Resuming from the live project -----------------------------------------
 
-/** Every `oauthClient` row, whole, hashed secrets included: what "minted nothing" is checked against. */
-function clientRows(dir: string): string {
-  const db = new Database(join(dir, "idp.db"), { readonly: true });
-  try {
-    return JSON.stringify(db.query(`select * from oauthClient order by id`).all());
-  } finally {
-    db.close();
-  }
-}
-
 /**
  * The human's live project after the first real run (#7, 2026-09-25): the
- * provider was created (201) and its callback allowlisted, `.env`'s second
- * block was filled and `idp.db` minted, and the run stopped at the tool
- * secrets' 404, so no secret, no hooks and no verifier were set. The fixed
- * command must pick up from exactly there (#26).
+ * provider was created (201) and its callback written to `.env`, `.env`'s
+ * second block was filled, and the run stopped at the tool secrets' 404, so no
+ * secret, no hooks and no verifier were set. The fixed command must pick up
+ * from exactly there (#26).
  */
 test("a rerun resumes from the live project's state after run 1: the provider matches, nothing is minted or overwritten, and the rest is set", async () => {
   const dir = project("resume-live");
@@ -1676,17 +1660,15 @@ test("a rerun resumes from the live project's state after run 1: the provider ma
 
   // The state the issue describes, checked rather than assumed.
   expect(arcade.providers.has("app-identity")).toBe(true);
-  expect(existsSync(join(dir, "idp.db"))).toBe(true);
   const example = readFileSync(join(ROOT, ".env.example"), "utf8");
   const section = example.slice(example.indexOf("# --- Filled in by `bun run setup-arcade"), example.indexOf("# --- Optional"));
   const envBefore = envOf(dir);
   for (const [, key] of section.matchAll(/^([A-Z_][A-Z0-9_]*)=$/gm)) expect(envBefore[key!], `block 2 left ${key} blank`).toMatch(/\S/);
-  expect(clientsIn(dir).arcade!.redirectUris).toContain(CALLBACK);
+  expect(envBefore.ARCADE_PROVIDER_CALLBACK).toBe(CALLBACK);
   expect(arcade.secrets.size).toBe(0);
   expect(arcade.verifier).toEqual({ verifier_url: "", unsafe_skip_verification: false });
 
   const envText = readFileSync(join(dir, ".env"), "utf8");
-  const rows = clientRows(dir);
   const provider = JSON.stringify(arcade.providers.get("app-identity"));
   arcade.secretsLikeTheLiveRun = false;
   arcade.requests = [];
@@ -1697,8 +1679,7 @@ test("a rerun resumes from the live project's state after run 1: the provider ma
   expect(rerun.code, `${rerun.stdout}\n${rerun.stderr}`).toBe(0);
   expect(rerun.stdout).toContain("the provider app-identity is already registered and matches; it is left as it is");
   expect(sequence(arcade.requests)).toEqual(FIRST_RUN.filter((each) => each !== "POST /v1/admin/auth_providers"));
-  // Minted nothing, overwrote nothing, re-created nothing.
-  expect(clientRows(dir)).toBe(rows);
+  // Overwrote nothing, re-created nothing.
   expect(readFileSync(join(dir, ".env"), "utf8")).toBe(envText);
   expect(rerun.stdout).toContain("filled   (nothing to fill: every value was already set)");
   expect(JSON.stringify(arcade.providers.get("app-identity"))).toBe(provider);
@@ -1716,10 +1697,9 @@ const printedRequests = (stdout: string) =>
 
 /** What a dry run says only when it is about to create what a resumed project already has (#28). */
 const FRESH_ONLY = [
-  "would mint the OAuth clients",
   "would fill ",
-  "IDP_CLIENT_ID, IDP_CLIENT_SECRET",
-  "minted by this run>",
+  "ARCADE_PROVIDER_CALLBACK (with the callback Arcade generates for the provider)",
+  "(404: the provider is created below.",
   "/v1/admin/auth_providers\n",
 ];
 
@@ -1729,14 +1709,13 @@ test("a dry run of a fresh project describes the real run that follows it", asyn
   expect(dry.code, `${dry.stdout}\n${dry.stderr}`).toBe(0);
   expect(arcade.requests).toEqual([]);
 
-  expect(dry.stdout).toContain("idp.db: would mint the OAuth clients arcade, arcade-user-source, web");
-  expect(dry.stdout).toMatch(/would fill .*\bIDP_CLIENT_ID, IDP_CLIENT_SECRET\b.*\bIDP_OAUTH_REDIRECT_URIS_ARCADE\b/);
-  expect(dry.stdout).toContain("Client Secret   <its secret, minted by this run>");
+  expect(dry.stdout).toMatch(/would fill .*\bSESSION_SECRET\b.*\bARCADE_PROVIDER_CALLBACK\b/);
+  expect(dry.stdout).toContain("Client Secret   IDP_CLIENT_SECRET from .env (not shown here)");
   expect(dry.stdout).toContain(`  POST ${arcade.url}/v1/admin/auth_providers\n`);
 
   // The real run it describes is the one-click one (#52), across both APIs.
   arcade.coordinatorMode = "available";
-  const real = await setupArcade(dir, { tty: true, input: "\n" });
+  const real = await setupArcade(dir);
   expect(real.code, `${real.stdout}\n${real.stderr}`).toBe(0);
   expect(printedRequests(dry.stdout)).toEqual(combined());
 }, 60_000);
@@ -1746,8 +1725,8 @@ const asFallback = (printed: string[]) => printed.filter((each) => !each.include
 
 /**
  * The human's live project as #30 describes it: after run 3, the provider,
- * both tool secrets and the verifier are set, `.env`'s second block is filled
- * and `idp.db` minted, and there is no plugin and no gateway, because both
+ * both tool secrets and the verifier are set, `.env`'s second block is filled,
+ * and there is no plugin and no gateway, because both
  * were dashboard forms. That state is built here by a whole run with the
  * plugin then taken back out, and checked rather than assumed. From it, the
  * dry run and the real rerun must agree, and the second invocation must make
@@ -1763,14 +1742,12 @@ test("from the live project's state after run 3, the dry run tells the truth, th
   expect([...arcade.secrets.keys()].sort()).toEqual(["APPROVALS_STORE_TOKEN", "APP_PUBLIC_HOST"]);
   expect(arcade.verifier).toEqual({ verifier_url: `${ORIGIN}/api/arcade/verify`, unsafe_skip_verification: false });
   expect(arcade.gateways.size).toBe(0);
-  expect(existsSync(join(dir, "idp.db"))).toBe(true);
   const envBefore = envOf(dir);
   const example = readFileSync(join(ROOT, ".env.example"), "utf8");
   const block2 = example.slice(example.indexOf("# --- Filled in by `bun run setup-arcade"), example.indexOf("# --- Optional"));
   for (const [, key] of block2.matchAll(/^([A-Z_][A-Z0-9_]*)=$/gm)) expect(envBefore[key!], `block 2 left ${key} blank`).toMatch(/\S/);
   const secretsBefore = new Map(arcade.secrets);
   const envText = readFileSync(join(dir, ".env"), "utf8");
-  const rows = clientRows(dir);
   const provider = JSON.stringify(arcade.providers.get("app-identity"));
   arcade.requests = [];
 
@@ -1781,11 +1758,9 @@ test("from the live project's state after run 3, the dry run tells the truth, th
   expect(arcade.requests).toEqual([]);
   for (const phrase of FRESH_ONLY) expect(dry.stdout, `the resumed dry run says ${JSON.stringify(phrase)}`).not.toContain(phrase);
   expect(dry.stdout).toContain(".env: nothing to fill: every value is already set, and none is overwritten");
-  expect(dry.stdout).toContain("idp.db: already holds the OAuth clients");
-  expect(dry.stdout).toContain("  no secret is minted or rotated");
   expect(dry.stdout).toContain("(expected 200: .env holds the callback Arcade made for this provider.");
-  expect(dry.stdout).toContain("If Arcade answers 404 instead, a real run mints a new secret for the");
-  expect(dry.stdout).toContain("Client Secret   (unchanged, and not shown");
+  expect(dry.stdout).toContain("If Arcade answers 404 instead, a real run creates the provider.");
+  expect(dry.stdout).toContain("Client Secret   IDP_CLIENT_SECRET from .env (not shown here)");
   expect(bodyAfter(dry.stdout, `  POST ${arcade.url}${SCOPED}/plugins\n`).webhook_config.auth.token).toBe("<ARCADE_HOOK_SIGNING_SECRET from .env>");
   expect(formOrder(dry.stdout)).toEqual(["User Source", "gateway"]);
   // The check bites: the fresh project's dry run says every one of them.
@@ -1826,9 +1801,8 @@ test("from the live project's state after run 3, the dry run tells the truth, th
   ];
   expect([...marks].sort((a, b) => a - b)).toEqual(marks);
 
-  // Idempotent: the same secrets, nothing minted, nothing overwritten, nothing re-created.
+  // Idempotent: the same secrets, nothing overwritten, nothing re-created.
   expect(arcade.secrets).toEqual(secretsBefore);
-  expect(clientRows(dir)).toBe(rows);
   expect(readFileSync(join(dir, ".env"), "utf8")).toBe(envText);
   expect(JSON.stringify(arcade.providers.get("app-identity"))).toBe(provider);
   expect(`${rerun.stdout}${dry.stdout}`).not.toContain(envBefore.ARCADE_HOOK_SIGNING_SECRET!);
@@ -1878,12 +1852,13 @@ test("a refusal about reaching the app says to start it and the tunnel", async (
   expect(run.stderr).toContain(`Arcade could not reach ${ORIGIN}/hooks/health: start \`bun run dev\` and the tunnel first.`);
 });
 
-test("setup-arcade manages exactly .env.example's required values and its second block", async () => {
-  const { REQUIRED_KEYS, WRITTEN_KEYS } = await import("../scripts/setup-arcade/env-file.ts");
+test("setup-arcade manages exactly .env.example's required values, okta-setup's block and its own", async () => {
+  const { REQUIRED_KEYS, IDP_KEYS, WRITTEN_KEYS } = await import("../scripts/setup-arcade/env-file.ts");
   const example = readFileSync(join(ROOT, ".env.example"), "utf8");
   const block = (from: string, to: string) =>
     [...example.slice(example.indexOf(from), example.indexOf(to)).matchAll(/^([A-Z_][A-Z0-9_]*)=/gm)].map(([, key]) => key!).sort();
-  expect(([...REQUIRED_KEYS] as string[]).sort()).toEqual(block("# --- Required", "# --- Filled in by `bun run setup-arcade"));
+  expect(([...REQUIRED_KEYS] as string[]).sort()).toEqual(block("# --- Required", "# --- Filled in by `bun run okta-setup"));
+  expect(([...IDP_KEYS] as string[]).sort()).toEqual(block("# --- Filled in by `bun run okta-setup", "# --- Filled in by `bun run setup-arcade"));
   expect(([...WRITTEN_KEYS] as string[]).sort()).toEqual(block("# --- Filled in by `bun run setup-arcade", "# --- Optional"));
 });
 
@@ -1891,8 +1866,8 @@ test("setup-arcade manages exactly .env.example's required values and its second
  * The fourth live run (#7, F7): a fresh clone, a fresh `.env` with its second
  * block blank, and a shell that still exported the previous clone's `.env`
  * (`set -a; . ./.env`). The shell won, the run said ".env: nothing to fill",
- * the provider was created with the shell's old `arcade` client, and
- * `bun run dev`, which reads `.env`, had no BETTER_AUTH_SECRET. The run now
+ * the provider was created with the shell's old client, and `bun run dev`,
+ * which reads `.env`, had none of the second block. The run now
  * stops before it sends or writes anything, and names the keys, never the values.
  */
 test("a shell that still exports an old .env is refused before anything is sent or written, naming the keys and not the values", async () => {
@@ -1901,7 +1876,8 @@ test("a shell that still exports an old .env is refused before anything is sent 
   const exported = envOf(old);
   const managed = (await import("../scripts/setup-arcade/env-file.ts")).MANAGED_KEYS;
   const shell = Object.fromEntries(Object.entries(exported).filter(([key, value]) => managed.includes(key) && value !== ""));
-  expect(Object.keys(shell)).toContain("BETTER_AUTH_SECRET");
+  expect(Object.keys(shell)).toContain("SESSION_SECRET");
+  expect(Object.keys(shell)).toContain("ARCADE_PROVIDER_CALLBACK");
   arcade.requests = [];
 
   // The seven filled in, as the human's were, and the second block blank.
@@ -1911,7 +1887,7 @@ test("a shell that still exports an old .env is refused before anything is sent 
   console.log(`--- setup-arcade ${HOST}, with the old clone's .env exported ---\n${run.stdout}${run.stderr}`);
   expect(run.code).toBe(1);
   const refused = Object.keys(shell).filter((key) => (envOf(dir)[key] ?? "") !== shell[key]);
-  expect(refused.length).toBeGreaterThan(5);
+  expect(refused).toEqual(expect.arrayContaining(["SESSION_SECRET", "ARCADE_PROVIDER_CALLBACK", "ARCADE_HOOK_SIGNING_SECRET", "APPROVALS_STORE_TOKEN"]));
   expect(run.stderr).toContain(`${refused.join(", ")} are exported in this shell with a value .env does not hold`);
   expect(run.stderr).toContain(`Open a new terminal, or run: unset ${refused.join(" ")}`);
   expect(run.stderr).toContain("Nothing was sent or written.");
@@ -1921,34 +1897,39 @@ test("a shell that still exports an old .env is refused before anything is sent 
   for (const key of refused) expect(`${run.stdout}${run.stderr}`, `the run printed ${key}'s value`).not.toContain(shell[key]!);
   expect(arcade.requests).toEqual([]);
   expect(readFileSync(join(dir, ".env"), "utf8")).toBe(before);
-  expect(existsSync(join(dir, "idp.db"))).toBe(false);
   expect(projects.get(dir)!.deploys()).toEqual([]);
   // A dry run says the same.
   expect((await setupArcade(dir, "--dry-run", { shell })).code).toBe(1);
 
-  // In a new terminal: the second block is filled into this .env, BETTER_AUTH_SECRET included,
-  // and the provider's callback is allowlisted with no "add it yourself" warning. The
-  // provider the old clone made names the old client, so it is taken away first, as a
-  // human would delete it in the dashboard (the next test is what happens if not).
+  // In a new terminal: the second block is filled into this .env, fresh, and the
+  // provider's callback written for okta-setup to allowlist.
   arcade.providers.clear();
   arcade.plugins.clear();
   const clean = await setupArcade(dir);
   expect(clean.code, `${clean.stdout}\n${clean.stderr}`).toBe(0);
   const env = envOf(dir);
-  expect(env.BETTER_AUTH_SECRET).toMatch(/^[0-9a-f]{64}$/);
-  expect(env.BETTER_AUTH_SECRET).not.toBe(exported.BETTER_AUTH_SECRET);
-  expect(env.IDP_OAUTH_REDIRECT_URIS_ARCADE).toBe(CALLBACK);
-  expect(clean.stdout).not.toContain("add it to IDP_OAUTH_REDIRECT_URIS_ARCADE yourself");
-  expect(clean.stdout).toContain("allowlisted the provider's callback on the arcade client");
-  expect((arcade.providers.get("app-identity") as Json).oauth2.client_id).toBe(clientsIn(dir).arcade!.clientId);
+  expect(env.SESSION_SECRET).toMatch(/^[0-9a-f]{64}$/);
+  expect(env.SESSION_SECRET).not.toBe(exported.SESSION_SECRET);
+  expect(env.ARCADE_PROVIDER_CALLBACK).toBe(CALLBACK);
+  expect(clean.stdout).toContain(`wrote the provider's callback to .env: ${CALLBACK}`);
+  expect((arcade.providers.get("app-identity") as Json).oauth2.client_id).toBe(CLIENT_ID);
 }, 120_000);
 
-test("in a new terminal, a provider the old clone created is reported, and never edited", async () => {
+test("in a new clone on the same Okta app, the provider the old clone created matches, and its callback is written", async () => {
   expect((await setupArcade(project("old-clone-2"))).code).toBe(0);
-  const run = await setupArcade(project("fresh-clone-2"));
+  const dir = project("fresh-clone-2");
+  const run = await setupArcade(dir);
+  expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(0);
+  expect(run.stdout).toContain("the provider app-identity is already registered and matches");
+  expect(envOf(dir).ARCADE_PROVIDER_CALLBACK).toBe(CALLBACK);
+}, 60_000);
+
+test("in a new clone on another Okta app, the provider the old clone created is reported, and never edited", async () => {
+  expect((await setupArcade(project("old-clone-3"))).code).toBe(0);
+  const run = await setupArcade(project("fresh-clone-3", (env) => env.replace(`IDP_CLIENT_ID=${CLIENT_ID}`, "IDP_CLIENT_ID=0oaAnotherOktaApp")));
   expect(run.code).toBe(1);
   expect(run.stdout).toContain("The provider app-identity already exists in this Arcade project, and it is not what this app needs:");
-  expect(run.stdout).toContain("oauth2.client_id: Arcade has");
+  expect(run.stdout).toContain(`oauth2.client_id: Arcade has "${CLIENT_ID}"`);
   expect(run.stderr).toContain("never edits an existing provider");
 }, 60_000);
 
@@ -2044,10 +2025,10 @@ test("arcade deploy is given no stdin, so its logs prompt never waits for a key"
  * … yourself"), and hop 2's Authorize failed with invalid_redirect. The live
  * provider is the source of truth for this one variable.
  */
-test("a provider recreated with a new callback: the rerun replaces it in .env and on the allowlist, with no hand edit", async () => {
+test("a provider recreated with a new callback: the rerun replaces it in .env, and says to run okta-setup again", async () => {
   const dir = project("callback-replaced");
   expect((await setupArcade(dir)).code).toBe(0);
-  expect(envOf(dir).IDP_OAUTH_REDIRECT_URIS_ARCADE).toBe(CALLBACK);
+  expect(envOf(dir).ARCADE_PROVIDER_CALLBACK).toBe(CALLBACK);
 
   // Deleted and created again: a new provider, a new callback.
   const recreated = "https://cloud.arcade.dev/api/v1/oauth/stand_in_ap_2/callback";
@@ -2058,19 +2039,17 @@ test("a provider recreated with a new callback: the rerun replaces it in .env an
   console.log(`--- setup-arcade ${HOST}, after the provider was recreated ---\n${rerun.stdout}${rerun.stderr}`);
   expect(rerun.code, `${rerun.stdout}\n${rerun.stderr}`).toBe(0);
 
-  expect(rerun.stdout).toContain(`replaced the provider's callback: ${CALLBACK} -> ${recreated}`);
-  expect(rerun.stdout).not.toContain("yourself");
-  expect(envOf(dir).IDP_OAUTH_REDIRECT_URIS_ARCADE).toBe(recreated);
-  // Exactly the new one: the old provider's callback no longer passes.
-  expect(clientsIn(dir).arcade!.redirectUris).toEqual([recreated]);
+  expect(rerun.stdout).toContain(`replaced the provider's callback in .env: ${CALLBACK} -> ${recreated}`);
+  expect(envOf(dir).ARCADE_PROVIDER_CALLBACK).toBe(recreated);
+  // okta-setup is what puts it on the Okta app's allowlist, so the steps start there.
+  expect(thenList(rerun.stdout).split("\n")[1]).toContain("op run -- bun run okta-setup");
   // Every other value on file is kept, as ever.
-  for (const [key, value] of Object.entries(envBefore)) if (key !== "IDP_OAUTH_REDIRECT_URIS_ARCADE") expect(envOf(dir)[key], key).toBe(value);
+  for (const [key, value] of Object.entries(envBefore)) if (key !== "ARCADE_PROVIDER_CALLBACK") expect(envOf(dir)[key], key).toBe(value);
 
   // And a third run has nothing to replace.
   const again = await setupArcade(dir);
   expect(again.code).toBe(0);
-  expect(again.stdout).not.toContain("replaced the provider's callback");
-  expect(again.stdout).not.toContain("allowlisted the provider's callback");
+  expect(again.stdout).not.toContain("provider's callback");
 }, 90_000);
 
 // --- A rerun does not redeploy what Arcade already runs (#30, run 4) ----------
@@ -2131,8 +2110,6 @@ test("a worker lookup that fails for another reason stops the run with Arcade's 
 // --- One click, through the Coordinator API (#52) -----------------------------
 
 const SIX_TOOLS = ["LoanDesk.SearchLoans", "LoanDesk.GetLoan", "LoanDesk.ApproveLoan", "LoanDesk.DenyLoan", "LoanDesk.RequestApproval", "LoanDesk.Decide", "Gmail.SendEmail", "Gmail.ListEmails", "Slack.SendMessage"];
-/** Enter, once, at the pause: what a developer does after restarting `bun run dev`. */
-const ENTER: RunOptions = { tty: true, input: "\n" };
 
 /** Everything the stand-ins hold, secrets included: what "the rerun changed nothing" is checked against. */
 function arcadeState(): string {
@@ -2166,7 +2143,7 @@ test("one run, one click: the User Source is created through the Coordinator, th
   arcade.coordinatorMode = "available";
   // The worst case of #48's finding, assumed of the API: active hooks hide the tools from a gateway create.
   expect(arcade.activeHooksHideTools).toBe(true);
-  const run = await setupArcade(dir, ENTER);
+  const run = await setupArcade(dir);
   console.log(`--- setup-arcade ${HOST}, one click ---\n${run.stdout}${run.stderr}`);
   expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(0);
 
@@ -2176,31 +2153,27 @@ test("one run, one click: the User Source is created through the Coordinator, th
   expect(coordinatorSequence()).toEqual(ONE_CLICK_COORDINATOR);
   for (const request of arcade.coordinatorRequests) expect(request.authorization).toBe(`Bearer ${KEY}`);
 
-  // The User Source: the dashboard form's fields, the app's own client, the issuer as its discovery names it.
-  const clients = clientsIn(dir);
+  // The User Source: the dashboard form's fields, the Okta app's client, IDP_ISSUER.
   expect(arcade.userSources.size).toBe(1);
   const [source] = [...arcade.userSources.values()] as [Json];
   expect(source.id).toMatch(/^us_[0-9A-Za-z]{27}$/);
   const [checked, create] = arcade.coordinatorRequests.filter((each) => each.method === "POST");
-  expect(checked!.body).toEqual({ issuer: ORIGIN });
+  expect(checked!.body).toEqual({ issuer: arcade.issuer });
   expect(create!.body).toEqual({
     name: "Loans Approval Limits",
-    description: "The app's own sign-in (hop 1)",
+    description: "The app's sign-in, through its identity provider (hop 1)",
     protocol: "oidc",
-    issuer: ORIGIN,
-    client_id: clients["arcade-user-source"]!.clientId,
-    client_secret: source.client_secret,
+    issuer: arcade.issuer,
+    client_id: CLIENT_ID,
+    client_secret: CLIENT_SECRET,
     subject_claim: "email",
     scopes: ["openid", "profile", "email"],
     status: "active",
   });
-  expect(source.client_secret).toMatch(/^\S{16,}$/);
-  // The callback is Arcade's, the same for every User Source: the client allowlists it, and nothing sends or compares it.
-  expect(clients["arcade-user-source"]!.redirectUris).toEqual(["https://cloud.arcade.dev/oauth2/intermediate_callback"]);
+  // The callback is Arcade's, the same for every User Source: okta-setup allowlists it, and nothing sends or compares it.
   expect(JSON.stringify(arcade.coordinatorRequests)).not.toContain("intermediate_callback");
   expect(run.stdout).not.toContain("can't be checked");
   expect(run.stdout).toContain("user source: binding_type project, protocol oidc (reported, not checked)");
-  expect(`${run.stdout}${run.stderr}`).not.toContain(source.client_secret);
 
   // The gateway: through that User Source, never Headers, exactly the six tools.
   const created = arcade.requests.find((each) => each.method === "POST" && each.path === `${SCOPED}/gateways`)!.body as Json;
@@ -2215,11 +2188,11 @@ test("one run, one click: the User Source is created through the Coordinator, th
   expect(arcade.gateways.size).toBe(1);
   hooksAreRegistered(dir, "active");
 
-  // The order, across both APIs: the app's discovery, then Arcade's issuer check, then the User Source and its
-  // read-back, then the gateway, then the hooks on, last.
+  // The order, across both APIs: the issuer's discovery, then the hooks created, then Arcade's issuer check, then
+  // the User Source and its read-back, then the gateway, then the hooks on, last.
   const order = [
+    whenExactly("idp GET /oauth2/default/.well-known/openid-configuration"),
     when("arcade POST /v1/orgs/org_standin/projects/prj_standin/plugins"),
-    when("tunnel GET /.well-known/openid-configuration"),
     when(`coordinator POST ${USER_SOURCES}/test_issuer`),
     whenExactly(`coordinator POST ${USER_SOURCES}`),
     when(`coordinator GET ${USER_SOURCES}/us_`),
@@ -2229,47 +2202,43 @@ test("one run, one click: the User Source is created through the Coordinator, th
   expect([...order].sort((a, b) => a - b)).toEqual(order);
   expect(arcade.timeline.at(-1)).toStartWith(`arcade GET ${SCOPED}/hooks?plugin_id=`);
 
-  // What it said: the pause, each step read back, and nothing left for the dashboard.
-  expect(run.stdout).toContain(
-    "  Now start the app and the tunnel, in two other terminals: bun run dev, and ngrok http --url=template-test.ngrok.app 3000.\n" +
-      "  (Or both in one: bun run up.)\n" +
-      "  Press Enter when both are running (n, or Ctrl-C, ends on the dashboard forms instead): ",
-  );
-  expect(run.stdout).toContain(`the app answers for ${ORIGIN} through the tunnel, and Arcade can use it`);
-  expect(run.stdout).toContain(`user source: created Loans Approval Limits (${source.id}), issuer ${ORIGIN}, client ${source.client_id}, status active (read back)`);
+  // What it said: no pause, each step read back, and nothing left for the dashboard.
+  expect(run.stdout).not.toContain("Press Enter");
+  expect(run.stdout).toContain(`user source: created Loans Approval Limits (${source.id}), issuer ${arcade.issuer}, client ${CLIENT_ID}, status active (read back)`);
   expect(run.stdout).toContain(`gateway: created loan-desk-template-test, through the User Source ${source.id}, with the six LoanDesk tools and Gmail and Slack (read back)`);
   expect(run.stdout).toContain(`hooks: ${ORIGIN}/hooks/access, /hooks/pre and /hooks/post, fail closed, status active (read back)`);
   expect(run.stdout).toContain("hooks: on. Arcade now calls /hooks/access, /hooks/pre and /hooks/post for every tool call through loan-desk-template-test");
   expect(formOrder(run.stdout)).toEqual([]);
   expect(run.stdout).not.toMatch(/ungoverned|dashboard flow/);
-  // The app and the tunnel answered at the wait, after .env was written: opening the app is all that is left.
-  expect(thenList(run.stdout).split("\n").slice(1)).toEqual([`  1. Open ${ORIGIN}, never localhost, and sign in.`]);
+  // Okta's allowlist for the new callback, the app and the tunnel, and the app itself are all that is left.
+  expect(thenList(run.stdout).split("\n").slice(1)).toEqual([
+    '  1. Allowlist the provider\'s callback on the Okta app: OKTA_API_TOKEN="op://<vault>/<item>/<field>" op run -- bun run okta-setup',
+    "  2. Start `bun run dev` (or restart it, if it is already running), so the app reads the new .env.",
+    `  3. Start the tunnel: ngrok http --url=${HOST} 3000`,
+    `  4. Open ${ORIGIN}, never localhost, and sign in.`,
+  ]);
   expect(`${run.stdout}${run.stderr}`).not.toContain(KEY);
   expect(JSON.stringify([...arcade.requests, ...arcade.coordinatorRequests])).not.toMatch(/arcade_header/i);
 }, 60_000);
 
-test("a rerun after one click is a no-op that says so: nothing paused, created, rotated or turned on", async () => {
+test("a rerun after one click is a no-op that says so: nothing created, rotated or turned on", async () => {
   const dir = project("one-click-rerun");
   arcade.coordinatorMode = "available";
-  expect((await setupArcade(dir, ENTER)).code).toBe(0);
+  expect((await setupArcade(dir)).code).toBe(0);
   const state = arcadeState();
   const envText = readFileSync(join(dir, ".env"), "utf8");
-  const rows = clientRows(dir);
   arcade.requests = [];
   arcade.coordinatorRequests = [];
-  arcade.tunnelRequests = 0;
 
-  // No input: a run that paused would read the end of stdin and fall back, which the checks below would catch.
-  const again = await setupArcade(dir, { tty: true, input: "" });
+  const again = await setupArcade(dir);
   console.log(`--- setup-arcade ${HOST}, one click, again ---\n${again.stdout}${again.stderr}`);
   expect(again.code, `${again.stdout}\n${again.stderr}`).toBe(0);
   const [source] = [...arcade.userSources.values()] as [Json];
-  expect(again.stdout).toContain(`user source: found Loans Approval Limits (${source.id}), issuer ${ORIGIN}, client ${source.client_id}; it matches and is left as it is`);
+  expect(again.stdout).toContain(`user source: found Loans Approval Limits (${source.id}), issuer ${arcade.issuer}, client ${CLIENT_ID}; it matches and is left as it is`);
   expect(again.stdout).toContain(`gateway: found loan-desk-template-test, through the User Source ${source.id}`);
   expect(again.stdout).toContain(`user source: ${source.id} is active (read back)`);
   expect(again.stdout).toContain("hooks: already on (status active); nothing to do");
-  expect(again.stdout).not.toMatch(/Press Enter|dashboard flow|created/);
-  expect(arcade.tunnelRequests).toBe(0);
+  expect(again.stdout).not.toMatch(/Press Enter|dashboard flow|created|okta-setup/);
   // The list, and the read-back by id the gateway needs: no issuer check, no create.
   expect(coordinatorSequence()).toEqual([LIST, READ_BY_ID]);
   expect(sequence(arcade.requests)).toEqual(RERUN);
@@ -2281,7 +2250,6 @@ test("a rerun after one click is a no-op that says so: nothing paused, created, 
   ]);
   expect(arcadeState()).toBe(state);
   expect(readFileSync(join(dir, ".env"), "utf8")).toBe(envText);
-  expect(clientRows(dir)).toBe(rows);
   expect(formOrder(again.stdout)).toEqual([]);
 }, 90_000);
 
@@ -2322,7 +2290,7 @@ function isTheFallback(dir: string, run: { code: number; stdout: string; stderr:
 test("any failure of the Coordinator call prints one line naming it and its status, then runs the #48 flow unchanged", async () => {
   // The baseline: the Coordinator answers 404, as the project key's `…/user_sources` did on api.arcade.dev (#7).
   const base = project("fallback-404");
-  const first = await setupArcade(base, ENTER);
+  const first = await setupArcade(base);
   console.log(`--- setup-arcade ${HOST}, the Coordinator answering 404 ---\n${first.stdout}${first.stderr}`);
   expect(fallbackLines(first.stdout)).toEqual([
     `  coordinator: GET ${arcade.coordinatorUrl}${USER_SOURCES}?limit=100&offset=0 answered 404${KEY_WRONG}. The rest is the dashboard flow (#48):`,
@@ -2393,7 +2361,7 @@ test("any failure of the Coordinator call prints one line naming it and its stat
     arcade.coordinatorMode = "available";
     trigger.arrange();
     const dir = project(`fallback-${trigger.name.replace(/\W+/g, "-")}`);
-    const run = await setupArcade(dir, { ...ENTER, ...trigger.options });
+    const run = await setupArcade(dir, { ...trigger.options });
     const lines = fallbackLines(run.stdout);
     expect(lines, `${trigger.name}:\n${run.stdout}\n${run.stderr}`).toHaveLength(1);
     expect(lines[0]!.replace(arcade.coordinatorUrl, "{coordinator}"), trigger.name).toStartWith(`  coordinator: ${trigger.line}`);
@@ -2427,7 +2395,6 @@ test("the Coordinator host is ARCADE_COORDINATOR_URL, default https://cloud.arca
   arcade.coordinatorMode = "available";
   const dir = project("coordinator-experience");
   const run = await setupArcade(dir, {
-    ...ENTER,
     shell: { ARCADE_COORDINATOR_URL: "https://experience.arcade.dev/api", HTTPS_PROXY: "http://127.0.0.1:9", https_proxy: "http://127.0.0.1:9", NO_PROXY: "127.0.0.1", no_proxy: "127.0.0.1" },
   });
   expect(run.stdout).toContain("  coordinator   none: ARCADE_COORDINATOR_URL=https://experience.arcade.dev/api is the dashboard's own proxy, which this command never calls");
@@ -2435,7 +2402,6 @@ test("the Coordinator host is ARCADE_COORDINATOR_URL, default https://cloud.arca
     "  coordinator: ARCADE_COORDINATOR_URL=https://experience.arcade.dev/api is the dashboard's own proxy, which this command never calls. The rest is the dashboard flow (#48):",
   ]);
   expect(arcade.coordinatorRequests).toEqual([]);
-  expect(arcade.tunnelRequests).toBe(0);
   isTheFallback(dir, run, null);
 
   // And nothing that ships names that host, but to refuse it.
@@ -2448,134 +2414,13 @@ test("the Coordinator host is ARCADE_COORDINATOR_URL, default https://cloud.arca
   expect(shipped).toEqual(['scripts/setup-arcade/coordinator.ts: const FORBIDDEN_HOST = "experience.arcade.dev";']);
 }, 90_000);
 
-test("with no User Source yet and stdin not a terminal, the run does not pause: it says so and falls back", async () => {
-  arcade.coordinatorMode = "available";
-  const dir = project("one-click-no-tty");
-  const run = await setupArcade(dir);
-  expect(run.stdout).toContain(`user source: there is none for ${ORIGIN} in this project yet.`);
-  expect(fallbackLines(run.stdout)).toEqual([
-    "  user source: not created, because stdin is not a terminal, so this run cannot wait for you to start `bun run dev` and the tunnel. The rest is the dashboard flow (#48):",
-  ]);
-  expect(run.stdout).not.toContain("Press Enter");
-  expect(arcade.tunnelRequests).toBe(0);
-  expect(coordinatorSequence()).toEqual([LIST]);
-  isTheFallback(dir, run, null);
-  // The form shows the secret minted by this run: nothing was rotated for a create that never came.
-  expect(run.stdout).toMatch(/Client Secret {3}\S{16,}$/m);
-}, 60_000);
-
-test("answering n at the pause falls back, sends nothing more, and a later run with Enter rotates only the User Source client and finishes", async () => {
-  arcade.coordinatorMode = "available";
-  const dir = project("one-click-no");
-  const no = await setupArcade(dir, { tty: true, input: "n\n" });
-  expect(no.stdout).toContain("Press Enter when both are running (n, or Ctrl-C, ends on the dashboard forms instead): ");
-  expect(fallbackLines(no.stdout)).toEqual(["  user source: not created, at your answer, so none of it is sent. The rest is the dashboard flow (#48):"]);
-  expect(arcade.tunnelRequests).toBe(0);
-  expect(coordinatorSequence()).toEqual([LIST]);
-  isTheFallback(dir, no, null);
-
-  // Later, with the app restarted: the client minted and shown on the first run is rotated for the create, and nothing else is.
-  const before = JSON.parse(clientRows(dir)) as Array<Record<string, unknown>>;
-  arcade.requests = [];
-  arcade.coordinatorRequests = [];
-  const yes = await setupArcade(dir, ENTER);
-  expect(yes.code, `${yes.stdout}\n${yes.stderr}`).toBe(0);
-  const after = JSON.parse(clientRows(dir)) as Array<Record<string, unknown>>;
-  const changed = after.filter((row, i) => JSON.stringify(row) !== JSON.stringify(before[i])).map((row) => row.id);
-  expect(changed).toEqual(["arcade-user-source"]);
-  expect(after.find((row) => row.id === "arcade-user-source")!.clientId).toBe(before.find((row) => row.id === "arcade-user-source")!.clientId);
-  expect(coordinatorSequence()).toEqual(ONE_CLICK_COORDINATOR);
-  expect(arcade.userSources.size).toBe(1);
-  hooksAreRegistered(dir, "active");
-  expect(arcade.gateways.size).toBe(1);
-}, 90_000);
-
-test("Ctrl-C at the pause falls back to the #48 forms, with the hooks disabled", async () => {
-  arcade.coordinatorMode = "available";
-  const dir = project("one-click-ctrl-c");
-  const child = spawnChild(["bun", "--no-env-file", SCRIPT, HOST], {
-    cwd: dir,
-    env: childEnv({
-      ARCADE_COORDINATOR_URL: arcade.coordinatorUrl,
-      CG_SETUP_ARCADE_ISSUER_URL: arcade.tunnelUrl,
-      CG_SETUP_ARCADE_TTY: "1",
-      ARCADE_API_URL: arcade.url,
-      HOME: projects.get(dir)!.home,
-      PATH: `${FAKE_BIN}:${process.env.PATH ?? ""}`,
-      FAKE_ARCADE_LOG: join(scratch, "one-click-ctrl-c.arcade.log"),
-    }),
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const stderr = new Response(child.stderr as ReadableStream).text();
-  let stdout = "";
-  const decoder = new TextDecoder();
-  const reader = (child.stdout as ReadableStream<Uint8Array>).getReader();
-  let interrupted = false;
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    stdout += decoder.decode(value, { stream: true });
-    if (!interrupted && stdout.includes("ends on the dashboard forms instead): ")) {
-      interrupted = true;
-      // The supervisor turns any signal into SIGTERM, so Ctrl-C goes to the script itself, as a terminal sends it.
-      const found = Bun.spawnSync(["pgrep", "-P", String(child.pid)]).stdout.toString().trim().split("\n").filter(Boolean);
-      expect(found).toHaveLength(1);
-      process.kill(Number(found[0]), "SIGINT");
-    }
-  }
-  const code = await child.exited;
-  const run = { code, stdout, stderr: await stderr };
-  expect(interrupted, run.stdout).toBe(true);
-  expect(fallbackLines(run.stdout)).toEqual(["  user source: not created, at your answer, so none of it is sent. The rest is the dashboard flow (#48):"]);
-  expect(arcade.tunnelRequests).toBe(0);
-  isTheFallback(dir, run, null);
-}, 60_000);
-
-test("Enter with the app not reachable through the tunnel says what failed and asks again, and never creates the User Source", async () => {
-  arcade.coordinatorMode = "available";
-  const cases: Array<{ name: string; tunnel: StandIn["tunnel"]; says: string }> = [
-    { name: "tunnel-down", tunnel: { status: 502 }, says: `GET ${"{tunnel}"}/.well-known/openid-configuration answered 502` },
-    {
-      name: "a scope not published",
-      tunnel: { status: 200, issuer: ORIGIN, scopes: ["openid", "email"], signingKeys: 1 },
-      says: "does not publish the scope profile in scopes_supported, which the User Source asks for: is an older app still running?",
-    },
-    {
-      name: "app-not-restarted",
-      tunnel: { status: 200, issuer: "http://localhost:4400" },
-      says: `GET {tunnel}/.well-known/openid-configuration names the issuer "http://localhost:4400", not ${ORIGIN}: stop \`bun run dev\` and start it again, so it reads APP_PUBLIC_HOST from .env`,
-    },
-    { name: "sign-in-down", tunnel: { status: 503 }, says: "answered 503: the app's sign-in did not start (start `bun run dev` again, so it reads the new .env)" },
-  ];
-  for (const { name, tunnel, says } of cases) {
-    arcade.stop();
-    arcade = new StandIn();
-    arcade.coordinatorMode = "available";
-    arcade.tunnel = tunnel;
-    const dir = project(`one-click-${name}`);
-    // Enter twice, each checked and each failing, then stdin ends: the third question reads the end, and the run falls back.
-    const run = await setupArcade(dir, { tty: true, input: "\n\n" });
-    const printed = run.stdout.replaceAll(arcade.tunnelUrl, "{tunnel}");
-    expect(printed.split(says).length - 1, `${name}:\n${run.stdout}`).toBe(2);
-    expect(run.stdout.match(/Press Enter when both are running/g), name).toHaveLength(2);
-    expect(arcade.tunnelRequests, name).toBe(2);
-    expect(fallbackLines(run.stdout), name).toEqual(["  user source: not created, at your answer, so none of it is sent. The rest is the dashboard flow (#48):"]);
-    expect(coordinatorSequence(), name).toEqual([LIST]);
-    isTheFallback(dir, run, null);
-  }
-}, 120_000);
-
 test("a User Source that claims this app and differs is reported, field by field, and never reused, edited or duplicated", async () => {
-  // A project whose clients exist, so a User Source can name the app's own client.
+  // A fresh project: a User Source can name the Okta app's client before the first run.
   const setUp = async (name: string) => {
     arcade.stop();
     arcade = new StandIn();
     arcade.coordinatorMode = "available";
-    const dir = project(name);
-    expect((await setupArcade(dir, { tty: true, input: "n\n" })).code).toBe(0);
-    return { dir, clientId: clientsIn(dir)["arcade-user-source"]!.clientId };
+    return { dir: project(name), clientId: CLIENT_ID };
   };
   const seed = (fields: Json) => {
     const source = userSourceRecord({ id: sourceId(`seeded${arcade.userSources.size + 1}`), ...fields });
@@ -2587,12 +2432,12 @@ test("a User Source that claims this app and differs is reported, field by field
     {
       name: "another issuer",
       seed: (clientId) => [seed({ client_id: clientId, issuer: "https://old-host.ngrok.app" })],
-      lines: [`  - issuer: Arcade has "https://old-host.ngrok.app", this app needs "${ORIGIN}"`],
+      lines: ['  - issuer: Arcade has "https://old-host.ngrok.app", this app needs "{issuer}"'],
     },
     {
       name: "an issuer with a trailing slash",
-      seed: (clientId) => [seed({ client_id: clientId, issuer: `${ORIGIN}/` })],
-      lines: [`  - issuer: Arcade has "${ORIGIN}/", this app needs "${ORIGIN}"`],
+      seed: (clientId) => [seed({ client_id: clientId, issuer: `${arcade.issuer}/` })],
+      lines: ['  - issuer: Arcade has "{issuer}/", this app needs "{issuer}"'],
     },
     { name: "the sub claim", seed: (clientId) => [seed({ client_id: clientId, subject_claim: "sub" })], lines: ['  - subject_claim: Arcade has "sub", this app needs "email"'] },
     {
@@ -2608,16 +2453,15 @@ test("a User Source that claims this app and differs is reported, field by field
     const seeded = JSON.stringify(each.seed(clientId));
     arcade.requests = [];
     arcade.coordinatorRequests = [];
-    const run = await setupArcade(dir, ENTER);
+    const run = await setupArcade(dir);
     if (each.name === "another client") console.log(`--- setup-arcade ${HOST}, a User Source that differs ---\n${run.stdout}${run.stderr}`);
     expect(run.code, `${each.name}: ${run.stdout}\n${run.stderr}`).toBe(1);
-    for (const line of each.lines) expect(run.stderr, each.name).toContain(line.replace("{client}", clientId));
+    for (const line of each.lines) expect(run.stderr, each.name).toContain(line.replace("{client}", clientId).replaceAll("{issuer}", arcade.issuer));
     expect(run.stderr).toContain("this command will not pick one or reuse one that differs");
     expect(run.stderr).toContain("No gateway was created, and the hooks are left disabled. In the dashboard (your project → User Sources), correct it or delete it, then run this again.");
     // A read, and nothing after it: no create, no edit, no pause, no gateway, no forms.
     expect(coordinatorSequence(), each.name).toEqual([LIST]);
     expect(JSON.stringify([...arcade.userSources.values()])).toBe(seeded);
-    expect(arcade.tunnelRequests).toBe(0);
     expect(arcade.requests.filter((each) => each.path.includes("/gateways") && each.method !== "GET")).toEqual([]);
     expect(arcade.gateways.size).toBe(0);
     hooksAreRegistered(dir, "inactive");
@@ -2629,7 +2473,7 @@ test("the User Source created and the gateway not: it says so and what is left, 
   arcade.coordinatorMode = "available";
   const dir = project("one-click-gateway-fails");
   arcade.nextGatewayCreate = { status: 500, body: { name: "internal", message: "the gateway service is having a moment" } };
-  const run = await setupArcade(dir, ENTER);
+  const run = await setupArcade(dir);
   console.log(`--- setup-arcade ${HOST}, the gateway refused after the User Source ---\n${run.stdout}${run.stderr}`);
   expect(run.code).toBe(1);
   const [source] = [...arcade.userSources.values()] as [Json];
@@ -2646,7 +2490,7 @@ test("the User Source created and the gateway not: it says so and what is left, 
 
   // The rerun: the User Source is found, the gateway made through it, the hooks turned on.
   arcade.coordinatorRequests = [];
-  const again = await setupArcade(dir, { tty: true, input: "" });
+  const again = await setupArcade(dir);
   expect(again.code, `${again.stdout}\n${again.stderr}`).toBe(0);
   expect(coordinatorSequence()).toEqual([LIST, READ_BY_ID]);
   expect(arcade.userSources.size).toBe(1);
@@ -2674,7 +2518,7 @@ test("the other ways the gateway is not made after the User Source are each repo
     arcade.coordinatorMode = "available";
     each.arrange();
     const dir = project(`one-click-partial-${each.name.replace(/\W+/g, "-")}`);
-    const run = await setupArcade(dir, ENTER);
+    const run = await setupArcade(dir);
     expect(run.code, `${each.name}: ${run.stdout}\n${run.stderr}`).toBe(1);
     expect(run.stderr.replaceAll(arcade.coordinatorUrl, "{coordinator}"), each.name).toContain(each.says);
     if (each.name === "not read back") expect(run.stderr).toMatch(/\/user_sources\/us_StandIn\d{20} answered 404, no User Source with that id: Not Found\n/);
@@ -2695,7 +2539,7 @@ test("the order does not depend on active hooks hiding tools: a fresh run passes
   arcade.coordinatorMode = "available";
 
   // Under the worst case, the create after the hooks is refused, and the run says what is left.
-  const refused = await setupArcade(dir, ENTER);
+  const refused = await setupArcade(dir);
   expect(refused.code).toBe(1);
   expect(refused.stderr).toContain("Arcade says: tool LoanDesk.SearchLoans not found");
   expect(refused.stdout).toContain("and the gateway is not, so the hooks\nare left on.");
@@ -2703,7 +2547,7 @@ test("the order does not depend on active hooks hiding tools: a fresh run passes
 
   // Where the API does not filter, which is what the issue records of it, the same state finishes.
   arcade.activeHooksHideTools = false;
-  const passed = await setupArcade(dir, { tty: true, input: "" });
+  const passed = await setupArcade(dir);
   expect(passed.code, `${passed.stdout}\n${passed.stderr}`).toBe(0);
   expect(passed.stdout).toContain("gateway: created loan-desk-template-test");
   expect(passed.stdout).toContain("hooks: already on (status active); nothing to do");
@@ -2714,7 +2558,7 @@ test("a gateway under the slug that authenticates through another User Source is
   arcade.coordinatorMode = "available";
   const dir = project("one-click-other-user-source");
   dashboardGateway({ user_source_id: "us_somebody_else" });
-  const run = await setupArcade(dir, ENTER);
+  const run = await setupArcade(dir);
   expect(run.code).toBe(1);
   expect(run.stderr).toMatch(/the gateway loan-desk-template-test does not authenticate through this app's User Source:\n {2}- user_source_id: Arcade has "us_somebody_else", this app needs "us_StandIn\d{20}"/);
   expect(run.stderr).toContain("The hooks are left disabled.");
@@ -2723,12 +2567,11 @@ test("a gateway under the slug that authenticates through another User Source is
 }, 60_000);
 
 test("the list is read page by page until total_count, and a match on page two is found, whatever order its scopes are in", async () => {
-  // A project whose clients exist, and a User Source for this app made before, behind 150 others.
+  // A User Source for this app made before, behind 150 others.
   arcade.coordinatorMode = "available";
   const dir = project("user-source-paged");
-  expect((await setupArcade(dir, { tty: true, input: "n\n" })).code).toBe(0);
   // The list is newest first, so the one made first comes last.
-  const ours = userSourceRecord({ id: sourceId("ours"), client_id: clientsIn(dir)["arcade-user-source"]!.clientId, scopes: ["email", "openid", "profile"] });
+  const ours = userSourceRecord({ id: sourceId("ours"), client_id: CLIENT_ID, scopes: ["email", "openid", "profile"] });
   arcade.userSources.set(ours.id, ours);
   for (let i = 1; i <= 150; i += 1) {
     const other = userSourceRecord({ id: sourceId(`other${String(i).padStart(3, "0")}`), name: `Other ${i}`, issuer: `https://other-${i}.example`, client_id: `other-client-${i}` });
@@ -2736,55 +2579,56 @@ test("the list is read page by page until total_count, and a match on page two i
   }
   arcade.coordinatorRequests = [];
 
-  const run = await setupArcade(dir, { tty: true, input: "" });
+  const run = await setupArcade(dir);
   expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(0);
   expect(coordinatorSequence()).toEqual([LIST, `GET ${USER_SOURCES}?limit=100&offset=100`, READ_BY_ID]);
-  expect(run.stdout).toContain(`user source: found Loans Approval Limits (${ours.id}), issuer ${ORIGIN}`);
+  expect(run.stdout).toContain(`user source: found Loans Approval Limits (${ours.id}), issuer ${arcade.issuer}`);
   expect(arcade.userSources.size).toBe(151);
   expect((arcade.requests.find((each) => each.method === "POST" && each.path === `${SCOPED}/gateways`)!.body as Json).user_source_id).toBe(ours.id);
   hooksAreRegistered(dir, "active");
 }, 90_000);
 
-test("Arcade's issuer check: a 422 prints its reason and asks again, and the Enter it passes on creates the User Source", async () => {
-  arcade.coordinatorMode = "available";
-  const dir = project("one-click-issuer-422");
-  const reason = `Could not reach \`${ORIGIN}/.well-known/openid-configuration\` at this time. Try again.`;
-  arcade.nextCoordinator.test_issuer = { status: 422, body: { code: 422, msg: reason, data: null } };
-  const run = await setupArcade(dir, { tty: true, input: "\n\n" });
-  console.log(`--- setup-arcade ${HOST}, the issuer check refused once ---\n${run.stdout}${run.stderr}`);
-  expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(0);
-  expect(run.stdout).toContain(`  Arcade cannot use the issuer ${ORIGIN} yet: ${reason}\n`);
-  expect(run.stdout.match(/Press Enter when both are running/g)).toHaveLength(2);
-  // Not a fallback: the check again, then the create.
-  expect(fallbackLines(run.stdout)).toEqual([]);
-  expect(coordinatorSequence()).toEqual([LIST, TEST_ISSUER, TEST_ISSUER, `POST ${USER_SOURCES}`, READ_BY_ID]);
-  expect(arcade.userSources.size).toBe(1);
-  hooksAreRegistered(dir, "active");
-}, 60_000);
-
-test("an issuer Arcade keeps refusing is never created: each Enter prints the reason, and the end of stdin falls back", async () => {
-  arcade.coordinatorMode = "available";
-  const dir = project("one-click-issuer-no-key");
-  // The app answers the run, and its key set has no signing key: only Arcade's check sees that.
-  arcade.tunnel = { status: 200, issuer: ORIGIN, scopes: [...APP_SCOPES], signingKeys: 0 };
-  const run = await setupArcade(dir, { tty: true, input: "\n\n" });
-  expect(run.stdout.split(`Arcade cannot use the issuer ${ORIGIN} yet: The JWKS at \`${ORIGIN}/api/auth/jwks\` has no signing key.`).length - 1).toBe(2);
-  expect(coordinatorSequence()).toEqual([LIST, TEST_ISSUER, TEST_ISSUER]);
-  expect(fallbackLines(run.stdout)).toEqual(["  user source: not created, at your answer, so none of it is sent. The rest is the dashboard flow (#48):"]);
-  isTheFallback(dir, run, null);
-  expect(arcade.userSources.size).toBe(0);
-}, 60_000);
+test("Arcade's issuer check: a 422 creates nothing and falls back to the dashboard forms, with Arcade's reason", async () => {
+  const cases: Array<{ name: string; arrange: () => string }> = [
+    {
+      name: "refused",
+      arrange: () => {
+        const reason = `Could not reach \`${arcade.issuer}/.well-known/openid-configuration\` at this time. Try again.`;
+        arcade.nextCoordinator.test_issuer = { status: 422, body: { code: 422, msg: reason, data: null } };
+        return reason;
+      },
+    },
+    {
+      // Discovery answers the run, and the key set has no signing key: only Arcade's check sees that.
+      name: "no signing key",
+      arrange: () => {
+        arcade.idp = { status: 200, scopes: [...IDP_SCOPES], signingKeys: 0 };
+        return `The JWKS at \`${arcade.issuer}/v1/keys\` has no signing key.`;
+      },
+    },
+  ];
+  for (const each of cases) {
+    arcade.stop();
+    arcade = new StandIn();
+    arcade.coordinatorMode = "available";
+    const reason = each.arrange();
+    const dir = project(`one-click-issuer-${each.name.replace(/\W+/g, "-")}`);
+    const run = await setupArcade(dir);
+    if (each.name === "refused") console.log(`--- setup-arcade ${HOST}, the issuer check refused ---\n${run.stdout}${run.stderr}`);
+    expect(run.code, `${each.name}: ${run.stdout}\n${run.stderr}`).toBe(0);
+    expect(fallbackLines(run.stdout), each.name).toEqual([`  user source: Arcade cannot use the issuer ${arcade.issuer}: ${reason}. The rest is the dashboard flow (#48):`]);
+    expect(coordinatorSequence(), each.name).toEqual([LIST, TEST_ISSUER]);
+    expect(arcade.userSources.size).toBe(0);
+    isTheFallback(dir, run, null);
+  }
+}, 90_000);
 
 test("the User Source is read back by id before the gateway: inactive, not the id asked for, or not of the us_ shape stops the run", async () => {
   const setUp = async (name: string) => {
     arcade.stop();
     arcade = new StandIn();
     arcade.coordinatorMode = "available";
-    const dir = project(name);
-    expect((await setupArcade(dir, { tty: true, input: "n\n" })).code).toBe(0);
-    arcade.requests = [];
-    arcade.coordinatorRequests = [];
-    return { dir, clientId: clientsIn(dir)["arcade-user-source"]!.clientId };
+    return { dir: project(name), clientId: CLIENT_ID };
   };
   const stopped = (dir: string, run: { code: number; stdout: string; stderr: string }, lines: string[], name: string) => {
     expect(run.code, `${name}: ${run.stdout}\n${run.stderr}`).toBe(1);
@@ -2801,7 +2645,7 @@ test("the User Source is read back by id before the gateway: inactive, not the i
     const { dir, clientId } = await setUp("read-back-inactive");
     const source = userSourceRecord({ id: sourceId("inactive"), client_id: clientId, status: "inactive" });
     arcade.userSources.set(source.id, source);
-    const run = await setupArcade(dir, ENTER);
+    const run = await setupArcade(dir);
     stopped(dir, run, [`the User Source ${source.id} is not one a gateway can use: Arcade reads back`, '  - status: Arcade has "inactive", this app needs "active"'], "inactive");
     expect(coordinatorSequence()).toEqual([LIST, READ_BY_ID]);
     expect(arcade.userSources.get(source.id)).toEqual(source);
@@ -2811,7 +2655,7 @@ test("the User Source is read back by id before the gateway: inactive, not the i
     const { dir, clientId } = await setUp("read-back-bad-id");
     const source = userSourceRecord({ id: "us_short", client_id: clientId });
     arcade.userSources.set(source.id, source);
-    const run = await setupArcade(dir, ENTER);
+    const run = await setupArcade(dir);
     stopped(dir, run, ['  - id: "us_short" is not a User Source id (us_ and 27 base62 characters)'], "bad id");
   }
   // Created, and read back as another one: it did not take.
@@ -2821,7 +2665,7 @@ test("the User Source is read back by id before the gateway: inactive, not the i
       status: 200,
       body: { code: 200, msg: "Request successful", data: userSourceRecord({ id: sourceId("impostor"), client_id: "somebody-elses-client", status: "inactive" }) },
     };
-    const run = await setupArcade(dir, ENTER);
+    const run = await setupArcade(dir);
     const [created] = [...arcade.userSources.values()] as [Json];
     stopped(
       dir,
@@ -2841,13 +2685,10 @@ test("the User Source is read back by id before the gateway: inactive, not the i
 test("a found User Source whose read by id fails falls back to the #48 flow, and one that is gone is not guessed at", async () => {
   arcade.coordinatorMode = "available";
   const dir = project("read-back-fails");
-  expect((await setupArcade(dir, { tty: true, input: "n\n" })).code).toBe(0);
-  const source = userSourceRecord({ id: sourceId("found"), client_id: clientsIn(dir)["arcade-user-source"]!.clientId });
+  const source = userSourceRecord({ id: sourceId("found"), client_id: CLIENT_ID });
   arcade.userSources.set(source.id, source);
-  arcade.requests = [];
-  arcade.coordinatorRequests = [];
   arcade.nextCoordinator.get = { status: 500, body: { code: 500, msg: "internal", data: null } };
-  const run = await setupArcade(dir, ENTER);
+  const run = await setupArcade(dir);
   expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(0);
   expect(fallbackLines(run.stdout)).toEqual([
     `  coordinator: GET ${arcade.coordinatorUrl}${USER_SOURCES}/${source.id} answered 500: internal. The rest is the dashboard flow (#48):`,
@@ -2870,16 +2711,16 @@ test("the stand-in's Coordinator is the contract: code 200 inside a 201, the 422
     // `null` for a body-less 204, typed as a body so each assertion can read into it.
     return { status: response.status, json: (text ? JSON.parse(text) : null) as Json };
   };
-  const body = { name: "Loans Approval Limits", issuer: ORIGIN, client_id: "cid", client_secret: "shh", subject_claim: "email" };
+  const body = { name: "Loans Approval Limits", issuer: arcade.issuer, client_id: "cid", client_secret: "shh", subject_claim: "email" };
 
-  const checked = await call("POST", `${base}/test_issuer`, { issuer: ORIGIN });
+  const checked = await call("POST", `${base}/test_issuer`, { issuer: arcade.issuer });
   expect(checked.status).toBe(204);
   expect(checked.json).toBeNull();
   const one = await call("POST", base, body);
   const two = await call("POST", base, body);
   for (const created of [one, two]) {
     expect(created.status).toBe(201);
-    expect(created.json).toMatchObject({ code: 200, msg: "Request successful", data: { issuer: ORIGIN, client_id: "cid", scopes: ["openid", "profile", "email"], status: "active" } });
+    expect(created.json).toMatchObject({ code: 200, msg: "Request successful", data: { issuer: arcade.issuer, client_id: "cid", scopes: ["openid", "profile", "email"], status: "active" } });
     expect(created.json.data.id).toMatch(/^us_[0-9A-Za-z]{27}$/);
     expect(created.json.data).not.toHaveProperty("client_secret");
   }
@@ -2894,14 +2735,14 @@ test("the stand-in's Coordinator is the contract: code 200 inside a 201, the 422
   // Refusals are the same envelope, with data null.
   expect(await call("POST", base, { ...body, client_secret: "" })).toEqual({ status: 422, json: { code: 422, msg: "Invalid request parameters: client_secret", data: null } });
   expect(await call("POST", base, { ...body, scopes: ["profile"] })).toEqual({ status: 422, json: { code: 422, msg: "Invalid request parameters: scopes", data: null } });
-  expect(await call("POST", base, { ...body, issuer: `${ORIGIN}/` })).toEqual({
+  expect(await call("POST", base, { ...body, issuer: `${arcade.issuer}/` })).toEqual({
     status: 422,
-    json: { code: 422, msg: `The issuer in \`${ORIGIN}/.well-known/openid-configuration\` is \`${ORIGIN}\`, not \`${ORIGIN}/\`.`, data: null },
+    json: { code: 422, msg: `The issuer in \`${arcade.issuer}/.well-known/openid-configuration\` is \`${arcade.issuer}\`, not \`${arcade.issuer}/\`.`, data: null },
   });
-  arcade.tunnel = { status: 502 };
-  expect(await call("POST", `${base}/test_issuer`, { issuer: ORIGIN })).toEqual({
+  arcade.idp = { status: 502 };
+  expect(await call("POST", `${base}/test_issuer`, { issuer: arcade.issuer })).toEqual({
     status: 422,
-    json: { code: 422, msg: `Could not reach \`${ORIGIN}/.well-known/openid-configuration\` at this time. Try again.`, data: null },
+    json: { code: 422, msg: `Could not reach \`${arcade.issuer}/.well-known/openid-configuration\` at this time. Try again.`, data: null },
   });
   expect((await call("GET", `${base}?limit=100&offset=0`, undefined, "arc_not_this_one")).status).toBe(401);
   expect((await call("GET", `${arcade.coordinatorUrl}/v1/orgs/${ORG}/projects/prj_other/user_sources`)).status).toBe(404);
@@ -2911,205 +2752,76 @@ test("the stand-in's Coordinator is the contract: code 200 inside a 201, the 422
 test("the Coordinator is only read and created on: no run, fresh, rerun or failed, sends it a PUT, a PATCH or a DELETE", async () => {
   arcade.coordinatorMode = "available";
   const dir = project("coordinator-methods");
-  expect((await setupArcade(dir, ENTER)).code).toBe(0);
-  expect((await setupArcade(dir, { tty: true, input: "" })).code).toBe(0);
+  expect((await setupArcade(dir)).code).toBe(0);
+  expect((await setupArcade(dir)).code).toBe(0);
   arcade.userSources.forEach((each) => (each.subject_claim = "sub"));
-  expect((await setupArcade(dir, ENTER)).code).toBe(1);
+  expect((await setupArcade(dir)).code).toBe(1);
   expect(arcade.coordinatorRequests.length).toBeGreaterThan(0);
   expect(arcade.coordinatorRequests.filter((each) => !["GET", "POST"].includes(each.method))).toEqual([]);
   // The only POSTs are the issuer check and the one create.
   expect(arcade.coordinatorRequests.filter((each) => each.method === "POST").map((each) => each.path.replace(/^\/api/, ""))).toEqual([`${USER_SOURCES}/test_issuer`, USER_SOURCES]);
 }, 90_000);
 
-// --- #54: the shell, a stale web client, and the identity module's advice -----
+// --- The identity provider: what `bun run okta-setup` wrote, and its discovery ---
 
-/**
- * The app's own sign-in, in this process, against the project's `.env` and
- * `idp.db` as `bun run dev` would open them: the real identity provider, and
- * the real `/api/auth/signin` and `/api/auth/callback` handlers, with a
- * password typed into the real login form. Only the network is left out: every
- * URL is the public host's, and each is answered by the module the app routes
- * it to. Lands on the gateway start when the sign-in worked, or wherever the
- * chain stopped when it did not.
- */
-class InProcessBrowser extends Browser {
-  readonly #provider: (request: Request) => Promise<Response>;
-  readonly #config: WebConfig;
-  constructor(provider: (request: Request) => Promise<Response>, config: WebConfig) {
-    super();
-    this.#provider = provider;
-    this.#config = config;
-  }
-  override async fetch(url: string, init: RequestInit = {}): Promise<Response> {
-    const headers = new Headers(init.headers);
-    if (this.cookies.size > 0) headers.set("cookie", [...this.cookies].map(([name, value]) => `${name}=${value}`).join("; "));
-    const request = new Request(url, { ...init, headers });
-    const { pathname } = new URL(url);
-    const response = isIdentityPath(pathname)
-      ? await this.#provider(request)
-      : pathname === "/api/auth/signin"
-        ? await signin(request, this.#config)
-        : pathname === "/api/auth/callback"
-          ? await signinCallback(request, this.#config)
-          : new Response(`not routed: ${pathname}`, { status: 404 });
-    this.visited.push(`${response.status} ${init.method ?? "GET"} ${url.split("?")[0]}`);
-    this.store(response);
-    return response;
-  }
-}
-
-async function signInAt(dir: string, email: string, password: string): Promise<{ signedIn: boolean; landed: string; html: string; visited: string[] }> {
-  const env = { ...envOf(dir), IDP_DB_PATH: join(dir, "idp.db"), NODE_ENV: "test" };
-  const provider = await openIdentityProvider(readIdpConfig(env));
-  linkIdentity({ fetch: provider.fetch, failure: () => null });
-  try {
-    const browser = new InProcessBrowser(provider.fetch, readWebConfig(env));
-    const end = await browser.follow(
-      `${ORIGIN}/api/auth/signin`,
-      (fields) => ({ ...fields, ...("email" in fields ? { email, password } : {}), ...("decision" in fields ? { decision: "allow" } : {}) }),
-      { stopAt: "/api/arcade/start" },
-    );
-    const signedIn = [...browser.cookies.keys()].some((name) => name.startsWith(SESSION_COOKIE)) && new URL(end.url).pathname === "/api/arcade/start";
-    return { signedIn, landed: new URL(end.url).pathname, html: end.html, visited: browser.visited };
-  } finally {
-    linkIdentity(undefined);
-    provider.close();
-  }
-}
-
-/** `bun run users …` in the project, reading its `.env` the way the command does from there. */
-async function usersIn(dir: string, ...args: string[]): Promise<{ code: number; out: string }> {
-  const child = spawnChild(["bun", join(ROOT, "scripts", "users.ts"), ...args], { cwd: dir, env: childEnv({}), stdout: "pipe", stderr: "pipe" });
-  const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
-  return { code, out: `${stdout}${stderr}` };
-}
-
-const PERSON = { email: "alice@bank.example", name: "Alice", role: "loan_officer", clearance: "50000", password: "setup-arcade-54-password" };
-const addPerson = (dir: string) =>
-  usersIn(dir, "add", PERSON.email, "--name", PERSON.name, "--role", PERSON.role, "--clearance", PERSON.clearance, "--password", PERSON.password);
-
-test("an IDP_CLIENT_ID idp.db does not hold is rewritten with its secret, so sign-in works, and a rerun leaves it alone (#54)", async () => {
-  const dir = project("stale-web-client");
-  expect((await setupArcade(dir)).code).toBe(0);
-  expect((await addPerson(dir)).code).toBe(0);
-  expect((await signInAt(dir, PERSON.email, PERSON.password)).signedIn).toBe(true);
-
-  // An older clone's sign-in client, copied into .env: the #52 live test's state.
-  const text = readFileSync(join(dir, ".env"), "utf8");
-  const stale = { id: "stale-web-client-from-an-older-clone", secret: "stale-web-secret-from-an-older-clone" };
-  writeFileSync(join(dir, ".env"), text.replace(/^IDP_CLIENT_ID=.*$/m, `IDP_CLIENT_ID=${stale.id}`).replace(/^IDP_CLIENT_SECRET=.*$/m, `IDP_CLIENT_SECRET=${stale.secret}`));
-  const refused = await signInAt(dir, PERSON.email, PERSON.password);
-  console.log(`--- sign-in with a stale IDP_CLIENT_ID ---\n${refused.visited.join("\n")}`);
-  expect(refused.signedIn).toBe(false);
-  expect(refused.landed).toBe("/error");
-  expect(refused.html).toContain("<code>invalid_client</code>: client_id is required");
-
-  arcade.requests = [];
+test("a blank IDP_ISSUER, IDP_CLIENT_ID or IDP_CLIENT_SECRET stops the run before anything is sent, naming okta-setup", async () => {
+  const dir = project("idp-blank", (env) => env.replace(/^IDP_CLIENT_ID=.*$/m, "IDP_CLIENT_ID=").replace(/^IDP_CLIENT_SECRET=.*$/m, "IDP_CLIENT_SECRET="));
+  const before = readFileSync(join(dir, ".env"), "utf8");
   const run = await setupArcade(dir);
-  console.log(`--- setup-arcade ${HOST}, with a stale IDP_CLIENT_ID in .env ---\n${run.stdout}${run.stderr}`);
-  expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(0);
-  const env = envOf(dir);
-  const web = clientsIn(dir).web!.clientId;
-  expect(env.IDP_CLIENT_ID).toBe(web);
-  expect(env.IDP_CLIENT_SECRET).not.toBe(stale.secret);
-  expect(env.IDP_CLIENT_SECRET!.length).toBeGreaterThan(20);
-  expect(run.stdout).toContain(`rewrote  IDP_CLIENT_ID, IDP_CLIENT_SECRET  (.env named a web client idp.db does not hold; now idp.db's ${web},`);
-  expect(`${run.stdout}${run.stderr}`, "the new secret was printed").not.toContain(env.IDP_CLIENT_SECRET!);
-  expect(run.stdout).not.toContain("sign-in will fail until they match");
-  // Only the web client: nothing Arcade holds was rotated or re-registered.
-  expect(sequence(arcade.requests)).toEqual(RERUN);
-  expect((await signInAt(dir, PERSON.email, PERSON.password)).signedIn).toBe(true);
+  expect(run.code).toBe(1);
+  expect(run.stderr).toContain("IDP_CLIENT_ID, IDP_CLIENT_SECRET are blank in .env. Run `bun run okta-setup` first");
+  expect(arcade.requests).toEqual([]);
+  expect(arcade.idpRequests).toBe(0);
+  expect(readFileSync(join(dir, ".env"), "utf8")).toBe(before);
+});
 
-  const after = readFileSync(join(dir, ".env"), "utf8");
-  const again = await setupArcade(dir);
-  expect(again.code).toBe(0);
-  expect(again.stdout).not.toContain("rewrote");
-  expect(readFileSync(join(dir, ".env"), "utf8")).toBe(after);
-}, 120_000);
-
-test("a dry run with an IDP_CLIENT_ID and no idp.db says the real run rewrites it", async () => {
-  const dir = project("stale-web-client-dry", (env) => env.replace(/^IDP_CLIENT_ID=$/m, "IDP_CLIENT_ID=stale").replace(/^IDP_CLIENT_SECRET=$/m, "IDP_CLIENT_SECRET=stale"));
+test("a dry run with the identity provider blank says a real run stops there, and still prints the requests", async () => {
+  const dir = project("idp-blank-dry", (env) => env.replace(/^IDP_ISSUER=.*$/m, "IDP_ISSUER="));
   const dry = await setupArcade(dir, "--dry-run");
   expect(dry.code).toBe(0);
-  expect(dry.stdout).toContain("and would rewrite IDP_CLIENT_ID and IDP_CLIENT_SECRET: with no idp.db, a real run mints a new web client");
+  expect(dry.stdout).toContain("IDP_ISSUER is blank: a real run stops here. Run `bun run okta-setup` first.");
+  expect(dry.stdout).toMatch(/^ {2}POST \S+\/v1\/admin\/auth_providers$/m);
+  expect(arcade.idpRequests).toBe(0);
+});
+
+test("the provider's endpoints are the ones IDP_ISSUER's discovery names, and its client is the Okta app's", async () => {
+  const dir = project("idp-endpoints");
+  const run = await setupArcade(dir);
+  expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(0);
+  const provider = arcade.requests.find((each) => each.method === "POST" && each.path === "/v1/admin/auth_providers")!.body as Json;
+  expect(provider.oauth2.client_id).toBe(CLIENT_ID);
+  expect(provider.oauth2.client_secret).toBe(CLIENT_SECRET);
+  expect(provider.oauth2.authorize_request.endpoint).toBe(`${arcade.issuer}/v1/authorize`);
+  expect(provider.oauth2.token_request.endpoint).toBe(`${arcade.issuer}/v1/token`);
+  expect(provider.oauth2.user_info_request.endpoint).toBe(`${arcade.issuer}/v1/userinfo`);
+  expect(arcade.timeline.filter((each) => each.startsWith("idp "))).toEqual(["idp GET /oauth2/default/.well-known/openid-configuration"]);
+  expect(run.stdout).toContain(`identity      ${arcade.issuer}, client ${CLIENT_ID}`);
+});
+
+test("an issuer whose discovery does not answer stops the run before anything is sent to Arcade or written", async () => {
+  const dir = project("idp-down");
+  const before = readFileSync(join(dir, ".env"), "utf8");
+  arcade.idp = { status: 503 };
+  const run = await setupArcade(dir);
+  expect(run.code).toBe(1);
+  expect(run.stderr).toContain(`reading ${arcade.issuer}/.well-known/openid-configuration failed`);
+  expect(run.stderr).toContain("Is IDP_ISSUER the issuer `bun run okta-setup` wrote?");
+  expect(arcade.requests).toEqual([]);
+  expect(readFileSync(join(dir, ".env"), "utf8")).toBe(before);
 });
 
 test("a shell that exports any IDP_* key .env does not hold stops the run too, managed or not, naming it and not its value (#54)", async () => {
   const dir = project("shell-idp-keys");
   const before = readFileSync(join(dir, ".env"), "utf8");
-  const shell = { IDP_DB_PATH: join(scratch, "an-older-clone", "idp.db"), IDP_SCOPES: "openid email planted-scope", IDP_CLIENT_ID: "planted-older-client" };
+  const shell = { IDP_SCOPES: "openid email planted-scope", IDP_CLIENT_ID: "planted-older-client", IDP_ISSUER: "https://planted.okta.example/oauth2/default" };
   const run = await setupArcade(dir, { shell });
   expect(run.code).toBe(1);
-  expect(run.stderr).toContain("IDP_CLIENT_ID, IDP_DB_PATH, IDP_SCOPES are exported in this shell with a value .env does not hold");
-  expect(run.stderr).toContain("unset IDP_CLIENT_ID IDP_DB_PATH IDP_SCOPES");
+  expect(run.stderr).toContain("IDP_ISSUER, IDP_CLIENT_ID, IDP_SCOPES are exported in this shell with a value .env does not hold");
+  expect(run.stderr).toContain("unset IDP_ISSUER IDP_CLIENT_ID IDP_SCOPES");
   for (const [key, value] of Object.entries(shell)) expect(`${run.stdout}${run.stderr}`, `the run printed ${key}'s value`).not.toContain(value);
   expect(arcade.requests).toEqual([]);
   expect(readFileSync(join(dir, ".env"), "utf8")).toBe(before);
-  expect(existsSync(join(dir, "idp.db"))).toBe(false);
 });
-
-/**
- * Criterion 5 of #54: the identity module's refusal, `identity_unavailable`
- * on every identity route, names steps that end in a working sign-in when
- * followed to the letter. The #52 live test's state: Arcade already holds the
- * provider, created with the arcade client of the `idp.db` about to be deleted.
- */
-test("the identity module's advice, followed to the letter, ends in a working sign-in", async () => {
-  const dir = project("advice");
-  expect((await setupArcade(dir)).code).toBe(0);
-  expect((await addPerson(dir)).code).toBe(0);
-  // The first sign-in signs an ID token, which mints idp.db's signing key.
-  expect((await signInAt(dir, PERSON.email, PERSON.password)).signedIn).toBe(true);
-
-  // The secret changes under it, as it did when an exported one stopped being exported.
-  const other = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("hex");
-  writeFileSync(join(dir, ".env"), readFileSync(join(dir, ".env"), "utf8").replace(/^BETTER_AUTH_SECRET=.*$/m, `BETTER_AUTH_SECRET=${other}`));
-  const dbPath = join(dir, "idp.db");
-  const advice = await openIdentityProvider(readIdpConfig({ ...envOf(dir), IDP_DB_PATH: dbPath, NODE_ENV: "test" })).then(
-    () => null,
-    (error: Error) => error.message,
-  );
-  console.log(`--- the identity module's refusal ---\n${advice}`);
-  expect(advice).not.toBeNull();
-  // The steps, as the test below takes them.
-  const steps = ["(1) stop the app", `(2) delete ${dbPath}`, `(3) run \`bun run setup-arcade ${HOST}\``, "`bun run users list`", "`bun run users remove <email>`", "`bun run users add <email>", "(5) start the app, and sign in"];
-  for (const step of steps) expect(advice).toContain(step);
-  expect(steps.map((step) => advice!.indexOf(step))).toEqual([...steps.map((step) => advice!.indexOf(step))].sort((a, b) => a - b));
-
-  // (1) Nothing is running: the provider above refused to open. (2)
-  for (const suffix of ["", "-wal", "-shm"]) rmSync(`${dbPath}${suffix}`, { force: true });
-
-  // (3) Arcade's provider names the deleted arcade client, so the run stops there, and says so...
-  const run = await setupArcade(dir);
-  console.log(`--- step 3, setup-arcade ${HOST} ---\n${run.stdout}${run.stderr}`);
-  expect(run.code).toBe(1);
-  expect(run.stdout).toContain("oauth2.client_id: Arcade has");
-  expect(run.stderr).toContain("never edits an existing provider");
-  // ...having set .env's web client to the new idp.db's first.
-  expect(run.stdout).toContain("rewrote  IDP_CLIENT_ID, IDP_CLIENT_SECRET");
-  expect(run.stderr).toContain(".env's IDP_CLIENT_ID and IDP_CLIENT_SECRET were rewritten above, so the app's own sign-in works");
-  expect(envOf(dir).IDP_CLIENT_ID).toBe(clientsIn(dir).web!.clientId);
-
-  // (4) For each person the list shows: remove, then add again.
-  const listed = await usersIn(dir, "list");
-  console.log(`--- step 4, bun run users list ---\n${listed.out}`);
-  expect(listed.out).toContain(PERSON.email);
-  expect((await usersIn(dir, "remove", PERSON.email)).code).toBe(0);
-  expect((await addPerson(dir)).code).toBe(0);
-
-  // (5) Sign in.
-  const signedIn = await signInAt(dir, PERSON.email, PERSON.password);
-  console.log(`--- step 5, sign in ---\n${signedIn.visited.join("\n")}`);
-  expect(signedIn.signedIn).toBe(true);
-
-  // And the provider, deleted in the dashboard as the advice says, is created again by step 3.
-  arcade.providers.clear();
-  const again = await setupArcade(dir);
-  expect(again.code, `${again.stdout}\n${again.stderr}`).toBe(0);
-  expect((arcade.providers.get("app-identity") as Json).oauth2.client_id).toBe(clientsIn(dir).arcade!.clientId);
-  expect(again.stdout).not.toContain("rewrote");
-  expect((await signInAt(dir, PERSON.email, PERSON.password)).signedIn).toBe(true);
-}, 180_000);
 
 // --- Gmail and Slack: Arcade's own tools on the gateway (the shape JD Armada's PR #2 tests took) ---
 
@@ -3131,7 +2843,7 @@ const gatewayPatches = () => arcade.requests.filter((each) => each.method === "P
 test("one click creates the gateway with the six LoanDesk tools and Gmail and Slack, and deploys nothing for them", async () => {
   const dir = project("native-one-click");
   arcade.coordinatorMode = "available";
-  const run = await setupArcade(dir, ENTER);
+  const run = await setupArcade(dir);
   expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(0);
   expect(projects.get(dir)!.deploys()).toEqual(DEPLOYS);
   expect(run.stdout).toContain("with the six LoanDesk tools and Gmail and Slack (read back)");
@@ -3142,11 +2854,11 @@ test("one click creates the gateway with the six LoanDesk tools and Gmail and Sl
 test("a gateway with only the six gets Gmail and Slack added, and nothing else changes", async () => {
   const dir = project("native-later");
   arcade.coordinatorMode = "available";
-  expect((await setupArcade(dir, ENTER)).code).toBe(0);
+  expect((await setupArcade(dir)).code).toBe(0);
   const before = structuredClone(sixOnly());
 
   arcade.requests = [];
-  const run = await setupArcade(dir, { tty: true, input: "" });
+  const run = await setupArcade(dir);
   expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(0);
   expect(run.stdout).toContain(`gateway: added the 3 Gmail and Slack tools to ${before.slug}, keeping its other tools and its User Source (read back)`);
   expect(run.stdout).not.toContain("warning       tool_filter");
@@ -3160,7 +2872,7 @@ test("a gateway with only the six gets Gmail and Slack added, and nothing else c
   // No new gateway, and nothing left to add on the run after.
   expect(arcade.requests.filter((each) => each.method === "POST" && /\/gateways$/.test(each.path))).toEqual([]);
   arcade.requests = [];
-  const third = await setupArcade(dir, { tty: true, input: "" });
+  const third = await setupArcade(dir);
   expect(third.code, `${third.stdout}\n${third.stderr}`).toBe(0);
   expect(gatewayPatches()).toEqual([]);
   expect(third.stdout).not.toContain("added the 3");
@@ -3169,10 +2881,10 @@ test("a gateway with only the six gets Gmail and Slack added, and nothing else c
 test("Arcade refusing the update is a warning naming both ways to finish, and the run still turns the hooks on", async () => {
   const dir = project("native-patch-refused");
   arcade.coordinatorMode = "available";
-  expect((await setupArcade(dir, ENTER)).code).toBe(0);
+  expect((await setupArcade(dir)).code).toBe(0);
   sixOnly();
   arcade.nextGatewayPatch = { status: 405, body: { name: "method_not_allowed", message: "method not allowed" } };
-  const run = await setupArcade(dir, { tty: true, input: "" });
+  const run = await setupArcade(dir);
   expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(0);
   expect(run.stdout).toMatch(/warning {7}adding the 3 Gmail and Slack tools to \S+ failed: .*405.*\(Arcade says: method not allowed\)/);
   expect(run.stdout).toContain("--gateway <a-new-slug>");
@@ -3184,11 +2896,11 @@ test("Arcade refusing the update is a warning naming both ways to finish, and th
 test("a gateway missing one of the six is not edited: that stays a warning", async () => {
   const dir = project("native-six-incomplete");
   arcade.coordinatorMode = "available";
-  expect((await setupArcade(dir, ENTER)).code).toBe(0);
+  expect((await setupArcade(dir)).code).toBe(0);
   const gateway = onlyGateway();
   gateway.tool_filter = { allowed_tools: SIX.filter((tool) => tool !== "LoanDesk.DenyLoan") };
   arcade.requests = [];
-  const run = await setupArcade(dir, { tty: true, input: "" });
+  const run = await setupArcade(dir);
   expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(0);
   expect(gatewayPatches()).toEqual([]);
   expect(run.stdout).toMatch(/warning {7}tool_filter\.allowed_tools is missing [^\n]*LoanDesk\.DenyLoan/);
