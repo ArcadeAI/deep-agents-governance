@@ -137,7 +137,7 @@ beforeAll(async () => {
   // added the way an operator adds one: into the identity provider, and into
   // the `governance.db` the app has open.
   const added = await runUsers(
-    ["add", DANA, "--name", "Alice", "--role", "loan_officer", "--clearance", "50000", "--password", "Root-Reset-Test-23"],
+    ["add", DANA, "--name", "Alice", "--role", "loan_officer", "--clearance", "50000", "--password", "Root-Reset-Ledger-23"],
     { standIn: app.identity.standIn, governance: app.databases.governance },
   );
   if (added.code !== 0) throw new Error(`users add exited ${added.code}:\n${added.out}\n${added.err}`);

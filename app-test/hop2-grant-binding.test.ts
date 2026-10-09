@@ -2,9 +2,10 @@
  * Hop 2 identity/tool binding, through the real local services.
  *
  * This is the narrow regression for #133. The verifier is the production
- * handler, `apps/idp` is a real Better Auth subprocess, and the Arcade stand-in
- * performs the provider code exchange against the real IdP token and userinfo
- * routes when it finalizes `next_uri`. The stand-in is still the only Arcade
+ * handler, the identity provider is the harness's OIDC stand-in (shaped like
+ * Okta's `default` authorization server), and the Arcade stand-in performs the
+ * provider code exchange against its token and userinfo endpoints when it
+ * finalizes `next_uri`. The stand-in is still the only Arcade
  * boundary, but it now models the important order: auth requirements happen
  * before the tool call, and a grant is usable only when the confirmed persona
  * equals the OAuth identity Arcade obtained for that grant.
@@ -87,14 +88,16 @@ async function setupFlow(
 }
 
 describe("an already-authorized Dana-equivalent hop-2 grant", () => {
-  test("finalizes through real cg-idp and LoanDesk_SearchLoans receives that grant", async () => {
+  test("finalizes through the identity provider and LoanDesk_SearchLoans receives that grant", async () => {
     const browser = new Browser();
-    const before = (await harness.idpLog()).split("\n").filter((line) => line.includes("grant=authorization_code")).length;
+    const codes = () => harness.idp.grants.filter((grant) => grant === "authorization_code").length;
+    const before = codes();
     const { flowId, token } = await setupFlow(browser, "dana", "dana");
-    const after = (await harness.idpLog()).split("\n").filter((line) => line.includes("grant=authorization_code")).length;
+    const after = codes();
 
-    // Sign-in used the real route once; finalizing next_uri adds another real
-    // authorization_code exchange at the IdP. No test stub can satisfy this.
+    // Sign-in used the token endpoint once; finalizing next_uri adds another
+    // authorization_code exchange at the IdP. Nothing short of a real code
+    // exchange satisfies this.
     expect(after).toBeGreaterThan(before);
     expect(harness.arcade.confirmations).toEqual([
       { flow_id: flowId, user_id: PEOPLE.dana.email, authorized: true },
