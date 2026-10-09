@@ -51,6 +51,7 @@ const GOOD_SECRET = "3f9a1c7e5b2d84069a1fe73c05b8d42e6c917ab3fd50e28c47196baf3d0
 /** Everything a cg-web needs. Individual tests take keys away. */
 const COMPLETE = {
   APP_PUBLIC_HOST: "cg-web-sa31.example.com",
+  IDP_ISSUER: "https://bank.okta.example/oauth2/default",
   IDP_CLIENT_ID: "client-c",
   IDP_CLIENT_SECRET: "client-c-secret",
   SESSION_SECRET: GOOD_SECRET,
@@ -114,10 +115,12 @@ describe("the banner, with ARCADE_GATEWAY_ID absent", () => {
     // `gatewayProblems` is a superset of `signinProblems` by construction.
     // Printing five identical sentences under two headings is how a banner
     // becomes something people stop reading.
-    // `IDP_CLIENT_ID` since #6, when the issuer became the app's own origin
-    // and stopped being a variable that could be unset.
+    // `IDP_ISSUER` and `IDP_CLIENT_ID` both: sign-in needs the issuer to
+    // discover and the client to present.
     const problems = configurationProblems(readIdentitySurface({ APP_PUBLIC_HOST: COMPLETE.APP_PUBLIC_HOST }));
+    expect(problems.signin).toContain("IDP_ISSUER is not set");
     expect(problems.signin).toContain("IDP_CLIENT_ID is not set");
+    expect(problems.gateway).not.toContain("IDP_ISSUER is not set");
     expect(problems.gateway).not.toContain("IDP_CLIENT_ID is not set");
     expect(problems.gateway).toContain("ARCADE_GATEWAY_ID is not set");
   });

@@ -719,10 +719,10 @@ describe("the fork seam", () => {
    */
   test("nothing this service serves opens the loan book's database", () => {
     // Since #4 the app opens governance.db (the control plane,
-    // `gate/service/`), since #5 loans.db (the loan module,
-    // `api/`) and since #6 idp.db (the identity provider,
-    // `auth/provider/`). So the rule is stated as what it always meant:
-    // bun:sqlite only under those three modules, and only the loan module reads
+    // `gate/service/`) and since #5 loans.db (the loan module, `api/`).
+    // (`idp.db` was the third until the identity provider moved to Okta.)
+    // So the rule is stated as what it always meant:
+    // bun:sqlite only under those two modules, and only the loan module reads
     // the variable that locates the loan book's file. (The control plane's reset names
     // `loans.db` in its answer, to say it was not touched.)
     const opening: string[] = [];
@@ -737,7 +737,7 @@ describe("the fork seam", () => {
     }
     expect(opening.length).toBeGreaterThan(0);
     for (const path of opening) {
-      const owner = ["gate/service/", "api/", "auth/provider/"].some((module) => path.startsWith(module));
+      const owner = ["gate/service/", "api/"].some((module) => path.startsWith(module));
       expect({ path, owner }).toEqual({
         path,
         owner: true,
@@ -786,15 +786,15 @@ describe("the fork seam", () => {
     // service name; `app-test/control-plane/public-host.test.ts` pins that).
     // It never reads the loan book with it. `lib/loan-context/read.ts` was on
     // this list until #5, when it stopped reading the loan book over HTTP.
-    // Since #6: the app's own config (its origin, `appPublicHost`), the
-    // panel's stream (the browser's address for `/hooks/events`) and the
-    // identity provider's issuer. Since #9: the origin trap, which compares
+    // Since #6: the app's own config (its origin, `appPublicHost`) and the
+    // panel's stream (the browser's address for `/hooks/events`). The
+    // identity provider's issuer was on this list until it moved to Okta and
+    // became `IDP_ISSUER`. Since #9: the origin trap, which compares
     // the host a page was served on with it and names it on the home page's
     // banner and in `bun run dev`'s first line. It fetches nothing. Since
     // #30: `next dev`'s `allowedDevOrigins`, which lists the host's name so a
     // page served on it can load the dev resources. It fetches nothing either.
     expect(reaching.sort()).toEqual([
-      "auth/provider/config.ts",
       "components/identity/OriginBanner.tsx",
       "gate/service/config.ts",
       "lib/config.ts",
