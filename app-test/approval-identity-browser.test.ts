@@ -277,7 +277,7 @@ test.skipIf(chromeResolution.path === null && !REQUIRED)(
  */
 async function sessionFor(harness: { webUrl: string }, persona: PersonaKey): Promise<Session> {
   const browser = new Browser();
-  await signInAs(browser, harness, persona, { stopAt: "/api/arcade/start" });
+  await signInAs(browser, harness, persona, { stopAtLanding: true });
   const session = await openSealed<Session>(joinChunks(SESSION_COOKIE, browser.cookies), SESSION_SECRET);
   if (session === null) throw new Error(`signing in as ${persona} left no session`);
   return session;
@@ -286,8 +286,8 @@ async function sessionFor(harness: { webUrl: string }, persona: PersonaKey): Pro
 /**
  * Put this session in the browser, and only this session.
  *
- * Cleared first: one persona per browser is the design (`DESIGN.md` → Gateway
- * token storage), and a leftover chunk from a longer session would join onto a
+ * Cleared first: one persona per browser is the design (`DESIGN.md` → Session
+ * storage), and a leftover chunk from a longer session would join onto a
  * shorter new one and refuse to open — which reads as "not signed in" and would
  * quietly turn the second half of this test into a repeat of the first.
  */

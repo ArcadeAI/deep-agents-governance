@@ -148,10 +148,13 @@ async function tokenRequest(
       "content-type": "application/x-www-form-urlencoded",
       accept: "application/json",
     };
-    const form: Record<string, string> = { ...grant, client_id: options.clientId };
+    // The client id goes in exactly one place. Okta refuses a Basic header plus
+    // a `client_id` in the body as "multiple client credentials".
+    const form: Record<string, string> = { ...grant };
     if (method === "basic") {
       headers.authorization = `Basic ${basic(options)}`;
     } else {
+      form.client_id = options.clientId;
       form.client_secret = options.clientSecret;
     }
 

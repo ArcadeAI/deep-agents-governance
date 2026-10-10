@@ -44,8 +44,9 @@ class TestWiring:
         assert config["name"] == "loan-desk"
         assert [type(m) for m in config["middleware"]] == [ArcadeMiddleware]
 
-    def test_selection_is_scoped_to_the_gateway(self) -> None:
-        assert loan_desk.provider._gateway_id == "gw-test"
+    def test_selection_is_not_scoped_to_a_gateway_even_when_one_is_left_in_the_env(self) -> None:
+        # conftest sets ARCADE_GATEWAY_ID the way an older .env would; the provider ignores it.
+        assert loan_desk.provider._gateway_id is None
 
     def test_the_model_is_scripted_without_model_id(self) -> None:
         assert isinstance(loan_desk.agent.config["model"], ScriptedModel)

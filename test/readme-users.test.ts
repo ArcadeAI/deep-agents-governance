@@ -38,8 +38,8 @@ const ACCOUNTS_LINK = `[\`${ACCOUNTS_PAGE}\`](./${ACCOUNTS_PAGE})`;
 const ACCOUNTS_LINK_FROM_DOCS = "[`app-users-and-arcade-accounts.md`](./app-users-and-arcade-accounts.md)";
 const SLACK_PAGE = "https://docs.arcade.dev/en/references/auth-providers/slack";
 
-const ADD_STEP = "7. **Add yourself and an approver**";
-const ASK_STEP = "8. **Run the agent and ask it**";
+const ADD_STEP = "6. **Add yourself and an approver**";
+const ASK_STEP = "7. **Run the agent and ask it**";
 
 const scratch = mkdtempSync(join(tmpdir(), "cg-readme-users-"));
 afterAll(() => rmSync(scratch, { recursive: true, force: true }));
@@ -76,13 +76,13 @@ function flag(argv: string[], name: string): string | undefined {
   return at === -1 ? undefined : argv[at + 1];
 }
 
-/** Whether the loan officer is refused the $95K and the approver may grant it: act 2, as step 7 sets it up. */
+/** Whether the loan officer is refused the $95K and the approver may grant it: act 2, as step 6 sets it up. */
 function coversTheAct(commands: string[][]): boolean {
   const [officer, approver] = commands.map((argv) => Number(flag(argv, "clearance")));
   return officer! < 95_000 && approver! >= 95_000;
 }
 
-/** The README with step 7 moved after step 8, the order in which nobody can sign in. */
+/** The README with step 6 moved after step 7, the order in which nobody can sign in. */
 function addStepAfterAsk(markdown: string): string {
   const start = markdown.indexOf(ADD_STEP);
   const ask = markdown.indexOf(ASK_STEP);
@@ -133,7 +133,7 @@ describe("the README's users commands", () => {
   const quickstartAdds = addCommands(step);
   const tryItOutAdds = addCommands(section(README, "Try it out"));
 
-  test("step 7 adds a loan officer and a VP, right before the app is opened", () => {
+  test("step 6 adds a loan officer and a VP, right before the app is opened", () => {
     expect(step).not.toBe("");
     expect(quickstartAdds.map((argv) => flag(argv, "role"))).toEqual(["loan_officer", "vp_credit"]);
     const quickstart = section(README, "Quickstart 🚀");
@@ -144,7 +144,7 @@ describe("the README's users commands", () => {
     expect(coversTheAct(quickstartAdds)).toBe(true);
   });
 
-  test("step 7 says the approver's email is their Slack one, answers who needs an Arcade account, and offers seed-demo", () => {
+  test("step 6 says the approver's email is their Slack one, answers who needs an Arcade account, and offers seed-demo", () => {
     expect(step).toContain("Use the email the approver's Slack account uses");
     expect(step).toContain(
       "   - Do your app's users need Arcade accounts? With Arcade's built-in Slack app, yes: invite each loan officer to your Arcade project's Members. " +
@@ -214,7 +214,7 @@ describe("the page on who needs an Arcade account", () => {
     expect(accountsPageGaps(readFileSync(path, "utf8"))).toEqual([]);
   });
 
-  test("the README points at it from Prerequisites, step 7 and Further reading, and the FAQ from its answer", () => {
+  test("the README points at it from Prerequisites, step 6 and Further reading, and the FAQ from its answer", () => {
     for (const title of ["Prerequisites", "Quickstart 🚀", "Further reading"]) expect(section(README, title)).toContain(ACCOUNTS_LINK);
     expect(accountsAnswer(FAQ)).toContain(ACCOUNTS_LINK_FROM_DOCS);
   });

@@ -1,7 +1,8 @@
 # The loan desk agent
 
-A LangChain Deep Agent that runs on Managed Deep Agents (MDA) and reaches every tool through
-one Arcade gateway. It is a directory, the way MDA wants it:
+A LangChain Deep Agent that runs on Managed Deep Agents (MDA) and calls the Arcade Engine
+directly with the project key, as the signed-in person. There is no gateway. It is a
+directory, the way MDA wants it:
 
 | File | What it is |
 | --- | --- |
@@ -47,7 +48,15 @@ token, or a token from anywhere else, and MDA answers 401 before the agent runs.
 
 With `MODEL_ID` unset the agent runs `ScriptedModel`: it selects the loan desk's search tool,
 calls `LoanDesk_SearchLoans` for pending requests and answers with what came back. That is
-enough to prove the sign-in, the gateway and the hooks with no model key.
+enough to prove the sign-in and the hooks with no model key.
+
+## Tool Rec is unscoped
+
+With no gateway, Tool Rec searches the whole catalog, not just the loan desk. It may offer
+catalog tools such as Ashby or ClickUp alongside the six LoanDesk tools and Gmail and Slack.
+The project's hooks still govern every call the agent makes, so nothing here relies on
+search to hide a tool: a tool the hooks refuse is refused when it is called, whoever found
+it.
 
 For a real model:
 

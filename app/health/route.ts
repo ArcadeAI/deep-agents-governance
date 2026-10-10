@@ -6,12 +6,13 @@
  * thing a human configures by hand, each fails on its own, and each fails at a
  * point where nothing else on screen would say so.
  *
- * Since #82: `signin`, `gateway` and `verifier` — sign-in, the gateway hop and
- * the custom verifier depend on variables set by hand on the deployment
- * and in the Arcade dashboard, and two of the three fail at a step no hook
- * observes, so an unset one is otherwise discovered mid-rehearsal as "the demo
- * does nothing". They say `configured` or `missing` and never which value is
- * wrong, because the value is a credential in two cases out of three.
+ * Since #82: `signin` and `verifier` — sign-in and the custom verifier depend
+ * on variables set by hand on the deployment and in the Arcade dashboard, and
+ * both fail at a step no hook observes, so an unset one is otherwise
+ * discovered mid-rehearsal as "the demo does nothing". They say `configured`
+ * or `missing` and never which value is wrong, because the value is a
+ * credential. (A third, `gateway`, went with the gateway: the agent calls the
+ * Engine directly.)
  *
  * Since #81: `panel_stream` — `live`, `fixture` or `unconfigured`. The odd one
  * out, because it has three answers rather than two: a panel can be watching

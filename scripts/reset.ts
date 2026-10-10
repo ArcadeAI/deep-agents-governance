@@ -51,7 +51,7 @@
  * every approval forward. This command is the only way back.
  *
  * **A reset is not a re-registration.** The Okta client Arcade's
- * `app-identity` provider and User Source are registered against is not
+ * `app-identity` provider is registered against is not
  * touched by anything here.
  *
  * ## Addresses

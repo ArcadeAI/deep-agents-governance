@@ -69,8 +69,6 @@ const SET_ELSEWHERE: Record<string, string> = {
   ARCADE_WORK_DIR: "the Arcade CLI's own, naming its config directory; setup-arcade reads the CLI's context where the CLI does",
   ARCADE_CONTEXT: "the Arcade CLI's own, choosing a saved context; setup-arcade honours it as the CLI does",
   HOME: "the shell's, where the Arcade CLI keeps ~/.arcade",
-  CG_SETUP_ARCADE_TTY: "set by setup-arcade's test harness, standing in for a terminal on stdin so the run may pause (#52); read from the shell, never .env",
-  CG_SETUP_ARCADE_ISSUER_URL: "set by setup-arcade's test harness, standing in for the tunnel the run checks the issuer through (#52); read from the shell, never .env",
 };
 
 test("every variable .env.example names is read by the code that ships", () => {

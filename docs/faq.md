@@ -24,7 +24,7 @@ Arcade's stock Slack provider issues a delegated user token, so the DM arrives u
 
 ## Why two OAuth hops?
 
-Because Arcade establishes who you are at two separate points. Hop 1, the MCP client reaching the gateway, is answered by a User Source whose issuer is Okta, where the app's people sign in; hop 2, the loan tool calling the loan API as the signed-in person, is answered by the `app-identity` provider and a custom verifier. A spike measured that hop 1's identity does not carry into hop 2, and without the custom verifier Arcade sends the user to its own account login, which requires an Arcade account that is a project member. The mechanisms are in [Two OAuth hops, two mechanisms](./architecture.md#two-oauth-hops-two-mechanisms).
+Because Arcade establishes who you are at two separate points. Hop 1, the agent reaching Arcade, is answered by the project key and the email from the Okta ID token the agent verified, with no gateway between them; hop 2, the loan tool calling the loan API as the signed-in person, is answered by the `app-identity` provider and a custom verifier. A spike measured that hop 1's identity does not carry into hop 2 (when hop 1 was still a User Source gateway), and without the custom verifier Arcade sends the user to its own account login, which requires an Arcade account that is a project member. The mechanisms are in [Two OAuth hops, two mechanisms](./architecture.md#two-oauth-hops-two-mechanisms).
 
 ## Can the control plane see an OAuth misconfiguration?
 

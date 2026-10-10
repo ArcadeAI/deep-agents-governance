@@ -234,8 +234,8 @@
   color: inherit;
 }
 
-/* The session controls, pushed to the far end of the same line: the gateway
-   token's expiry and the one button that changes who this browser is. They are
+/* The session controls, pushed to the far end of the same line: the one
+   button that changes who this browser is. They are
    `components/identity`'s, not the bank's, and arrive as an element — this rule
    places it and the `--line`/`--muted` aliases above restyle it. */
 .bank-user-session {
@@ -310,7 +310,8 @@
    back above it.
 
    #176 took the sign-in panel out of this column and put its two surviving
-   facts — the gateway token and one button — in the chrome bar, so the two
+   facts — the gateway token and one button — in the chrome bar (the token
+   went with hop 1), so the two
    cards left here fit without a scroll at both sizes. */
 .bank-files {
   display: grid;

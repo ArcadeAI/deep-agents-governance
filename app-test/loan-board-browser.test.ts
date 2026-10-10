@@ -106,8 +106,8 @@ test.skipIf(chromeResolution.path === null && !REQUIRED)(
             // workspace; bearers are checked at `appIdentity.env`'s issuer.
             LOANS_DB_PATH: join(dir, "loans.db"),
             // So the decision line can name the person rather than the address.
-            // The gateway is not configured on purpose: nothing about the loan
-            // cards depends on hop 1 since #157, and a page that still needed it
+            // No Arcade key or gateway at all: nothing about the loan cards
+            // depends on Arcade since #157, and a page that still needed it
             // would fail here rather than quietly keep working.
           },
           stdout: "pipe",
@@ -253,7 +253,7 @@ test.skipIf(chromeResolution.path === null && !REQUIRED)(
 /** A real sign-in, unsealed back into the `Session` a browser would be carrying. */
 async function sessionFor(harness: { webUrl: string }, persona: keyof typeof PEOPLE): Promise<Session> {
   const browser = new Browser();
-  await signInAs(browser, harness, persona, { stopAt: "/api/arcade/start" });
+  await signInAs(browser, harness, persona, { stopAtLanding: true });
   const session = await openSealed<Session>(joinChunks(SESSION_COOKIE, browser.cookies), SESSION_SECRET);
   if (session === null) throw new Error(`signing in as ${persona} left no session`);
   return session;

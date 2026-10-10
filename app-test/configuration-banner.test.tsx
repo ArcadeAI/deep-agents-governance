@@ -2,10 +2,9 @@
  * What a visitor sees when this deployment is only half configured.
  *
  * Round 2 of #84's review ran a built cg-web with sign-in configured and
- * `ARCADE_GATEWAY_ID` and `ARCADE_API_KEY` absent. `/health` answered
- * `{"status":"ok", … "gateway":"missing","verifier":"missing"}` and `GET /`
- * rendered the ordinary persona buttons and `Gateway token: none` with no
- * warning anywhere. The process stayed Ready, the host kept it in rotation, and
+ * `ARCADE_API_KEY` absent (with what was then `ARCADE_GATEWAY_ID`). `/health`
+ * answered `{"status":"ok", … "verifier":"missing"}` and `GET /` rendered the
+ * ordinary persona buttons with no warning anywhere. The process stayed Ready, the host kept it in rotation, and
  * the only way to discover that no tool call could ever be made was to click
  * into a flow and read a 503.
  *
@@ -55,11 +54,7 @@ const COMPLETE = {
   IDP_CLIENT_ID: "client-c",
   IDP_CLIENT_SECRET: "client-c-secret",
   SESSION_SECRET: GOOD_SECRET,
-  ARCADE_GATEWAY_ID: "cg-demo-us",
   ARCADE_API_KEY: "arcade-key",
-  // The agent, since #14. In this list for the same reason as the rest: a
-  // cg-web without it signs Alice in, holds a gateway token, and then the chat
-  // page fails at the point of use.
 } as const;
 
 /** The banner alone, exactly as `app/page.tsx` and `app/chat/page.tsx` place it. */
@@ -86,43 +81,39 @@ function text(html: string): string {
     .trim();
 }
 
-describe("the banner, with ARCADE_GATEWAY_ID absent", () => {
-  const { ARCADE_GATEWAY_ID, ...withoutGateway } = COMPLETE;
+describe("the banner, with ARCADE_API_KEY absent", () => {
+  const { ARCADE_API_KEY, ...withoutKey } = COMPLETE;
 
   test("it appears, and names the missing variable in the visitor's face", () => {
-    const html = banner(withoutGateway);
+    const html = banner(withoutKey);
 
     expect(html).toContain('role="alert"');
     expect(text(html)).toContain("This deployment is not fully configured");
-    expect(text(html)).toContain("The gateway hop is not configured");
-    // The same sentence `gatewayProblems` produces for the 503 page. One source.
-    expect(text(html)).toContain("ARCADE_GATEWAY_ID is not set");
-    expect(configurationProblems(readIdentitySurface(withoutGateway)).gateway).toContain(
-      "ARCADE_GATEWAY_ID is not set",
+    expect(text(html)).toContain("The custom verifier is not configured");
+    // The same sentence `verifierProblems` produces for the 503 page. One source.
+    expect(text(html)).toContain("ARCADE_API_KEY is not set");
+    expect(configurationProblems(readIdentitySurface(withoutKey)).verifier).toContain(
+      "ARCADE_API_KEY is not set",
     );
   });
 
   test("sign-in still works, so its control stays live", () => {
-    const html = chrome(withoutGateway);
-    // Only the gateway is broken. Disabling the way in here would say the wrong
-    // thing — a visitor can sign in, and finding out how far they get is the
-    // point of the banner above them.
+    const html = chrome(withoutKey);
+    // Only the verifier is broken. Disabling the way in here would say the
+    // wrong thing: a visitor can sign in, and finding out how far they get is
+    // the point of the banner above them.
     expect(html).toContain(`href="${SIGNIN_PATH}"`);
     expect(html).not.toContain("disabled");
   });
 
   test("the banner does not repeat sign-in's problems under every heading", () => {
-    // `gatewayProblems` is a superset of `signinProblems` by construction.
-    // Printing five identical sentences under two headings is how a banner
-    // becomes something people stop reading.
-    // `IDP_ISSUER` and `IDP_CLIENT_ID` both: sign-in needs the issuer to
-    // discover and the client to present.
-    const problems = configurationProblems(readIdentitySurface({ APP_PUBLIC_HOST: COMPLETE.APP_PUBLIC_HOST }));
-    expect(problems.signin).toContain("IDP_ISSUER is not set");
-    expect(problems.signin).toContain("IDP_CLIENT_ID is not set");
-    expect(problems.gateway).not.toContain("IDP_ISSUER is not set");
-    expect(problems.gateway).not.toContain("IDP_CLIENT_ID is not set");
-    expect(problems.gateway).toContain("ARCADE_GATEWAY_ID is not set");
+    // `APP_PUBLIC_HOST` is a problem for sign-in and the verifier both.
+    // Printing the same sentence under two headings is how a banner becomes
+    // something people stop reading.
+    const problems = configurationProblems(readIdentitySurface({ ARCADE_CLOUD_URL: "https://cloud.arcade.dev" }));
+    expect(problems.signin).toContain("APP_PUBLIC_HOST is not set");
+    expect(problems.verifier).not.toContain("APP_PUBLIC_HOST is not set");
+    expect(problems.verifier).toContain("ARCADE_API_KEY is not set");
   });
 });
 
@@ -154,7 +145,6 @@ describe("a fully configured deployment", () => {
     expect(deploymentReadiness(config)).toEqual({
       status: "ok",
       signin: "configured",
-      gateway: "configured",
       verifier: "configured",
     });
 
@@ -198,9 +188,9 @@ describe("/health's top-level status", () => {
       ) as Record<string, string>;
       const readiness = deploymentReadiness(readIdentitySurface(partial));
       expect(readiness.status).toBe("degraded");
-      // And it is never `degraded` with all three capabilities configured —
-      // the two halves of the claim have to agree.
-      expect([readiness.signin, readiness.gateway, readiness.verifier]).toContain(
+      // And it is never `degraded` with both capabilities configured: the two
+      // halves of the claim have to agree.
+      expect([readiness.signin, readiness.verifier]).toContain(
         "missing",
       );
     }

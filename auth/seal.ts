@@ -2,13 +2,14 @@
  * The seal on every cookie this service writes, and the chunking that gets a
  * sealed value past the 4KB a browser will hold in one.
  *
- * `DESIGN.md` → **Gateway token storage**: the persona email and the gateway
- * access + refresh tokens live in a sealed, HTTP-only, per-browser cookie under
- * `SESSION_SECRET`. No fourth database. That decision puts two bearer tokens in
- * something the browser carries, so what "sealed" means has to be exact:
+ * `DESIGN.md` → **Session storage**: the persona email and the identity
+ * provider's access + refresh tokens live in a sealed, HTTP-only, per-browser
+ * cookie under `SESSION_SECRET`. No fourth database. That decision puts bearer
+ * tokens in something the browser carries, so what "sealed" means has to be
+ * exact:
  *
  * - **AES-256-GCM**, so the cookie is unreadable *and* unforgeable without the
- *   key. A signed-but-readable cookie would put Alice's gateway token in her own
+ *   key. A signed-but-readable cookie would put Alice's IdP token in her own
  *   DevTools, and a demo whose thesis is that controls live outside the model
  *   should not hand the browser a credential to read.
  * - **The key comes from the environment and nowhere else.** There is no

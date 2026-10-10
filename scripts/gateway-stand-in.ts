@@ -1146,7 +1146,8 @@ if (import.meta.main) {
     process.exit(78);
   }
 
-  const gatewayId = env.ARCADE_GATEWAY_ID?.trim() || "cg-demo-us";
+  // A fixture path, not a registered gateway: the app no longer has one to name.
+  const gatewayId = "cg-demo-us";
   const hooksHost = env.APP_PUBLIC_HOST?.trim() || "localhost:3000";
   // Both toolkits always — the agent has to be able to see
   // `LoanDesk_RequestApproval`, because the pre-hook's remediation sentence

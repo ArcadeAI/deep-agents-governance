@@ -37,7 +37,8 @@ def _urlopen(request, *args, **kwargs):
 urllib.request.urlopen = _urlopen
 
 os.environ.setdefault("ARCADE_API_KEY", "placeholder-not-a-key")
-os.environ.setdefault("ARCADE_GATEWAY_ID", "gw-test")
+# Left over from when the agent was scoped to a gateway: `agent.py` must ignore it.
+os.environ["ARCADE_GATEWAY_ID"] = "gw-left-over"
 os.environ["IDP_ISSUER"] = f"{ISSUER}/"
 os.environ.pop("LOAN_DESK_ISSUER", None)
 os.environ["IDP_CLIENT_ID"] = "0oa-okta-app-test"

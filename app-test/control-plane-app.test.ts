@@ -287,7 +287,9 @@ describe("the control plane, on the app's own port", () => {
       control_plane: { status: "healthy", service: "hooks", failure_mode: "fail-closed" },
     });
     expect(body.warnings).toBeArray();
-    for (const key of ["signin", "gateway", "verifier"]) expect(body).toHaveProperty(key);
+    for (const key of ["signin", "verifier"]) expect(body).toHaveProperty(key);
+    // No gateway field: the agent calls the Engine directly.
+    expect(body).not.toHaveProperty("gateway");
   }, 60_000);
 
   test("the panel's strip reads it back as a healthy control plane", async () => {

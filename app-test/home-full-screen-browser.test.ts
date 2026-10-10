@@ -237,7 +237,6 @@ async function measureHome(options: {
         GOVERNANCE_DB_PATH: ":memory:",
         ARCADE_API_URL: agents.gateway.url,
         ARCADE_API_KEY: "arcade-key-for-full-screen-browser",
-        ARCADE_GATEWAY_ID: "cg-demo-us",
         ARCADE_TOOLKIT: "LoanDesk",
         SESSION_SECRET,
         // The session below is sealed by hand, so nothing here signs in.
@@ -292,21 +291,16 @@ async function measureHome(options: {
     chrome = browser.child;
     const debugPort = browser.port;
 
-    // A real post-#157 browser: the gateway bearer for hop 1, and the IdP
-    // access token the bank's own screens are read with. Before #176 this
-    // fixture carried only the first, which is the shape of a cookie sealed
-    // before #157 shipped — so every page load in this file went down
+    // A real browser: the IdP access token the bank's own screens are read
+    // with. Before #176 this fixture carried only a hop-1 gateway bearer (hop 1
+    // has since gone), which is the shape of a cookie sealed before #157
+    // shipped — so every page load in this file went down
     // `readLoanBook`'s "carries no loan-system token" branch and the served
     // page was, unremarked, in exactly the self-contradicting state #176 is
     // about. It is measured deliberately below instead.
     const session = {
       email: DANA,
       signed_in_at: Date.now(),
-      gateway: {
-        access_token: harness.gateway.issueToken(DANA),
-        expires_at: Date.now() + 3_600_000,
-        client_id: "full-screen-browser",
-      },
       idp: {
         access_token: "idp-token-for-full-screen-browser",
         expires_at: Date.now() + 3_600_000,

@@ -1,6 +1,6 @@
 # Okta, the identity provider
 
-Okta is where the people who use the loan desk exist. They sign in to the app, to the agent's `ask.py` and to Arcade's gateway with their Okta login, and each of those is an ordinary OpenID Connect client of one Okta app. The app reads every endpoint from the issuer's discovery document, `IDP_ISSUER/.well-known/openid-configuration`, and spells no Okta path, so any provider that publishes one, Auth0 included, works with the same code.
+Okta is where the people who use the loan desk exist. They sign in to the app, to the agent's `ask.py` and to the loan desk's `app-identity` provider at Arcade with their Okta login, and each of those is an ordinary OpenID Connect client of one Okta app. The app reads every endpoint from the issuer's discovery document, `IDP_ISSUER/.well-known/openid-configuration`, and spells no Okta path, so any provider that publishes one, Auth0 included, works with the same code.
 
 Okta holds who someone is and their password. What they may do, their role and their approval clearance, stays in the app's `governance.db`, where `/hooks/pre` reads it.
 
@@ -25,7 +25,6 @@ Each step looks for what it makes before making it, so a second run changes noth
 - **The app**, an OIDC Web app labelled "Loan Desk", with the authorization code and refresh token grants, the client secret sent over HTTP Basic, and the consent screen skipped. Its sign-in redirect URIs are:
   - `https://<APP_PUBLIC_HOST>/api/auth/callback`, the app's own sign-in, once `APP_PUBLIC_HOST` is set;
   - `http://127.0.0.1:8765/callback`, where `ask.py` listens while you sign in;
-  - `https://cloud.arcade.dev/oauth2/intermediate_callback`, the User Source's sign-in at Arcade;
   - `ARCADE_PROVIDER_CALLBACK`, Arcade's callback for the `app-identity` provider, once `bun run setup-arcade` has written it to `.env`. That is why the Quickstart runs `okta-setup` a second time.
 - **The assignment** of the app to the Everyone group, so anybody in the org may sign in to it. Whether they can do anything once signed in is `governance.db`'s call.
 - **An access policy** on the `default` authorization server, "Loan Desk", with a rule that hands the app tokens for the authorization code grant. If a policy on that server already does, it uses that one and adds nothing.

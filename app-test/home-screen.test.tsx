@@ -41,7 +41,7 @@ import { BankPane } from "../components/bank/BankPane.tsx";
 import { LoanFilesView } from "../components/bank/LoanFiles.tsx";
 import { LoanFileCard } from "../components/bank/LoanFileCard.tsx";
 import { LoanBoard } from "../components/bank/LoanBoard.tsx";
-import { GATEWAY_START_PATH, SIGNIN_PATH } from "../auth/handlers.ts";
+import { SIGNIN_PATH } from "../auth/handlers.ts";
 import type { LoanBookState, LoanCard } from "../lib/loan-context/loans.ts";
 import type { Session } from "../auth/session.ts";
 
@@ -85,7 +85,7 @@ const SAM = "bob@bank.example";
 const samSession = (): Session => ({
   email: SAM,
   signed_in_at: 0,
-  gateway: { access_token: "tok", expires_at: 0, client_id: "c" },
+  idp: { access_token: "tok", expires_at: 0 },
 });
 
 const NORTHWIND: LoanCard = {
@@ -192,8 +192,8 @@ describe("the screen", () => {
     //
     // Scoped to the bank's **own** chrome, which is what `screen()` renders:
     // both demo fixtures it hosts — #82's session controls and #15's tool list
-    // — arrive as props and are stubbed here. Those two do name the gateway,
-    // and should: they are the demo's own furniture standing inside the bank's
+    // — arrive as props and are stubbed here. Those two do name Arcade's
+    // pieces, and should: they are the demo's own furniture standing inside the bank's
     // screen. What must not creep in is this file's chrome announcing itself.
     expect(markup).not.toMatch(/demo|scaffold|Arcade/i);
   });
@@ -242,8 +242,9 @@ describe("the screen", () => {
  *    `User session` card that held them. One Chrome profile per persona is the
  *    real demo shape, so the switcher read as the most demo-looking thing on a
  *    screen whose whole argument is that nothing here is a mock. What survives
- *    is what a real application's chrome carries: who you are, whether your
- *    gateway token is still good, and one button.
+ *    is what a real application's chrome carries: who you are and one button.
+ *    (It also showed whether a hop-1 gateway token was still good, until the
+ *    agent went gateway-free.)
  * 2. Four of the five tabs were `<span>`s. The old code defended them — *"a tab
  *    that navigates nowhere is worse on a projector than one that plainly
  *    cannot be pressed"* — and the answer was that five tabs where none
@@ -678,10 +679,10 @@ describe("the fork seam", () => {
     const source = readFileSync(join(WEB, "components/bank/LoanFiles.tsx"), "utf8");
 
     expect(source).toContain(`href: "${SIGNIN_PATH}"`);
-    // And it links **only** there. The gateway hop has nothing to do with the
-    // loan cards since #157: sending somebody to authorize the gateway because
-    // their IdP sign-in expired would be this screen naming the wrong hop.
-    expect(source).not.toContain(GATEWAY_START_PATH);
+    // And it links **only** there: no other `/api/` route. Before the agent
+    // went gateway-free the wrong one to name was `/api/arcade/start`, which
+    // authorized a hop that had nothing to do with an expired IdP sign-in.
+    expect(source.match(/"\/api\/[^"]*"/g) ?? []).toEqual([`"${SIGNIN_PATH}"`]);
   });
 
   /**

@@ -68,13 +68,13 @@ async function setupFlow(
   confirmedAs: "dana" | "sam",
   providerAs: "dana" | "sam",
 ): Promise<{ flowId: string; token: string }> {
-  await signInAs(browser, harness, confirmedAs, { stopAt: "/api/arcade/start" });
+  await signInAs(browser, harness, confirmedAs, { stopAtLanding: true });
   // A mismatch must come from a distinct real IdP session. Reusing Dana's
   // browser would correctly keep the IdP session as Dana and would not test
   // the identity split this regression is designed to expose.
   const providerBrowser = providerAs === confirmedAs ? browser : new Browser();
   if (providerBrowser !== browser) {
-    await signInAs(providerBrowser, harness, providerAs, { stopAt: "/api/arcade/start" });
+    await signInAs(providerBrowser, harness, providerAs, { stopAtLanding: true });
   }
   const provider = await prepareProviderCode(providerBrowser, harness, providerAs);
   const flowId = `hop2-${crypto.randomUUID()}`;

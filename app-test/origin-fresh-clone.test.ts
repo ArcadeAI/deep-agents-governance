@@ -92,7 +92,9 @@ test("a fresh clone with nothing filled boots, and /health names every missing c
   expect(response.status).toBe(200);
   const health = (await response.json()) as Record<string, any>;
   expect(health.status).toBe("degraded");
-  for (const capability of ["signin", "gateway", "verifier"]) expect(health[capability], capability).toBe("missing");
+  for (const capability of ["signin", "verifier"]) expect(health[capability], capability).toBe("missing");
+  // No gateway field: the agent calls the Engine directly, so there is none to configure.
+  expect("gateway" in health).toBe(false);
   // What does work, works: the policy and the loan book came up.
   expect(health.policy.status).toBe("ready");
   expect(health.loans).toMatchObject({ status: "ok" });

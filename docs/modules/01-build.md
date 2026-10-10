@@ -2,9 +2,9 @@
 
 **Start from:** `git checkout start`. **Owner:** LangChain. **45 minutes.**
 
-You leave this module with a Deep Agent running on your laptop under `mda dev`, reaching
-an Arcade gateway that carries the loan desk's six tools plus Gmail and Slack, having
-asked it one real question as yourself and read the tool calls it made.
+You leave this module with a Deep Agent running on your laptop under `mda dev`, calling
+Arcade's Engine directly for the loan desk's six tools plus Gmail and Slack, having asked it
+one real question as yourself and read the tool calls it made.
 
 ## Before the workshop
 
@@ -27,13 +27,14 @@ host shares a model key in the room for module 2.
    `SLACK_APPROVALS_CHANNEL=C0C83CW2CDN`, the workspace's `#deal-desk-approvals`, so every approval
    request you raise in module 2 is posted where everyone sees it.
 2. Register with Arcade: `bun run setup-arcade <APP_PUBLIC_HOST>`. It runs one `arcade deploy`
-   (`mcp`: the Loans and Approvals tools together), mints the OAuth clients, registers the identity provider and the hooks, and
-   creates the gateway with the six loan desk tools and Arcade's Gmail and Slack. Read what it prints; every name it reports is a name a rule is
+   (`mcp`: the Loans and Approvals tools together), mints the OAuth clients, registers the identity provider and the hooks, on.
+   There is no gateway to create: the agent calls the Engine with the project key. Read what it prints; every name it reports is a name a rule is
    keyed on later.
-3. Add yourself: `bun run users add <your-email> --name Alice --role loan_officer --clearance 50000`.
-4. Set up the agent: `cd agent`, `cp .env.example .env`, fill it in from the root `.env` and
+3. Start the app and the tunnel: `bun run dev`, and the ngrok command it prints, or `bun run up` for both.
+4. Add yourself: `bun run users add <your-email> --name Alice --role loan_officer --clearance 50000`.
+5. Set up the agent: `cd agent`, `cp .env.example .env`, fill it in from the root `.env` and
    your LangSmith key, `uv sync`, then `uv run mda dev .`.
-5. Ask it, from a second terminal in `agent`:
+6. Ask it, from a second terminal in `agent`:
 
        uv run --env-file .env python ask.py "Which loan applications are pending?"
 
@@ -44,7 +45,8 @@ host shares a model key in the room for module 2.
 ## What to look at
 
 - `agent/agent.py`: the whole agent is `define_deep_agent` plus one middleware. No tools are
-  listed in code; they come from the gateway.
+  listed in code; Tool Rec finds them in the project's catalog, which is not scoped to the
+  loan desk, so it may offer an unrelated tool too. The hooks govern every call either way.
 - `agent/identity.py`: MDA accepts only ID tokens Okta issued for the app, and the `email` claim is who
   every tool call runs as.
 - `agent/instructions.md`: what the agent is told. It describes the tools and carries no

@@ -18,13 +18,13 @@ import { publicHost } from "./public-host.ts";
 import { sessionSecretProblem } from "../auth/seal.ts";
 
 /**
- * Who the browser is signed in as, and the two OAuth hops that follow from it.
+ * Who the browser is signed in as, and the OAuth hop that follows from it.
  *
- * `DESIGN.md` → **Identity** and **Two hops, two mechanisms**. Everything here
+ * `DESIGN.md` → **Identity**. Everything here
  * is read from the environment and none of it has a development fallback: an
  * identity provider you can reach without configuring one is a fixture that
  * would eventually be mistaken for a login. `/health` reports which of the
- * three capabilities the environment actually configured, so an unset variable
+ * two capabilities the environment actually configured, so an unset variable
  * is visible before somebody discovers it mid-rehearsal.
  *
  * `idpIssuer` and `publicUrl` are **URLs**, not the HOST-form the cross-service
@@ -60,15 +60,13 @@ export interface IdentityConfig {
    * Arcade, where no hook fires.
    */
   publicHostConfigured: boolean;
-  /** `ARCADE_GATEWAY_ID` — `cg-demo-us`, the User Source gateway hop 1 authorizes against. */
-  gatewayId: string;
   /**
    * Arcade Cloud, which is a different host from `arcadeApiUrl`.
    *
    * `confirm_user` is `https://cloud.arcade.dev/api/v1/oauth/confirm_user`
    * (measured, spike #75) while tools execute against `api.arcade.dev`. One
    * variable for each, because pointing a test at a stand-in has to move the
-   * verifier's calls without moving the gateway's.
+   * verifier's calls without moving the Engine's.
    */
   cloudUrl: string;
 }
@@ -97,7 +95,7 @@ export interface WebConfig {
   arcadeApiKey: string;
   /** `tool.toolkit` as Arcade files the deployed approvals toolkit. */
   toolkit: string;
-  /** Sign-in, the gateway hop, and the custom verifier route. */
+  /** Sign-in and the custom verifier route. */
   identity: IdentityConfig;
 }
 
@@ -165,7 +163,6 @@ export function readIdentitySurface(
       sessionSecret: env.SESSION_SECRET?.trim() ?? "",
       publicUrl: appOrigin(env),
       publicHostConfigured: !appPublicHostIsFallback(env),
-      gatewayId: env.ARCADE_GATEWAY_ID?.trim() ?? "",
       cloudUrl: trimUrl(env.ARCADE_CLOUD_URL) || "https://cloud.arcade.dev",
     },
   };
@@ -212,11 +209,12 @@ function trimUrl(value: string | undefined): string {
 /**
  * What `/health` reports, and what each route refuses to run without.
  *
- * Three capabilities rather than one flag, because they fail independently and
+ * Two capabilities rather than one flag, because they fail independently and
  * the person reading `/health` is trying to find out which human step is
- * outstanding. Sign-in needs client C; the gateway hop needs a gateway id on
- * top of a signed-in person; and the verifier needs the Arcade project API
- * key, which nothing else here uses. The agent is not one of them: it is the
+ * outstanding. Sign-in needs client C, and the verifier needs the Arcade
+ * project API key, which nothing else here uses. There is no gateway to
+ * configure: the agent calls the Engine directly with the project key, and the
+ * project's hooks govern every call (`DESIGN.md` → Integration). The agent is not one of them: it is the
  * Deep Agent in `agent/`, and its model key lives in its own environment.
  *
  * A control that silently does nothing is worse than no control, and a
@@ -234,11 +232,11 @@ function trimUrl(value: string | undefined): string {
  */
 export interface DeploymentReadiness {
   /**
-   * `degraded` whenever any of the three below is `missing`, `ok` only when
-   * all three are configured.
+   * `degraded` whenever either of the two below is `missing`, `ok` only when
+   * both are configured.
    *
-   * Round 2 of #84's review ran a cg-web with sign-in configured and
-   * `ARCADE_GATEWAY_ID` absent and got `{"status":"ok", … "gateway":"missing"}`.
+   * Round 2 of #84's review ran a cg-web with sign-in configured and one
+   * capability unset and got `{"status":"ok", …}` with `missing` further down.
    * The top-level word is the one anybody actually reads — it is the first
    * field, it is what the other three services answer, and it is what somebody
    * greps for — so a deployment that cannot make a tool call was describing
@@ -253,14 +251,12 @@ export interface DeploymentReadiness {
    */
   status: "ok" | "degraded";
   signin: "configured" | "missing";
-  gateway: "configured" | "missing";
   verifier: "configured" | "missing";
 }
 
 export function deploymentReadiness(config: IdentitySurface): DeploymentReadiness {
   const capabilities = {
     signin: state(signinProblems(config)),
-    gateway: state(gatewayProblems(config)),
     verifier: state(verifierProblems(config)),
   } as const;
   return {
@@ -279,24 +275,21 @@ function state(problems: string[]): "configured" | "missing" {
  *
  * The same sentences the 503 pages render and the same ones `/health` counts —
  * one source, three surfaces. Round 2's finding was that a visitor saw none of
- * them: the page rendered its ordinary persona buttons and `Gateway token:
- * none`, and the only way to discover that the gateway was unconfigured was to
- * click into a flow and read a 503. A control plane demo whose own UI hides its
+ * them: the page rendered its ordinary persona buttons, and the only way to
+ * discover that a capability was unconfigured was to click into a flow and
+ * read a 503. A control plane demo whose own UI hides its
  * misconfiguration is arguing against itself.
  */
 export interface ConfigurationProblems {
   signin: string[];
-  gateway: string[];
   verifier: string[];
 }
 
 export function configurationProblems(config: IdentitySurface): ConfigurationProblems {
   return {
     signin: signinProblems(config),
-    // The gateway list is a superset of sign-in's by construction, and
-    // repeating five sentences under two headings is how a banner becomes
+    // Repeating a sentence under two headings is how a banner becomes
     // something people stop reading. Show only what sign-in did not already say.
-    gateway: withoutAll(gatewayProblems(config), signinProblems(config)),
     verifier: withoutAll(verifierProblems(config), signinProblems(config)),
   };
 }
@@ -328,15 +321,6 @@ export function signinProblems(config: IdentitySurface): string[] {
     ...(identity.idpClientId ? [] : ["IDP_CLIENT_ID is not set"]),
     ...(identity.idpClientSecret ? [] : ["IDP_CLIENT_SECRET is not set"]),
     ...(secret ? [secret] : []),
-  ];
-}
-
-/** The gateway hop is driven after sign-in, so it needs everything sign-in needs. */
-export function gatewayProblems(config: IdentitySurface): string[] {
-  return [
-    ...signinProblems(config),
-    ...(config.identity.gatewayId ? [] : ["ARCADE_GATEWAY_ID is not set"]),
-    ...(config.arcadeApiUrl ? [] : ["ARCADE_API_URL is not set"]),
   ];
 }
 

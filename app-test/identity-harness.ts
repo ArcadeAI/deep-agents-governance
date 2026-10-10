@@ -18,21 +18,20 @@
  *   they do in the app. Nothing is mocked: the suite drives them with a cookie
  *   jar over HTTP and asserts on the `Set-Cookie` headers a browser would
  *   actually get.
- * - **Arcade Cloud is a stand-in.** It speaks the MCP authorization discovery
- *   Arcade speaks (401 → protected-resource metadata → authorization-server
- *   metadata → dynamic registration → authorize → token), checks PKCE for
- *   real, and serves `confirm_user` and a `next_uri` whose code is single-use.
- *   It is a stand-in because the real one needs a project API key and a
- *   human's dashboard field; the shape it imitates is the one spike #04 and #75
- *   measured off the live service, hop for hop.
+ * - **Arcade Cloud is a stand-in.** It serves `confirm_user` and a `next_uri`
+ *   whose code is single-use, and one MCP tool endpoint the hop-2 regression
+ *   calls `LoanDesk_SearchLoans` on. It is a stand-in because the real one
+ *   needs a project API key and a human's dashboard field; the shape it
+ *   imitates is the one spike #04 and #75 measured off the live service. There
+ *   is no hop 1 to imitate: the agent calls the Engine directly with the
+ *   project key, so no gateway OAuth runs in a browser.
  *
  * Every port is `:0` and read back. This worktree owns a block of ten and the
  * reviewer's owns a different block, so nothing here may pick a number.
  */
 import { readWebConfig, type WebConfig } from "../lib/config.ts";
 import {
-  gatewayCallback,
-  gatewayStart,
+  CHAT_PAGE,
   signin,
   signinCallback,
   signout,
@@ -40,7 +39,6 @@ import {
 } from "../auth/handlers.ts";
 import { freePort } from "./child.ts";
 import { DEMO_CAST, DEMO_PEOPLE, TEST_OKTA_TOKEN } from "./demo-cast.ts";
-import { forgetGatewayClients } from "../auth/gateway.ts";
 import { forgetDiscovery } from "../auth/discovery.ts";
 import { nonce, pkce } from "../auth/oidc.ts";
 import { startOidcStandIn, type OidcStandIn } from "../scripts/oidc-stand-in.ts";
@@ -61,6 +59,7 @@ export type PersonaKey = keyof typeof PEOPLE;
 
 export const SESSION_SECRET = "identity-suite-session-secret-0123456789";
 export const ARCADE_API_KEY = "identity-suite-arcade-key";
+/** The MCP path the stand-in answers tool calls on. A fixture name; nothing registers it. */
 export const GATEWAY_ID = "cg-demo-us";
 
 // ---------------------------------------------------------------------------
@@ -112,12 +111,14 @@ export class Browser {
    * chain lands on a page with no form or on a path this caller is waiting for.
    *
    * `stopAt` is a substring rather than a full URL because the interesting stop
-   * is usually a path on a host whose port is assigned at boot.
+   * is usually a path on a host whose port is assigned at boot. `stopAtUrl` is
+   * the exact one, for a stop (the app's `/`) that every other URL on the
+   * chain would contain as a substring.
    */
   async follow(
     from: string,
     fill: (fields: Record<string, string>, html: string) => Record<string, string>,
-    options: { stopAt?: string; limit?: number } = {},
+    options: { stopAt?: string; stopAtUrl?: string; limit?: number } = {},
   ): Promise<{ url: string; response: Response; html: string }> {
     let url = from;
     for (let hop = 0; hop < (options.limit ?? 25); hop += 1) {
@@ -126,7 +127,7 @@ export class Browser {
         const location = response.headers.get("location");
         if (!location) throw new Error(`${response.status} with no Location at ${url}`);
         url = new URL(location, url).toString();
-        if (options.stopAt && url.includes(options.stopAt)) {
+        if ((options.stopAt && url.includes(options.stopAt)) || url === options.stopAtUrl) {
           return { url, response, html: "" };
         }
         continue;
@@ -146,7 +147,9 @@ export class Browser {
       const location = post.headers.get("location");
       if (!location) return { url: action, response: post, html: await post.text() };
       url = new URL(location, action).toString();
-      if (options.stopAt && url.includes(options.stopAt)) return { url, response: post, html: "" };
+      if ((options.stopAt && url.includes(options.stopAt)) || url === options.stopAtUrl) {
+        return { url, response: post, html: "" };
+      }
     }
     throw new Error(`the chain from ${from} did not terminate`);
   }
@@ -191,10 +194,6 @@ export function parseForm(html: string): ParsedForm | null {
 
 export interface ArcadeStandIn {
   url: string;
-  /** Every dynamic registration, in order. One per MCP client id. */
-  registrations: Array<{ client_id: string; redirect_uris: string[] }>;
-  /** Which client ids have already been consented to, per persona-less browser session. */
-  consents: string[];
   /** Every `confirm_user` call, as Arcade received it. The identity assertion under test. */
   confirmations: Array<{ flow_id: string; user_id: string; authorized: boolean }>;
   /** `next_uri`s that were actually fetched. Measured on #75: the grant needs this. */
@@ -235,66 +234,10 @@ export interface ArcadeStandIn {
    * stand-in.
    */
   nextUriOf(flowId: string): string | undefined;
-  /** Bearers presented to the MCP endpoint, in order. */
-  bearers: string[];
   /** Force the next `confirm_user` to fail with this status and body. */
   failConfirm: { status: number; body: string } | null;
   /** Answer `confirm_user` without a `next_uri`. */
   omitNextUri: boolean;
-  /** Seconds put on every access token this stand-in issues. */
-  tokenLifetimeSeconds: number;
-  refreshes: number;
-
-  // -- #113: a gateway that expires tokens and drops connections ------------
-  /** Every access token this stand-in has issued, in order. */
-  issued: string[];
-  /**
-   * Stop accepting every access token issued so far.
-   *
-   * The MCP endpoint then answers those bearers `401 invalid_token`, which is
-   * what a real gateway does to an expired one — **and it says nothing to the
-   * sealed cookie**, whose `expires_at` goes on claiming the token is live.
-   * That gap is the whole of #113: expiry as the session records it and expiry
-   * as the gateway enforces it are two different facts, and only one of them
-   * is a clock this service owns.
-   */
-  expireIssuedTokens(): void;
-  /**
-   * While false, every access token this stand-in issues is dead the moment it
-   * exists — the token endpoint hands one back and the MCP endpoint refuses it.
-   *
-   * The gateway nothing can rescue. It is what a retry has to terminate
-   * against: a service that kept refreshing here would spend a person's
-   * credentials in a loop against a server that has already said no.
-   */
-  acceptsIssuedTokens: boolean;
-  /**
-   * While true, `tools/list` comes back empty — the gateway takes the bearer
-   * and lists nothing, which is a broken control plane rather than a broken
-   * credential (#15).
-   */
-  listsNothing: boolean;
-  /**
-   * While true, the MCP endpoint accepts the request and then drops the
-   * connection mid-body.
-   *
-   * The other half of #113's measurement: a turn that dies on the transport
-   * rather than on the credential, which is what *"Could not connect to server
-   * with any available HTTP transport"* looks like from this side.
-   */
-  dropConnections: boolean;
-  /**
-   * Rotate the refresh token on every refresh, invalidating the one presented.
-   *
-   * Off by default, because the stand-in's original behaviour was to keep one
-   * refresh token alive forever and the identity suite is written against that.
-   * On, it is the stricter authorization server: a refresh whose result is not
-   * resealed into the cookie costs the browser its session. That is the thing
-   * "re-seal the cookie" has to be tested against rather than asserted.
-   */
-  rotateRefreshTokens: boolean;
-  /** Every `grant_type` the token endpoint was asked for, in order. */
-  grants: string[];
   /**
    * Test-only view of a hop-2 grant. It intentionally carries identities, but
    * never an authorization code, access token, refresh token or URL value.
@@ -324,45 +267,23 @@ export interface ArcadeStandIn {
   providerClientIdForTest(): string;
   /** Capture one provider code inside the harness; the code never leaves it. */
   bindProviderCode(flowId: string, authorizationState: string, codeVerifier: string): void;
-  /** A gateway bearer whose actor is the supplied test persona. */
+  /** A tool-call bearer whose actor is the supplied test persona. */
   issueToolToken(email: string): string;
   /** Reset only the stand-in's provider grants between focused test cases. */
   clearToolGrantsForTest(): void;
-  /**
-   * Make hop 1 a **User Source** gateway (#6): the gateway's authorize step
-   * sends the browser to this issuer's authorize endpoint under this client,
-   * with PKCE, before its own consent screen, the way the live gateway brokers
-   * it to Okta. Off unless configured, so every other suite sees the gateway
-   * it saw before.
-   */
-  configureUserSource(options: {
-    issuer: string;
-    endpoints: { authorize: string; token: string };
-    clientId: string;
-    clientSecret: string;
-  }): void;
-  /**
-   * Every login the gateway brokered to the User Source, with what it read
-   * off the ID token. `iss` is compared with the configured issuer byte for
-   * byte before anything is recorded, as Arcade compares it.
-   */
-  userSourceLogins: Array<{ iss: string; email: string; access_token: string | null }>;
   stop(): void;
 }
 
 /**
  * Arcade Cloud, as far as this slice can see it.
  *
- * Faithful where it matters and no further: the discovery chain is the one
- * measured on #04, PKCE is verified rather than accepted, `confirm_user`
- * demands the project API key, and the grant is only recorded once something
- * fetches `next_uri`. The focused `LoanDesk_SearchLoans` probe below is the one
- * tool path modeled here; all other tool execution remains absent because this
- * harness does not attempt to model the whole gateway.
+ * Faithful where it matters and no further: `confirm_user` demands the project
+ * API key, and the grant is only recorded once something fetches `next_uri`.
+ * The focused `LoanDesk_SearchLoans` probe below is the one tool path modeled
+ * here; all other tool execution remains absent because this harness does not
+ * attempt to model the whole Engine.
  */
 export function startArcadeStandIn(): ArcadeStandIn {
-  const codes = new Map<string, { challenge: string; clientId: string; redirectUri: string; subject?: { email: string; login: number } }>();
-  const refreshTokens = new Map<string, string>();
   const flows = new Map<
     string,
     {
@@ -375,16 +296,6 @@ export function startArcadeStandIn(): ArcadeStandIn {
     }
   >();
   const providerCodes = new Map<string, string>();
-  /** A gateway authorize parked while the User Source signs the person in, by the state sent there. */
-  const parkedAuthorize = new Map<string, { query: string; verifier: string }>();
-  /** Who the User Source said each gateway authorize is, by the `us` key it resumes under. */
-  const userSourceSubjects = new Map<string, { email: string; login: number }>();
-  let userSource: {
-    issuer: string;
-    endpoints: { authorize: string; token: string };
-    clientId: string;
-    clientSecret: string;
-  } | null = null;
   const pendingProvider = new Map<string, { code: string; codeVerifier: string }>();
   const actors = new Map<string, string>();
   const grantsByUser = new Map<string, string>();
@@ -395,31 +306,19 @@ export function startArcadeStandIn(): ArcadeStandIn {
     redirectUri: string;
   } | null = null;
 
-  /** Access tokens the gateway still accepts. Expiry is removal from this set. */
+  /** Tool-call bearers the stand-in accepts. */
   const liveAccess = new Set<string>();
 
   const state: ArcadeStandIn = {
     url: "",
-    registrations: [],
-    consents: [],
     confirmations: [],
     nextUriFetches: [],
     nextUriAnswer: "continuation",
     nextUriHits: [],
     continuations: [],
     nextUriOf: (flowId) => flows.get(flowId)?.next_uri,
-    bearers: [],
     failConfirm: null,
     omitNextUri: false,
-    tokenLifetimeSeconds: 3600,
-    refreshes: 0,
-    issued: [],
-    expireIssuedTokens: () => liveAccess.clear(),
-    acceptsIssuedTokens: true,
-    listsNothing: false,
-    dropConnections: false,
-    rotateRefreshTokens: false,
-    grants: [],
     grantObservations: [],
     loanSearchCalls: [],
     configureIdpProvider(options) {
@@ -445,79 +344,29 @@ export function startArcadeStandIn(): ArcadeStandIn {
     clearToolGrantsForTest() {
       grantsByUser.clear();
     },
-    configureUserSource(options) {
-      userSource = options;
-    },
-    userSourceLogins: [],
     stop: () => server.stop(true),
-  };
-
-  const issue = (clientId: string) => {
-    const access = `gw-access-${crypto.randomUUID()}`;
-    const refresh = `gw-refresh-${crypto.randomUUID()}`;
-    refreshTokens.set(refresh, clientId);
-    if (state.acceptsIssuedTokens) liveAccess.add(access);
-    state.issued.push(access);
-    return {
-      access_token: access,
-      refresh_token: refresh,
-      token_type: "Bearer",
-      expires_in: state.tokenLifetimeSeconds,
-    };
-  };
-
-  /**
-   * A connection the gateway accepts and then closes without answering.
-   *
-   * A real drop rather than an error status: the body never produces a byte and
-   * the per-request idle timeout closes the socket underneath it, so the client
-   * sees the connection go away mid-request — *"The socket connection was
-   * closed unexpectedly"* — instead of reading a status code. That is the
-   * difference between "the gateway said no" and "there was nothing to say no",
-   * and `probeGatewayToken` is built on exactly that distinction.
-   */
-  const dropConnection = (request: Request, listener: { timeout(request: Request, seconds: number): void }) => {
-    listener.timeout(request, 1);
-    return new Response(new ReadableStream({ start() { /* never writes, never closes */ } }));
   };
 
   const server = Bun.serve({
     port: 0,
     idleTimeout: 30,
-    async fetch(request, listener) {
+    async fetch(request) {
       const url = new URL(request.url);
       const { pathname } = url;
 
-      // The gateway's MCP endpoint. Unauthenticated: a 401 that names where the
-      // protected-resource metadata lives, which is how discovery starts.
+      // The tool endpoint, as MCP. A bearer from `issueToolToken` names the
+      // actor; anything else is refused.
       if (pathname === `/mcp/${GATEWAY_ID}`) {
-        // The transport, dead. Answered before the method check so the SDK's
-        // SSE fallback dies the same way its streamable POST did — which is
-        // what makes the client report that it could reach the server by no
-        // available HTTP transport rather than that the credential was refused.
-        if (state.dropConnections) return dropConnection(request, listener);
         if (request.method !== "POST") return new Response(null, { status: 405 });
 
         const bearer = request.headers.get("authorization")?.replace(/^Bearer /i, "");
-        const unauthorized = () =>
-          new Response(JSON.stringify({ error: "invalid_token" }), {
-            status: 401,
-            headers: {
-              "www-authenticate":
-                `Bearer resource_metadata="${state.url}/.well-known/oauth-protected-resource/mcp/${GATEWAY_ID}"`,
-              "content-type": "application/json",
-            },
-          });
-        if (!bearer) return unauthorized();
-        state.bearers.push(bearer);
-        // An access token the gateway no longer accepts is refused here and
-        // nowhere else. Nothing tells the holder in advance.
-        if (!liveAccess.has(bearer)) return unauthorized();
+        if (!bearer || !liveAccess.has(bearer)) {
+          return Response.json({ error: "invalid_token" }, { status: 401 });
+        }
 
         const body = (await request.json()) as { id?: number; method?: string; params?: { name?: string } };
         if (body.method?.startsWith("notifications/")) return new Response(null, { status: 202 });
         if (body.method === "tools/list") {
-          if (state.listsNothing) return Response.json({ jsonrpc: "2.0", id: body.id, result: { tools: [] } });
           return Response.json({
             jsonrpc: "2.0",
             id: body.id,
@@ -592,165 +441,6 @@ export function startArcadeStandIn(): ArcadeStandIn {
             serverInfo: { name: "arcade-stand-in", version: "0.1.0" },
           },
         });
-      }
-
-      if (pathname === `/.well-known/oauth-protected-resource/mcp/${GATEWAY_ID}`) {
-        return Response.json({ resource: `${state.url}/mcp/${GATEWAY_ID}`, authorization_servers: [`${state.url}/`] });
-      }
-
-      if (pathname === "/.well-known/oauth-authorization-server") {
-        return Response.json({
-          issuer: `${state.url}/`,
-          authorization_endpoint: `${state.url}/oauth/authorize`,
-          token_endpoint: `${state.url}/oauth/token`,
-          registration_endpoint: `${state.url}/oauth/register`,
-          code_challenge_methods_supported: ["S256"],
-        });
-      }
-
-      if (pathname === "/oauth/register" && request.method === "POST") {
-        const body = (await request.json()) as { redirect_uris?: string[] };
-        const clientId = `mcp-client-${state.registrations.length + 1}`;
-        state.registrations.push({ client_id: clientId, redirect_uris: body.redirect_uris ?? [] });
-        return Response.json({ client_id: clientId, redirect_uris: body.redirect_uris }, { status: 201 });
-      }
-
-      // Arcade's own gateway consent screen — once per persona per MCP client
-      // id. Rendered as a form so the suite has to press it, the way a human
-      // does, rather than having the flow complete invisibly.
-      // A User Source gateway (#6) signs the person in at the User Source
-      // first. Parked by a key of its own, sent to the issuer's authorize
-      // under the User Source's client with PKCE, and resumed with `us=<key>`
-      // once the intermediate callback has read who it was.
-      if (pathname === "/oauth/authorize" && request.method === "GET" && userSource && !url.searchParams.has("us")) {
-        const key = crypto.randomUUID();
-        const verifier = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
-        const challenge = Buffer.from(
-          await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)),
-        ).toString("base64url");
-        parkedAuthorize.set(key, { query: url.search, verifier });
-        const brokered = new URL(userSource.endpoints.authorize);
-        brokered.search = new URLSearchParams({
-          response_type: "code",
-          client_id: userSource.clientId,
-          redirect_uri: `${state.url}/oauth2/intermediate_callback`,
-          scope: "openid email",
-          state: key,
-          code_challenge: challenge,
-          code_challenge_method: "S256",
-        }).toString();
-        return new Response(null, { status: 302, headers: { location: brokered.toString() } });
-      }
-
-      // Arcade's intermediate callback: redeem the User Source's code, read
-      // the ID token, check its issuer, and go back to the parked authorize.
-      if (pathname === "/oauth2/intermediate_callback" && request.method === "GET" && userSource) {
-        const key = url.searchParams.get("state") ?? "";
-        const parked = parkedAuthorize.get(key);
-        parkedAuthorize.delete(key);
-        const code = url.searchParams.get("code");
-        if (!parked || !code) return new Response("no such user source login", { status: 400 });
-        const half = (value: string) => new URLSearchParams({ v: value }).toString().slice(2);
-        const exchanged = await fetch(userSource.endpoints.token, {
-          method: "POST",
-          headers: {
-            "content-type": "application/x-www-form-urlencoded",
-            authorization: `Basic ${Buffer.from(`${half(userSource.clientId)}:${half(userSource.clientSecret)}`).toString("base64")}`,
-          },
-          body: new URLSearchParams({
-            grant_type: "authorization_code",
-            code,
-            redirect_uri: `${state.url}/oauth2/intermediate_callback`,
-            code_verifier: parked.verifier,
-          }).toString(),
-        });
-        const tokens = (await exchanged.json().catch(() => ({}))) as { id_token?: string };
-        if (!exchanged.ok || !tokens.id_token) {
-          return new Response(`Token exchange with identity provider failed: ${exchanged.status}`, { status: 502 });
-        }
-        const claims = JSON.parse(Buffer.from(tokens.id_token.split(".")[1]!, "base64url").toString("utf8")) as {
-          iss?: string;
-          email?: string;
-        };
-        if (claims.iss !== userSource.issuer) {
-          return new Response(`issuer mismatch: ${String(claims.iss)} is not ${userSource.issuer}`, { status: 502 });
-        }
-        if (!claims.email) return new Response("the ID token carried no email claim", { status: 502 });
-        const login = state.userSourceLogins.push({ iss: claims.iss, email: claims.email, access_token: null }) - 1;
-        const resume = crypto.randomUUID();
-        userSourceSubjects.set(resume, { email: claims.email, login });
-        const back = new URLSearchParams(parked.query);
-        back.set("us", resume);
-        return new Response(null, { status: 302, headers: { location: `/oauth/authorize?${back}` } });
-      }
-
-      if (pathname === "/oauth/authorize" && request.method === "GET") {
-        const query = url.search;
-        return new Response(
-          `<!doctype html><title>Arcade — allow access</title><form method="post" action="/oauth/authorize${query}">` +
-            `<button name="decision" value="allow">Allow</button></form>`,
-          { headers: { "content-type": "text/html; charset=utf-8" } },
-        );
-      }
-
-      if (pathname === "/oauth/authorize" && request.method === "POST") {
-        const clientId = url.searchParams.get("client_id") ?? "";
-        const redirectUri = url.searchParams.get("redirect_uri") ?? "";
-        state.consents.push(clientId);
-        const code = `gw-code-${crypto.randomUUID()}`;
-        const subject = userSourceSubjects.get(url.searchParams.get("us") ?? "");
-        codes.set(code, {
-          challenge: url.searchParams.get("code_challenge") ?? "",
-          clientId,
-          redirectUri,
-          ...(subject ? { subject } : {}),
-        });
-        const back = new URL(redirectUri);
-        back.searchParams.set("code", code);
-        back.searchParams.set("state", url.searchParams.get("state") ?? "");
-        return new Response(null, { status: 303, headers: { location: back.toString() } });
-      }
-
-      if (pathname === "/oauth/token" && request.method === "POST") {
-        const form = new URLSearchParams(await request.text());
-        state.grants.push(form.get("grant_type") ?? "");
-        if (form.get("grant_type") === "refresh_token") {
-          const presented = form.get("refresh_token") ?? "";
-          const clientId = refreshTokens.get(presented);
-          if (!clientId || clientId !== form.get("client_id")) {
-            return Response.json({ error: "invalid_grant" }, { status: 400 });
-          }
-          state.refreshes += 1;
-          // A rotating server hands back a new refresh token and stops taking
-          // the old one, so a caller that does not store what came back has
-          // spent the browser's session rather than extended it.
-          if (state.rotateRefreshTokens) refreshTokens.delete(presented);
-          return Response.json(issue(clientId));
-        }
-
-        const record = codes.get(form.get("code") ?? "");
-        if (!record) return Response.json({ error: "invalid_grant" }, { status: 400 });
-        codes.delete(form.get("code")!);
-        // PKCE, checked rather than accepted: a stand-in that ignores the
-        // verifier would let a broken challenge pass every test here.
-        const digest = await crypto.subtle.digest(
-          "SHA-256",
-          new TextEncoder().encode(form.get("code_verifier") ?? ""),
-        );
-        if (Buffer.from(digest).toString("base64url") !== record.challenge) {
-          return Response.json({ error: "invalid_grant", error_description: "PKCE verification failed" }, { status: 400 });
-        }
-        if (form.get("client_id") !== record.clientId) {
-          return Response.json({ error: "invalid_client" }, { status: 400 });
-        }
-        const issued = issue(record.clientId);
-        // A User Source gateway's token is that person's: the bearer every
-        // later tool call carries names whoever the User Source signed in.
-        if (record.subject) {
-          actors.set(issued.access_token, record.subject.email.trim().toLowerCase());
-          state.userSourceLogins[record.subject.login]!.access_token = issued.access_token;
-        }
-        return Response.json(issued);
       }
 
       // Hop 2. The project API key is demanded, because the real one does.
@@ -925,26 +615,17 @@ export interface IdentityHarnessOptions {
    * the port with `freePort()` first and pass the callback here.
    */
   extraWebRedirectUris?: readonly string[];
-  /**
-   * Make the gateway a User Source gateway whose User Source is the identity
-   * provider (#6): the one client also allowlists the stand-in's intermediate
-   * callback, and the stand-in brokers hop 1's login to it. Off by default, so
-   * a suite about something else sees the gateway it saw before.
-   */
-  userSource?: boolean;
 }
 
-/** The one client the app, the provider leg and the User Source share, as `bun run okta-setup` makes one. */
+/** The one client the app and the provider leg share, as `bun run okta-setup` makes one. */
 export const HARNESS_CLIENT_ID = "0oa-identity-suite";
 
 export async function startIdentityHarness(
   options: IdentityHarnessOptions = {},
 ): Promise<IdentityHarness> {
-  // Registration is a module-level cache keyed by gateway URL, and every run of
-  // this harness stands a new one up on a new port. Clearing it is what keeps
-  // one suite's registration out of the next suite's flow. Discovery is cached
-  // per issuer the same way.
-  forgetGatewayClients();
+  // Discovery is a module-level cache keyed by issuer, and every run of this
+  // harness stands a new one up on a new port. Clearing it is what keeps one
+  // suite's provider out of the next suite's flow.
   forgetDiscovery();
 
   const arcade = startArcadeStandIn();
@@ -962,7 +643,6 @@ export async function startIdentityHarness(
         redirectUris: [
           `${webUrl}/api/auth/callback`,
           `${arcade.url}/idp/callback`,
-          ...(options.userSource ? [`${arcade.url}/oauth2/intermediate_callback`] : []),
           ...(options.extraWebRedirectUris ?? []),
         ],
       },
@@ -970,15 +650,6 @@ export async function startIdentityHarness(
     managementToken: TEST_OKTA_TOKEN,
   });
   const idpUrl = idp.issuer;
-
-  if (options.userSource) {
-    arcade.configureUserSource({
-      issuer: idp.issuer,
-      endpoints: { authorize: idp.endpoints.authorize, token: idp.endpoints.token },
-      clientId: HARNESS_CLIENT_ID,
-      clientSecret,
-    });
-  }
 
   // The same client is the provider leg in the focused hop-2 regression, as
   // the `app-identity` provider is in production. The callback is a route on
@@ -996,7 +667,6 @@ export async function startIdentityHarness(
     ARCADE_API_URL: arcade.url,
     ARCADE_API_KEY: ARCADE_API_KEY,
     ARCADE_CLOUD_URL: arcade.url,
-    ARCADE_GATEWAY_ID: GATEWAY_ID,
     APP_PUBLIC_HOST: `localhost:${webPort}`,
     IDP_ISSUER: idp.issuer,
     IDP_CLIENT_ID: HARNESS_CLIENT_ID,
@@ -1012,8 +682,6 @@ export async function startIdentityHarness(
       if (pathname === "/api/auth/signin") return signin(request, config);
       if (pathname === "/api/auth/callback") return signinCallback(request, config);
       if (pathname === "/api/auth/signout" && request.method === "POST") return signout(request, config);
-      if (pathname === "/api/arcade/start") return gatewayStart(request, config);
-      if (pathname === "/api/arcade/callback") return gatewayCallback(request, config);
       if (pathname === "/api/arcade/verify") return verify(request, config);
       // Stands in for the app shell: the landing page a completed sign-in
       // reaches. It renders no form, so the browser stops here.
@@ -1076,17 +744,20 @@ export async function prepareProviderCode(
  * Sign a persona in from scratch: press their button, land on the IdP, type the
  * password, and come back.
  *
- * Returns where the chain ended, so a caller can assert it reached hop 1 rather
- * than an error page.
+ * Returns where the chain ended, so a caller can assert it reached the app
+ * rather than an error page. `stopAtLanding` stops on the redirect to the app's
+ * landing page (`CHAT_PAGE`) without fetching it: a booted app renders a
+ * `Sign out` form there, and walking into it would sign the persona out again.
  */
 export async function signInAs(
   browser: Browser,
   /** Where sign-in starts: this harness, or a booted app. */
   harness: Pick<IdentityHarness, "webUrl">,
   persona: PersonaKey,
-  options: { from?: string; stopAt?: string } = {},
+  options: { from?: string; stopAt?: string; stopAtLanding?: boolean } = {},
 ): Promise<{ url: string; response: Response; html: string }> {
   const person = PEOPLE[persona];
+  const landing = new URL(CHAT_PAGE, harness.webUrl).toString();
   return browser.follow(
     options.from ?? `${harness.webUrl}/api/auth/signin?persona=${persona}`,
     (fields) => {
@@ -1101,6 +772,9 @@ export async function signInAs(
       if ("decision" in fields) filled.decision = "allow";
       return filled;
     },
-    { ...(options.stopAt !== undefined && { stopAt: options.stopAt }) },
+    {
+      ...(options.stopAt !== undefined && { stopAt: options.stopAt }),
+      ...(options.stopAtLanding && { stopAtUrl: landing }),
+    },
   );
 }

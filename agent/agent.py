@@ -2,8 +2,10 @@
 
 One middleware does the Arcade work: Sam Partee's `ArcadeMiddleware` (vendored in
 `langchain_arcade/`) finds tools with `arcade_select_tools` and calls them through the
-Arcade engine. Selection is scoped to the workshop's gateway, so the agent sees the six
-LoanDesk tools plus Gmail and Slack, and nothing else in the catalogue.
+Arcade engine directly, with the project key. There is no gateway, so Tool Rec is not
+scoped to the loan desk: it may also offer catalog tools such as Ashby or ClickUp. That is
+fine because nothing relies on search to hide a tool. The project's hooks govern every call,
+whichever tool the model picked.
 
 Every call is made as the signed-in person. MDA verifies the caller's ID token from the
 app's identity provider (`identity.py`) and hands the verified email to the middleware as
@@ -32,10 +34,14 @@ def signed_in_user(runtime) -> str | None:
     return user if isinstance(user, str) and "@" in user else None
 
 
+# The provider falls back to `$ARCADE_GATEWAY_ID` when no gateway is passed. An older .env
+# or deployment may still set it, and a gateway that has since been deleted would break
+# selection, so it is dropped here rather than left to chance.
+os.environ.pop("ARCADE_GATEWAY_ID", None)
+
 provider = EngineProvider(
     api_key=os.environ.get("ARCADE_API_KEY"),
     user_id_resolver=signed_in_user,
-    gateway_id=os.environ.get("ARCADE_GATEWAY_ID"),
 )
 
 agent = define_deep_agent(

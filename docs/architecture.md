@@ -32,7 +32,7 @@ Conflating them cost a day. The full diagram is in [`DESIGN.md`](../DESIGN.md#id
 
 | | hop | mechanism |
 |---|---|---|
-| **1** | MCP client → gateway | the gateway's **User Source**, whose issuer is Okta, the app's identity provider |
+| **1** | the agent → Arcade's Engine | the **project API key**, with the caller's email as `user_id`, which the agent takes from the Okta ID token it verified. No gateway, no User Source |
 | **2** | tool → the loan API | the `app-identity` auth provider, plus a **custom user verifier** route in the app, `/api/arcade/verify` |
 | **2** | `LoanDesk_RequestApproval` → Slack | Arcade's stock Slack provider, which goes through **Arcade's own verifier**: the requester must be a member of the Arcade project |
 
@@ -45,8 +45,8 @@ Neither mechanism moves the other. Arcade's default verifier demands an Arcade a
 One TypeScript app at the repo root (Next.js, running on Bun), one Python MCP server and one Python agent:
 
 ```
-agent/                     The LangChain Deep Agent, on Managed Deep Agents. Its tools come from the
-                           Arcade gateway; it holds no limits. agent/README.md and docs/agent.md.
+agent/                     The LangChain Deep Agent, on Managed Deep Agents. It calls Arcade's Engine
+                           directly with the project key; it holds no limits. agent/README.md and docs/agent.md.
 gate/service/              /hooks/access, /hooks/pre, /hooks/post: the policy engine, audit log and event
                            stream. Owns governance.db. The policies are gate/policies/governance.json.
                            `bun run gate` starts it (with the rest of the app) and prints the rules.

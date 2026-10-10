@@ -49,7 +49,7 @@ const BAR_HEIGHT = 34;
  * A deployment with nothing missing, so `/` renders without #84's banner.
  *
  * None of these values is used against anything: no page in this file signs
- * anybody in, opens a gateway session or sends a message. They exist because
+ * anybody in, calls Arcade or sends a message. They exist because
  * `configurationProblems` counts absences, and the banner is the subject of the
  * last test rather than a fixture of the first three.
  */
@@ -58,7 +58,6 @@ const CONFIGURED: Record<string, string> = {
   IDP_ISSUER: "http://127.0.0.1:9/oauth2/default",
   IDP_CLIENT_ID: "web",
   IDP_CLIENT_SECRET: "not-used-by-this-test",
-  ARCADE_GATEWAY_ID: "cg-demo-us",
   ARCADE_API_KEY: "not-used-by-this-test",
   ARCADE_TOOLKIT: "LoanDesk",
   SESSION_SECRET: "frame-test-session-secret-at-least-32-chars",
@@ -77,7 +76,7 @@ interface Browser {
  * No session cookie and no stand-ins. Every page under test answers without a
  * network call when nobody is signed in — `homeSurface` and `readLoanBook` both
  * short-circuit on a `null` session — so the frame can be measured against the
- * real App Router without an IdP, a gateway or a loan book behind it. The
+ * real App Router without an IdP, Arcade or a loan book behind it. The
  * surfaces' own tests own the rest.
  */
 async function withBrowser(
@@ -392,12 +391,12 @@ test.skipIf(chromeResolution.path === null && !REQUIRED)(
     // #84 round 2: a deployment that renders a perfectly normal page and fails
     // at the point of use. The banner is the answer to it, and the frame may
     // not bury it, push it below the bank's chrome, or cover it.
-    await withBrowser({ ...CONFIGURED, ARCADE_GATEWAY_ID: "" }, async (browser) => {
+    await withBrowser({ ...CONFIGURED, ARCADE_API_KEY: "" }, async (browser) => {
       await browser.open("/");
 
       const html = await evaluate<string>(browser.cdp, `document.documentElement.outerHTML`);
       expect(html).toContain("This deployment is not fully configured");
-      expect(html).toContain("ARCADE_GATEWAY_ID is not set");
+      expect(html).toContain("ARCADE_API_KEY is not set");
 
       // Order in the served document: the bar, then the banner, then the bank's
       // own chrome. Not a screenshot — the order itself.

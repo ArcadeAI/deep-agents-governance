@@ -6,12 +6,10 @@
  * is held to the builder that sends it.
  */
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { gatewayBody, pluginBody, providerBody, verifierBody } from "../scripts/setup-arcade/arcade.ts";
-import { userSourceBody } from "../scripts/setup-arcade/coordinator.ts";
-import { serverName } from "../scripts/setup-arcade/toolkit.ts";
+import { pluginBody, providerBody, verifierBody } from "../scripts/setup-arcade/arcade.ts";
 
 const REPO = join(import.meta.dir, "..");
 const HOST = "<APP_PUBLIC_HOST>";
@@ -27,20 +25,9 @@ const ENDPOINTS = {
   userinfo: `${ISSUER}/v1/userinfo`,
 };
 
-/** `loan_desk` as Arcade prefixes its tools: `LoanDesk` (`mcp/loan_desk/app.py`). */
-const TOOLKIT = serverName(join(REPO, "mcp"))!
-  .split("_")
-  .map((word) => word[0]!.toUpperCase() + word.slice(1))
-  .join("");
-
 const read = (name: string) => JSON.parse(readFileSync(join(REPO, "auth-config", name), "utf8"));
 
 const EXPECTED: Record<string, unknown> = {
-  "user-source.json": userSourceBody({
-    issuer: ISSUER,
-    clientId: "<IDP_CLIENT_ID>",
-    clientSecret: "<IDP_CLIENT_SECRET>",
-  }),
   "app-identity-provider.json": providerBody({
     host: HOST,
     origin: ORIGIN,
@@ -51,11 +38,6 @@ const EXPECTED: Record<string, unknown> = {
   }),
   "custom-verifier.json": verifierBody(ORIGIN),
   "hooks-plugin.json": pluginBody(ORIGIN, "<ARCADE_HOOK_SIGNING_SECRET>", "active"),
-  "gateway.json": gatewayBody({
-    slug: "<ARCADE_GATEWAY_ID>",
-    userSourceId: "<USER_SOURCE_ID>",
-    toolkit: TOOLKIT,
-  }),
 };
 
 describe("auth-config/", () => {
@@ -68,6 +50,14 @@ describe("auth-config/", () => {
   test("README.md names every file in the folder", () => {
     const readme = readFileSync(join(REPO, "auth-config", "README.md"), "utf8");
     for (const name of Object.keys(EXPECTED)) expect(readme).toContain(`\`${name}\``);
+  });
+
+  test("the folder holds exactly those files: no User Source or gateway body is left", () => {
+    // The agent calls the Engine directly with the project key, so there is no
+    // User Source or MCP gateway to register. A body left here would have a
+    // dashboard user create one the app never uses.
+    const files = readdirSync(join(REPO, "auth-config")).filter((name) => name.endsWith(".json"));
+    expect(files.sort()).toEqual(Object.keys(EXPECTED).sort());
   });
 
   test("no file holds a value of its own where a placeholder belongs", () => {

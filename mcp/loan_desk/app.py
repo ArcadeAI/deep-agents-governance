@@ -5,7 +5,7 @@ deployment as, and `loan_desk` PascalCased — `LoanDesk` — is the toolkit nam
 prefixes every tool with: `LoanDesk_SearchLoans`, `LoanDesk_RequestApproval`.
 `ARCADE_TOOLKIT` in `.env` and the `$TOOLKIT` placeholder in
 `governance.json` both mean this name, so a rule keyed on `LoanDesk.ApproveLoan`
-matches the call the gateway makes.
+matches the call Arcade makes.
 
 The tools live one file each next to this one — `loans.py`, `approvals.py` and its
 helpers — and each does `from loan_desk.app import app` and

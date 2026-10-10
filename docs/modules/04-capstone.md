@@ -8,9 +8,9 @@ Run the whole story on your own build, end to end, from `ask.py`:
 
 Watch the panel. Access hid a tool from Bob earlier; pre refuses Alice and routes to
 Charlie; post masks the identifiers and strips the note. Once Charlie approves and the
-retry lands, the agent emails the borrower the outcome from Alice's own Gmail, on the same
-gateway and under the same hooks. Then edit one rule on stage — `bun run users set-clearance`, or an
-`UPDATE output_rules` in `governance.db` — and run the prompt again.
+retry lands, the agent emails the borrower the outcome from Alice's own Gmail, under the same
+hooks. Then edit one rule on stage, with `bun run users set-clearance` or an
+`UPDATE output_rules` in `governance.db`, and run the prompt again.
 
 ## Fork it
 
@@ -22,7 +22,7 @@ keep the test that fails if the business system learns the word "policy".
 
 | tag | state |
 |---|---|
-| `start` | The Deep Agent, the gateway and the control plane. Modules 1 and 2 run here. |
+| `start` | The Deep Agent and the control plane. Modules 1 and 2 run here. |
 | `capstone` | Plus these docs and `/walkthrough`. |
 
 The tags still point at the Mastra template's commits; they are re-cut on this repository

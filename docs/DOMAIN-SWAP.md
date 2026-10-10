@@ -313,7 +313,7 @@ Two places reference the issuer from outside and both are configuration rather t
 
 | | |
 |---|---|
-| **Arcade** | one custom OAuth provider (hop 2, id `app-identity`) and one User Source (hop 1), both registered by `bun run setup-arcade` from `IDP_ISSUER`'s discovery document. Rerun it after repointing |
+| **Arcade** | one custom OAuth provider (hop 2, id `app-identity`), registered by `bun run setup-arcade` from `IDP_ISSUER`'s discovery document. Rerun it after repointing. There is no User Source: the agent calls the Engine directly as the email it verified |
 | **`api/`** | validates bearer tokens at the issuer's discovered userinfo endpoint (`api/actor.ts`) and reads `$.email` |
 
 The application seam is one function pair:
@@ -321,7 +321,7 @@ The application seam is one function pair:
 | | |
 |---|---|
 | **the seam** | `auth/session.ts` — `readSession(request)`, `readSessionFromCookies(jar)` |
-| **returns** | `Session { email, gateway?, signed_in_at }`, or `null` |
+| **returns** | `Session { email, idp?, signed_in_at }`, or `null` |
 | **callers** | `lib/approval-status.ts`, `lib/approvals/opener.ts`, `auth/handlers.ts`, `app/api/loans/route.ts`, `app/loans/page.tsx`, `app/page.tsx` |
 | **keep** | the two signatures, and `email` being the join key |
 | **replace** | `auth/oidc.ts`, `auth/personas.ts`, `auth/roster.ts`, `components/identity/SessionChrome.tsx`, if your app has a sign-in of its own |
@@ -331,15 +331,12 @@ the address your directory knows the person by. Nothing downstream reads an iden
 from anywhere else — the verifier refuses a request that tries to carry one with a
 `400`.
 
-The `gateway` field is the one thing to think about rather than swap: it holds this
-person's Arcade gateway token, which is how the tool call reaches Arcade as them. A
-real IdP replaces how the **session** is established, not hop 1.
-`auth/handlers.ts::liveGatewayToken` stays.
+The `idp` field holds this person's IdP tokens, which the bank's own screens read the
+loan book with. Nothing in the session reaches Arcade: the agent calls the Engine with
+the project key and the email it verified from the caller's ID token.
 
-> ⚠️ Your IdP must publish a `jwks_uri` with RS256 keys, or Arcade will not accept it as
-> a User Source — measured against a real Arcade project, where an IdP with HS256 ID
-> tokens and no key set was refused at the form. Any real enterprise IdP does this; this
-> template's own provider had to be changed to.
+> ⚠️ Your IdP must publish a `jwks_uri` with RS256 keys: the agent verifies ID tokens
+> against it (`agent/identity.py`). Any real enterprise IdP does this.
 
 ---
 
@@ -409,7 +406,7 @@ of #150's review.
 > is the IdP access token from that browser's own sign-in, and `api/` derives
 > the actor from it — so swap in your API and your IdP, never a shared secret.
 >
-> **These reads deliberately do *not* go through the gateway (#157, reversing #22 and
+> **These reads deliberately do *not* go through Arcade (#157, reversing #22 and
 > #109).** They used to, and the argument was that every read of the system of record
 > should pass the control plane. Two things were wrong with it in front of an audience:
 > a page load put governed tool calls on the control plane before the presenter had
@@ -624,7 +621,7 @@ try once it runs is its Try it out section.
 - [ ] `gate/policies/governance.json` rewritten: catalogue, demo cast, policy rules, output rules
 - [ ] Your people added with `bun run users add`, or, with your own IdP, each given a `subjects` row under the email it asserts
 - [ ] Every injection pattern has both halves of a corpus entry; `bun test ./app-test/control-plane/` green
-- [ ] `IDP_ISSUER` pointed at your IdP, or `readSession` at your own sign-in; `bun run setup-arcade` rerun so Arcade's provider and User Source follow
+- [ ] `IDP_ISSUER` pointed at your IdP, or `readSession` at your own sign-in; `bun run setup-arcade` rerun so Arcade's provider follows
 - [ ] `"cg": { "governed": true }` on your app's manifest, and its `knows-nothing` test shipped
 - [ ] Both boundary tests green
 - [ ] One act driven end to end, and a `/pre` row in the audit log with your `user_id` on it

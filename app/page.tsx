@@ -16,19 +16,19 @@
  *
  * A **server** component, and it does two things a client one could not:
  *
- * 1. It unseals the session here, so the gateway tokens in the cookie never
- *    reach the browser. `SessionChrome` is rendered on this side of the
+ * 1. It unseals the session here, so the tokens in the cookie never reach the
+ *    browser. `SessionChrome` is rendered on this side of the
  *    boundary and handed down as an element, so only what it prints crosses.
  *    Since #176 that element is the session controls in the bank's top chrome
- *    — the gateway token's expiry, and `Sign out` or `Sign in` — rather than a
+ *    — `Sign out` or `Sign in` — rather than a
  *    card of four "Sign in as …" persona buttons below the loan files. One
  *    Chrome profile per persona is the real demo shape, so a switcher read as
  *    the most demo-looking thing on a screen arguing that nothing here is a
  *    mock.
- * 2. It reads the loan book, not from the gateway: `readLoanBook` calls the
+ * 2. It reads the loan book, not through Arcade: `readLoanBook` calls the
  *    loan module in-process with this browser's IdP bearer, so the first paint
  *    is already correct and the cards poll `GET /api/loans` from then on.
- *    `lib/loan-context/loans.ts` has the argument. Loading `/` makes no gateway
+ *    `lib/loan-context/loans.ts` has the argument. Loading `/` makes no Arcade
  *    call and no governed tool call: every MCP call in the demo starts in the
  *    agent, which is what keeps the panel legible.
  *

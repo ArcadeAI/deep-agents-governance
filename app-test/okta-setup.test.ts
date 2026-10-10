@@ -20,11 +20,11 @@ import {
   ACCESS_POLICY_NAME,
   APP_LABEL,
   oktaSetup,
+  AGENT_SIGNIN_CALLBACK,
   redirectUris,
   SIGN_ON_POLICY_NAME,
   USERS_GROUP,
 } from "../scripts/okta/setup.ts";
-import { AGENT_SIGNIN_CALLBACK, USER_SOURCE_CALLBACK } from "../scripts/setup-arcade/coordinator.ts";
 import { childEnv } from "./child-env.ts";
 import { spawnChild } from "./child.ts";
 
@@ -168,7 +168,7 @@ describe("oktaSetup, against a fake org", () => {
     const app = org.state.apps[0]!;
     expect(app.label).toBe(APP_LABEL);
     expect(((app.settings as Json).oauthClient as Json).grant_types).toEqual(["authorization_code", "refresh_token"]);
-    expect(redirectsOf(app)).toEqual(["https://desk.example/api/auth/callback", AGENT_SIGNIN_CALLBACK, USER_SOURCE_CALLBACK]);
+    expect(redirectsOf(app)).toEqual(["https://desk.example/api/auth/callback", AGENT_SIGNIN_CALLBACK]);
     expect(result.clientId).toBe(String(((app.credentials as Json).oauthClient as Json).client_id));
     // The secret Okta returned on create is the one handed back, and no second one was made.
     expect(result.clientSecret).toBe(org.state.secrets[0]!);
@@ -198,7 +198,7 @@ describe("oktaSetup, against a fake org", () => {
     expect(second.clientSecret).toBeNull();
     expect(org.state.apps).toHaveLength(1);
     expect(org.state.secrets).toHaveLength(1);
-    expect(second.lines).toContain("  its 3 redirect URIs are already there");
+    expect(second.lines).toContain("  its 2 redirect URIs are already there");
   });
 
   test("a run after setup-arcade adds the provider callback, keeping every URI the app had", async () => {
@@ -216,7 +216,6 @@ describe("oktaSetup, against a fake org", () => {
     expect(redirectsOf(org.state.apps[0]!)).toEqual([
       "https://desk.example/api/auth/callback",
       AGENT_SIGNIN_CALLBACK,
-      USER_SOURCE_CALLBACK,
       "https://elsewhere.example/callback",
       PROVIDER_CALLBACK,
     ]);
@@ -250,13 +249,17 @@ describe("oktaSetup, against a fake org", () => {
   });
 
   test("the redirect URIs: the app's own only with a public host, the provider's only once known", () => {
-    expect(redirectUris({ origin: null, providerCallback: null })).toEqual([AGENT_SIGNIN_CALLBACK, USER_SOURCE_CALLBACK]);
+    expect(redirectUris({ origin: null, providerCallback: null })).toEqual([AGENT_SIGNIN_CALLBACK]);
     expect(redirectUris({ origin: "https://a.example", providerCallback: PROVIDER_CALLBACK })).toEqual([
       "https://a.example/api/auth/callback",
       AGENT_SIGNIN_CALLBACK,
-      USER_SOURCE_CALLBACK,
       PROVIDER_CALLBACK,
     ]);
+    // No User Source, so no Arcade intermediate callback: the agent calls the
+    // Engine directly and nothing signs in at Okta through Arcade but hop 2.
+    expect(redirectUris({ origin: "https://a.example", providerCallback: PROVIDER_CALLBACK }).join(" ")).not.toContain(
+      "intermediate_callback",
+    );
   });
 
   test("the token is sent to the org and nowhere else", async () => {

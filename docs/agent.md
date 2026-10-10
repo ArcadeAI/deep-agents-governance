@@ -12,13 +12,15 @@ owns. [`agent/README.md`](../agent/README.md) has the commands.
 2. **MDA checks the token.** `agent/identity.py` accepts only a token `IDP_ISSUER` signed, for
    the app's client id as audience. The `email` claim becomes the run's principal.
 3. **The agent selects its tools.** The model sees one tool, `arcade_select_tools`. It
-   describes the task, and Arcade answers with the tools that fit from the gateway
-   `ARCADE_GATEWAY_ID` names, and from nowhere else. The chosen tools are promoted under their
-   own names, such as `LoanDesk_SearchLoans`, and the model calls them directly.
-4. **Every call carries the caller.** The middleware executes each tool through Arcade's API
-   with the principal's email as the user id. Arcade runs the contextual access hooks on it,
+   describes the task, and Arcade answers with the tools that fit. There is no gateway, so
+   the search is not scoped to the loan desk: it may return an unrelated catalog tool, such
+   as Ashby or ClickUp. The chosen tools are promoted under their own names, such as
+   `LoanDesk_SearchLoans`, and the model calls them directly.
+4. **Every call carries the caller.** The middleware executes each tool through Arcade's
+   Engine, with the project key and the principal's email as the user id. Arcade runs the contextual access hooks on it,
    so `/hooks/pre` decides on Alice's authority, and `/hooks/post` redacts what Alice may not
-   see before the model reads it.
+   see before the model reads it. That holds for every tool, the unrelated ones included:
+   the hooks govern the call, not the search that found it.
 5. **The answer goes back to the terminal.** `ask.py` prints each call, each result and the
    answer.
 
@@ -27,18 +29,18 @@ owns. [`agent/README.md`](../agent/README.md) has the commands.
 - **The agent** owns the conversation: the model, the instructions, which tools to look for.
   It holds no limits and decides nothing about authority. A refusal reaches it as a tool
   result, in the hook's own words.
-- **Arcade** owns the tools and who may call them: the gateway's tool set, the authorization
-  each provider needs, and the hooks on every call.
+- **Arcade** owns the tools and who may call them: the catalog, the authorization each
+  provider needs, and the hooks on every call.
 - **The app** owns identity and policy: the people, their roles and clearances, the rules in
   `gate/policies/governance.json`, the approvals, and the audit on `/panel`.
 
-## The gateway's nine tools
+## The nine tools the demo uses
 
 The six loan desk tools from the one `arcade deploy` (`SearchLoans`, `GetLoan`,
 `ApproveLoan`, `DenyLoan`, `RequestApproval`, `Decide`), and Arcade's own
-`Gmail.SendEmail`, `Gmail.ListEmails` and `Slack.SendMessage`. `bun run setup-arcade` creates
-the gateway with exactly these, and adds Gmail and Slack to a gateway it created before they
-were part of it.
+`Gmail.SendEmail`, `Gmail.ListEmails` and `Slack.SendMessage`. Nothing narrows the agent to
+these: with no gateway, Tool Rec searches the project's whole catalog. The policy in
+`gate/policies/governance.json` is what decides which tools each caller sees and runs.
 
 ## When a tool needs authorizing
 

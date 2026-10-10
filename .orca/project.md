@@ -199,7 +199,8 @@ Gate through the human regardless of slice:
 - **Anything a new user or forker sees first:** the README quickstart, the
   rehearsal runbook, shipped defaults and config templates.
 - **Anything touching identity, authorization or the access model** — the two
-  hops, the User Source gateway hop, the verifier tool hop.
+  hops: the agent's direct Engine call as the signed-in email (no gateway, no User
+  Source), and the verifier tool hop.
 - **The only Python in this project is `tools/`.** A slice once turned the loan
   tools into Python against an explicit constraint and no gate caught it.
 - `docs/PRESENTATION-BRIEF.md` is untracked and excluded on purpose because it
@@ -208,7 +209,10 @@ Gate through the human regardless of slice:
 - The personas are **Alice, Bob, Charlie and Michael at `@megaforce.tech`**.
   `dana`/`sam`/`riley`/`morgan` are internal keys only, and `@bank.example` is
   the local fixture — it must never reach anything audience-facing.
-- **Never Arcade Headers mode**, for any gateway, as an option, fallback or aside.
+- **No gateway.** The agent calls the Engine directly with the project key and the
+  signed-in email as `user_id`. Tool Rec is unscoped, so it may suggest unrelated
+  catalog tools; the hooks govern every call. Never Arcade Headers mode either, as
+  an option, fallback or aside.
 - **The README follows Mastra's exact outline** (see
   `.orca/local/human/mastra-contributing-guide.md`) and is rewritten in its own slice.
   Don't edit it piecemeal.
@@ -219,8 +223,7 @@ Gate through the human regardless of slice:
   the Next.js app, running on Bun: the chat, the control-plane panel, the
   approval pages. Its old service README is `docs/app.md`.
 - `src/mastra/index.ts` — the Studio entry, registering the chat route's own
-  agent. Every gateway bearer comes from `gatewayToken()`
-  (`lib/agent/gateway-token.ts`).
+  agent. (Historical: it no longer exists here, and neither does a gateway bearer.)
 - `gate/service/` — the control plane, served under `/hooks/*`
   (`/hooks/pre`, `/hooks/post`, `/hooks/access`, `/hooks/health` in Arcade's
   enum, the audit log, the event stream). The approvals store is

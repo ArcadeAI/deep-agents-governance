@@ -52,14 +52,13 @@ const STREAM_KEYS = [
   "GOVERNANCE_STREAM",
   "APP_PUBLIC_HOST",
   "NODE_ENV",
-  // Identity, because `/health`'s `status` folds four fields together and
+  // Identity, because `/health`'s `status` folds three fields together and
   // "degraded" proves nothing about the panel on a deployment where sign-in is
   // also unset — which is every deployment this suite builds by default.
   "IDP_ISSUER",
   "IDP_CLIENT_ID",
   "IDP_CLIENT_SECRET",
   "SESSION_SECRET",
-  "ARCADE_GATEWAY_ID",
   "ARCADE_API_KEY",
 ] as const;
 
@@ -124,7 +123,6 @@ const IDENTITY = {
   IDP_CLIENT_ID: "client-c",
   IDP_CLIENT_SECRET: "client-c-secret",
   SESSION_SECRET: "3f9a1c7e5b2d84069a1fe73c05b8d42e6c917ab3fd50e28c47196baf3d0c5e81",
-  ARCADE_GATEWAY_ID: "cg-demo-us",
   ARCADE_API_KEY: "arcade-key",
 };
 
@@ -175,7 +173,6 @@ describe("a deployed panel that was never told which stream to watch", () => {
     expect(body).toMatchObject({
       status: "degraded",
       signin: "configured",
-      gateway: "configured",
       verifier: "configured",
       panel_stream: "unconfigured",
     });

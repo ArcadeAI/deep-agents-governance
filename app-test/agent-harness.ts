@@ -275,7 +275,6 @@ export async function startAgentHarness(
   const config = readIdentitySurface({
     ARCADE_API_URL: gateway.url,
     ARCADE_API_KEY: "arcade-key-for-agent-tests",
-    ARCADE_GATEWAY_ID: GATEWAY_ID,
     ARCADE_TOOLKIT: LOAN_TOOLKIT,
     SESSION_SECRET,
     APP_PUBLIC_HOST: "localhost:1",

@@ -1,6 +1,6 @@
 /**
- * The session controls in the bank's top chrome: the gateway token, and the one
- * button that changes who this browser is.
+ * The session controls in the bank's top chrome: the one button that changes
+ * who this browser is.
  *
  * ## What this replaced, and why
  *
@@ -20,19 +20,12 @@
  * already true when there were four buttons, and is the reason the buttons were
  * never an identity.
  *
- * ## The gateway token row is not decoration
+ * ## No gateway token row
  *
- * It stays because the human reads it during rehearsals to answer *"is my hop-1
- * token still good"*, and because `DESIGN.md` records that hop 2's token is
- * `expires_in` 3600 with no refresh — a rehearsal longer than an hour costs an
- * authorization card per persona whatever else happens. Three states, not two
- * (#94): `none` is a hop nobody has run and `rejected` is a hop that ran and
- * whose result the gateway has since refused, and collapsing them once sent a
- * person looking for a missing toolkit.
- *
- * Never the token, and never a prefix of it. Whether one is held and when it
- * expires is everything anybody needs to see; the value is a bearer for the
- * whole gateway.
+ * Until the gateway-free refactor this chrome also showed whether a hop-1
+ * gateway token was held. There is no hop 1 now: the agent calls the Engine
+ * directly with the project key, as the signed-in person, so there is no
+ * bearer here to report on.
  *
  * ## No client JavaScript
  *
@@ -43,7 +36,7 @@
  * `components/identity/ConfigurationBanner.tsx`, placed by the pages, and its
  * own file says why.
  */
-import { SIGNIN_PATH, SIGNOUT_PATH, GATEWAY_START_PATH } from "../../auth/handlers.ts";
+import { SIGNIN_PATH, SIGNOUT_PATH } from "../../auth/handlers.ts";
 import type { ConfigurationProblems } from "../../lib/config.ts";
 import type { Session } from "../../auth/session.ts";
 
@@ -68,12 +61,6 @@ const row: React.CSSProperties = {
   lineHeight: 1.4,
 };
 
-const label: React.CSSProperties = {
-  letterSpacing: "0.09em",
-  textTransform: "uppercase",
-  color: "var(--muted)",
-};
-
 const control: React.CSSProperties = {
   border: "1px solid var(--line)",
   borderRadius: "2px",
@@ -96,32 +83,12 @@ export function SessionChrome({ session, problems }: SessionChromeProps) {
 
   return (
     <div style={row} data-session-chrome="">
-      <span style={label}>Gateway token</span>
-      <span data-gateway-token={session?.gateway ? "held" : session?.gateway_rejected_at ? "rejected" : "none"}>
-        {session?.gateway ? (
-          <>held, expires {new Date(session.gateway.expires_at).toISOString()}</>
-        ) : session?.gateway_rejected_at ? (
-          <span style={{ color: "#8a6100" }}>
-            rejected at {new Date(session.gateway_rejected_at).toISOString()} — authorize again
-          </span>
-        ) : (
-          <span style={{ color: "var(--muted)" }}>none</span>
-        )}
-      </span>
-
       {session ? (
-        <>
-          {session.gateway ? null : (
-            <a href={GATEWAY_START_PATH} style={control}>
-              Authorize the gateway
-            </a>
-          )}
-          <form action={SIGNOUT_PATH} method="post" style={{ margin: 0 }}>
-            <button type="submit" style={control}>
-              Sign out
-            </button>
-          </form>
-        </>
+        <form action={SIGNOUT_PATH} method="post" style={{ margin: 0 }}>
+          <button type="submit" style={control}>
+            Sign out
+          </button>
+        </form>
       ) : signinBroken ? (
         <button
           type="button"

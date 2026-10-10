@@ -197,12 +197,12 @@ function set(key: string, value: string): void {
 /**
  * A real sign-in, and the cookie header a browser would carry afterwards.
  *
- * `stopAt` is hop 1's start: the session exists by then and nothing about the
- * loan book depends on the gateway, which is the point of #157.
+ * It stops on the redirect to the app's landing page: the session exists by
+ * then, and the loan book needs nothing else, which is the point of #157.
  */
 async function signedInCookie(persona: keyof typeof PEOPLE): Promise<string> {
   const browser = new Browser();
-  await signInAs(browser, identity, persona, { stopAt: "/api/arcade/start" });
+  await signInAs(browser, identity, persona, { stopAtLanding: true });
   const jar = [...browser.cookies].filter(([name]) => name.startsWith(SESSION_COOKIE));
   if (jar.length === 0) throw new Error(`signing in as ${persona} left no session cookie`);
   return jar.map(([name, value]) => `${name}=${value}`).join("; ");

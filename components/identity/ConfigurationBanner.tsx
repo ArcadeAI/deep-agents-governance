@@ -1,9 +1,9 @@
 /**
  * Red, at the top, and impossible to walk past.
  *
- * Round 2 of #84's review ran a cg-web with sign-in configured and
- * `ARCADE_GATEWAY_ID` absent: `/health` said `ok`, and `GET /` rendered the
- * ordinary persona buttons and `Gateway token: none` with no warning at all.
+ * Round 2 of #84's review ran a cg-web with sign-in configured and one
+ * capability unset: `/health` said `ok`, and `GET /` rendered the ordinary
+ * persona buttons with no warning at all.
  * The only way to find out was to click into a flow and read a 503 — so the
  * misconfiguration was discoverable exactly when it was most expensive, which
  * on this project means on stage.
@@ -33,7 +33,6 @@ import { isMisconfigured, type ConfigurationProblems } from "../../lib/config.ts
 
 const BANNER_HEADINGS: ReadonlyArray<readonly [keyof ConfigurationProblems, string]> = [
   ["signin", "Signing in is not configured"],
-  ["gateway", "The gateway hop is not configured"],
   ["verifier", "The custom verifier is not configured"],
 ] as const;
 
