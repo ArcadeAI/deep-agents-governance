@@ -85,6 +85,9 @@ async function bootApp(env: Record<string, string> = {}): Promise<App> {
             ...identity.env,
             GOVERNANCE_STREAM: "hooks",
             NEXT_TELEMETRY_DISABLED: "1",
+            // Not the developer's gateway either: `setup-arcade --gateway` writes
+            // ARCADE_GATEWAY_ID to .env, and /health must read the same here.
+            ARCADE_GATEWAY_ID: "",
             ...env,
           },
           stdout: "pipe",
@@ -288,7 +291,7 @@ describe("the control plane, on the app's own port", () => {
     });
     expect(body.warnings).toBeArray();
     for (const key of ["signin", "verifier"]) expect(body).toHaveProperty(key);
-    // No gateway field: the agent calls the Engine directly.
+    // No gateway field without ARCADE_GATEWAY_ID: the gateway is optional, for an MCP client.
     expect(body).not.toHaveProperty("gateway");
   }, 60_000);
 

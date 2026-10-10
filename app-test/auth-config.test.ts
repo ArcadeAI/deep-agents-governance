@@ -9,7 +9,8 @@ import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { pluginBody, providerBody, verifierBody } from "../scripts/setup-arcade/arcade.ts";
+import { gatewayBody, pluginBody, providerBody, verifierBody } from "../scripts/setup-arcade/arcade.ts";
+import { userSourceBody } from "../scripts/setup-arcade/coordinator.ts";
 
 const REPO = join(import.meta.dir, "..");
 const HOST = "<APP_PUBLIC_HOST>";
@@ -38,6 +39,9 @@ const EXPECTED: Record<string, unknown> = {
   }),
   "custom-verifier.json": verifierBody(ORIGIN),
   "hooks-plugin.json": pluginBody(ORIGIN, "<ARCADE_HOOK_SIGNING_SECRET>", "active"),
+  // The optional pair `setup-arcade --gateway` sends: the User Source, then the gateway through it.
+  "user-source.json": userSourceBody({ issuer: ISSUER, clientId: "<IDP_CLIENT_ID>", clientSecret: "<IDP_CLIENT_SECRET>" }),
+  "gateway.json": gatewayBody({ slug: "<ARCADE_GATEWAY_ID>", userSourceId: "<USER_SOURCE_ID>", toolkit: "LoanDesk" }),
 };
 
 describe("auth-config/", () => {
@@ -52,10 +56,11 @@ describe("auth-config/", () => {
     for (const name of Object.keys(EXPECTED)) expect(readme).toContain(`\`${name}\``);
   });
 
-  test("the folder holds exactly those files: no User Source or gateway body is left", () => {
-    // The agent calls the Engine directly with the project key, so there is no
-    // User Source or MCP gateway to register. A body left here would have a
-    // dashboard user create one the app never uses.
+  test("the folder holds exactly those files", () => {
+    // The agent calls the Engine directly with the project key: the User
+    // Source and the gateway are the optional `--gateway` pair, and the README
+    // says so. Anything else here would have a dashboard user create something
+    // the app never uses.
     const files = readdirSync(join(REPO, "auth-config")).filter((name) => name.endsWith(".json"));
     expect(files.sort()).toEqual(Object.keys(EXPECTED).sort());
   });
@@ -65,5 +70,13 @@ describe("auth-config/", () => {
       const text = readFileSync(join(REPO, "auth-config", name), "utf8");
       expect(text).not.toMatch(/ngrok|localhost|127\.0\.0\.1/);
     }
+  });
+
+  test("the README marks the User Source and the gateway optional, and the agent needs neither", () => {
+    const readme = readFileSync(join(REPO, "auth-config", "README.md"), "utf8");
+    expect(readme).toMatch(/`user-source\.json` \| Optional, with `--gateway`/);
+    expect(readme).toMatch(/`gateway\.json` \| Optional, with `--gateway`/);
+    expect(readme).toContain("The agent needs no User Source and no MCP gateway.");
+    expect(read("gateway.json").auth_type).toBe("user_source");
   });
 });

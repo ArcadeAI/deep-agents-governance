@@ -82,6 +82,8 @@ export const WRITTEN_KEYS = [
   "ARCADE_HOOK_SIGNING_SECRET",
   "APPROVALS_STORE_TOKEN",
   "GOVERNANCE_STREAM",
+  // Only under `--gateway`, once the gateway exists: the app's MCP-client panel reads it.
+  "ARCADE_GATEWAY_ID",
 ] as const;
 
 export const MANAGED_KEYS: readonly string[] = [...REQUIRED_KEYS, ...IDP_KEYS, ...WRITTEN_KEYS];

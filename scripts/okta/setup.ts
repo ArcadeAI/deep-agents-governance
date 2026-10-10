@@ -8,8 +8,9 @@
  *    active. Its issuer becomes `IDP_ISSUER`.
  * 2. One OIDC Web app, {@link APP_LABEL}: authorization code and refresh
  *    token, client secret over HTTP Basic, consent skipped. The app, Arcade's
- *    `app-identity` provider and `agent/ask.py` all sign in through it, so its
- *    redirect URIs are the three of {@link redirectUris}.
+ *    `app-identity` provider, `agent/ask.py` and Arcade's User Source (for an
+ *    MCP client, under `setup-arcade --gateway`) all sign in through it, so
+ *    its redirect URIs are the four of {@link redirectUris}.
  *    URIs it already has are kept.
  * 3. The app assigned to Everyone, so anybody in the org may sign in. What
  *    they may do is the control plane's business, in `governance.db`.
@@ -24,6 +25,7 @@
  * Everything goes through {@link Okta}, whose `fetch` the tests replace.
  */
 import type { Okta, OktaApp, OktaGroup } from "./client.ts";
+import { USER_SOURCE_CALLBACK } from "../setup-arcade/coordinator.ts";
 
 /** The app's label in the org. One app per org, found again by this label. */
 export const APP_LABEL = "Loan Desk";
@@ -50,12 +52,15 @@ export const AGENT_SIGNIN_CALLBACK = "http://127.0.0.1:8765/callback";
  *
  * - the app's own sign-in, on `APP_PUBLIC_HOST`;
  * - `agent/ask.py`'s loopback catch, for the agent's ID token;
+ * - the callback every Arcade User Source signs in through, fixed on Cloud,
+ *   so `setup-arcade --gateway` needs no second Okta run;
  * - Arcade's callback for the `app-identity` provider, once known.
  */
 export function redirectUris(options: { origin: string | null; providerCallback: string | null }): string[] {
   return [
     ...(options.origin ? [`${options.origin}${SIGNIN_CALLBACK_PATH}`] : []),
     AGENT_SIGNIN_CALLBACK,
+    USER_SOURCE_CALLBACK,
     ...(options.providerCallback ? [options.providerCallback] : []),
   ];
 }

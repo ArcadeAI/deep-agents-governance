@@ -42,7 +42,7 @@ A limit written into a system prompt is a suggestion, and we measured how fragil
 4. **Register the app with Arcade**
    - Run `bun run setup-arcade <APP_PUBLIC_HOST> --dry-run` to print every request it would send and every deploy it would run, with every secret as a placeholder. Nothing is written, sent or deployed.
    - Run `bun run setup-arcade <APP_PUBLIC_HOST>`. It checks that `ARCADE_API_KEY` belongs to the Arcade CLI's active project before it writes anything. Then it fills the third block of `.env` (blanks only, never overwriting), and registers the `app-identity` auth provider, which signs in through your Okta app, the two tool secrets, the custom verifier and the contextual access hooks through Arcade's API, with the hooks on. It reads each one back. Then it runs `arcade deploy` once, in `mcp`, which carries the Loans and Approvals tools. Run it again, and it says everything is already in place.
-   - There is no User Source and no MCP gateway to create: the agent calls the Engine directly with the project key, and the hooks see every call in the project.
+   - The agent needs no User Source and no MCP gateway: it calls the Engine directly with the project key, and the hooks see every call in the project. To reach the same tools from Claude Code or another MCP client, add `--gateway`: it also registers a User Source for your Okta app and an MCP gateway through it, and writes the gateway's slug to `.env` as `ARCADE_GATEWAY_ID`. [`docs/modules/05-mcp-client.md`](./docs/modules/05-mcp-client.md) is that path, and the agent ignores the variable.
    - If Arcade cannot reach the app's hooks health check when it registers them, it says so: start the app and the tunnel as in step 5, then run it again.
 5. **Start the app and the tunnel**
    - In one terminal, run `bun run dev`. It prints the URL to use, `https://<APP_PUBLIC_HOST>`, and the ngrok command for the app's port, which is `PORT` from `.env`, 3000 when unset.
@@ -96,9 +96,10 @@ The internals live in `docs/`, one page per question:
 - [`gate/README.md`](./gate/README.md): the policies and the webhook service that enforces them, started by `bun run gate`, nothing hosted.
 - [`agent/README.md`](./agent/README.md): the Deep Agent itself, how it signs callers in, which model it runs, and how to deploy it.
 - [`docs/agent.md`](./docs/agent.md): how the agent and Arcade fit together: who the caller is, how tools are selected, and what happens when a tool needs authorizing.
-- [`auth-config/`](./auth-config/README.md): everything registered at Arcade, one copy-paste JSON body each: the custom `app-identity` provider for the loan API, the custom verifier and the hooks. `setup-arcade` sends the same bodies, and a test keeps them equal.
+- [`auth-config/`](./auth-config/README.md): everything registered at Arcade, one copy-paste JSON body each: the custom `app-identity` provider for the loan API, the custom verifier and the hooks, and the optional User Source and gateway. `setup-arcade` sends the same bodies, and a test keeps them equal.
 - [`api/`](./api/server.ts): the loan REST API, the bank's system of record, served under `/bank`.
 - [`docs/modules/01-build.md`](./docs/modules/01-build.md): the workshop, paced by tags. `start` for modules 1 and 2, `capstone` for the finish; each module page says what you build, what to look at, and where to pick up if you are behind.
+- [`docs/modules/05-mcp-client.md`](./docs/modules/05-mcp-client.md): optional. The same tools and the same hooks from Claude Code, through an MCP gateway `setup-arcade --gateway` registers.
 - [`app/walkthrough/page.tsx`](./app/walkthrough/page.tsx): `/walkthrough`, the four acts as five diagrams from Arcade's outreach library with one line each, for the livestream and the recap.
 - [`docs/DOMAIN-SWAP.md`](./docs/DOMAIN-SWAP.md) walks through pointing the template at your own business system.
 - [`docs/control-plane.md`](./docs/control-plane.md) is the control plane's own reference: the hooks, `governance.db`, drift and reset, the live stream and the audit log.

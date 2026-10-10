@@ -142,6 +142,13 @@ export interface BankPaneProps {
    * it, and links there when `AGENT_URL` names a deployment.
    */
   agentUrl?: string | null;
+  /**
+   * How to connect an MCP client, when the deployment has a gateway
+   * (`setup-arcade --gateway`): `components/identity/McpClientPanel.tsx`,
+   * rendered by the page and handed down as an element, like `identity`, so
+   * this pane knows nothing about gateways. `null` draws nothing.
+   */
+  mcpClient?: ReactNode;
 }
 
 export function BankPane({
@@ -149,6 +156,7 @@ export function BankPane({
   identity,
   loans,
   agentUrl = null,
+  mcpClient = null,
 }: BankPaneProps) {
   // Inert, and deliberately so: nothing here reads it. See the note above.
   const [hydrated, setHydrated] = useState(false);
@@ -250,6 +258,7 @@ export function BankPane({
                   <code>uv run --env-file .env python ask.py &quot;Which loan applications are pending?&quot;</code>.
                 </p>
               )}
+              {mcpClient}
             </div>
           </section>
         </div>

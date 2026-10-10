@@ -130,8 +130,9 @@ function boldTitles(markdown: string): number[] {
 /**
  * The Quickstart from step 5 on, in the one order that works: the app first,
  * then the tunnel that reaches it, then opening the app through the tunnel.
- * There is no User Source or gateway form between them any more: the agent
- * calls the Engine directly with the project key. `setup-arcade`'s "Then:"
+ * There is no User Source or gateway form between them: the agent calls the
+ * Engine directly with the project key, and `--gateway` is an optional aside
+ * in step 4, not a step. `setup-arcade`'s "Then:"
  * list is held to the same order in `app-test/setup-arcade.test.ts`.
  */
 const QUICKSTART_ORDER: Array<[string, RegExp]> = [
@@ -258,12 +259,15 @@ describe("README.md follows the template's outline", () => {
     expect(quickstart).not.toContain("bun run studio");
   });
 
-  test("step 4 is the one run: the hooks registered on, the deploys, and nothing about a gateway", () => {
+  test("step 4 is the one run: the hooks registered on, the deploys, and the gateway only as the optional --gateway", () => {
     const register = registerStep(README);
     expect(inOrder(register, ONE_CLICK_ORDER)).toEqual(ONE_CLICK_ORDER.map(([name]) => name));
     expect(register).toContain("the contextual access hooks through Arcade's API");
     expect(register).toContain("it runs `arcade deploy` once, in `mcp`");
-    expect(register).toContain("There is no User Source and no MCP gateway to create");
+    expect(register).toContain("The agent needs no User Source and no MCP gateway");
+    expect(register).toContain("add `--gateway`");
+    expect(register).toContain("[`docs/modules/05-mcp-client.md`](./docs/modules/05-mcp-client.md)");
+    expect(register).toContain("the agent ignores the variable");
     // What Arcade cannot reach is named, with the step that fixes it.
     expect(register).toContain("If Arcade cannot reach the app's hooks health check");
     expect(register).toContain("start the app and the tunnel as in step 5, then run it again");

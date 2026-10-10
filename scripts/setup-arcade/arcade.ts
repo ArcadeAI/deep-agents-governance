@@ -28,6 +28,14 @@
  *   `GET` on the same path, because a verifier that did not take is open
  *   risk 2 (DESIGN.md) and fails where no hook fires.
  *
+ * One more is optional, under `--gateway`: an MCP gateway,
+ * `POST /v1/orgs/{org_id}/projects/{project_id}/gateways`
+ * (`schemas.CreateGatewayRequest`), found first by slug in `GET …/gateways`
+ * and read back with `GET …/gateways/{id}`. It authenticates through a User
+ * Source, which only the Coordinator API creates (`coordinator.ts`). The
+ * agent never uses it: it is for an MCP client such as Claude Code, so the
+ * same hooks can be watched from one (`docs/modules/05-mcp-client.md`).
+ *
  * Since #30 the hooks go through the API too, under the org and project
  * `context.ts` resolves, because the human measured that a project key is
  * answered there (`GET …/plugins`, 200). Field names are
@@ -457,4 +465,112 @@ export function isReachabilityError(error: unknown): boolean {
   }
   if (validation) return false;
   return /unreachable|could not (be )?reach|cannot reach|connection refused|failed to connect|timed out|timeout|no such host|dial tcp|health check failed/i.test(error.body);
+}
+
+// --- The optional MCP gateway (`--gateway`) ---------------------------------
+
+/**
+ * Arcade's own Gmail and Slack tools, which the agent uses to tell people about
+ * a decision and to ask for an approval. They are Arcade's built-in providers,
+ * not part of `mcp/`: nothing is deployed for them, and each person authorizes
+ * their own account the first time a tool of theirs is called.
+ */
+export const NATIVE_TOOLS = ["Gmail.SendEmail", "Gmail.ListEmails", "Slack.SendMessage"] as const;
+
+/**
+ * The tools the gateway exposes, as its `tool_filter` names them:
+ * `Toolkit.Tool`. The six from the one `LoanDesk` deployment, then Gmail and
+ * Slack. The same nine the agent selects from when it calls the Engine
+ * directly.
+ */
+export function gatewayTools(toolkit: string): string[] {
+  return [
+    ...["SearchLoans", "GetLoan", "ApproveLoan", "DenyLoan"].map((tool) => `${toolkit}.${tool}`),
+    ...["RequestApproval", "Decide"].map((tool) => `${toolkit}.${tool}`),
+    ...NATIVE_TOOLS,
+  ];
+}
+
+/** The authentication the gateway needs: the person's own Okta sign-in, through the User Source. */
+export const GATEWAY_AUTH_TYPE = "user_source";
+
+/** Where an MCP client connects to the gateway: the Engine's host, `/mcp/<slug>`. */
+export function gatewayUrl(apiUrl: string, slug: string): string {
+  return `${apiUrl.replace(/\/+$/, "")}/mcp/${slug}`;
+}
+
+/**
+ * The gateway `--gateway` creates once it has the User Source's id:
+ * `POST …/gateways` (`schemas.CreateGatewayRequest`), in the shape the Arcade
+ * CLI sends it (`arcade_cli/connect.py` `create_gateway`:
+ * `tool_filter.allowed_tools`, qualified `Toolkit.Tool` names), with
+ * `auth_type: "user_source"` and the User Source's id. Create-only like the
+ * provider, and read back with `GET …/gateways/{id}`.
+ */
+export interface GatewaySpec {
+  slug: string;
+  userSourceId: string;
+  toolkit: string;
+}
+
+export function gatewayBody(spec: GatewaySpec) {
+  return {
+    name: "Loans Approval Limits",
+    description: "The loan officer's agent",
+    slug: spec.slug,
+    auth_type: GATEWAY_AUTH_TYPE,
+    user_source_id: spec.userSourceId,
+    tool_filter: { allowed_tools: gatewayTools(spec.toolkit) },
+  };
+}
+
+/** What checking a gateway that already exists under the slug found. */
+export interface GatewayCheck {
+  /** Set when it does not authenticate through a User Source: the run stops, because the gateway would not sign people in as themselves. */
+  authType: string | null;
+  /** The tool list's differences, each a warning. */
+  tools: string[];
+}
+
+/**
+ * A gateway as `GET …/gateways` lists it (`schemas.GatewayResponse`), against
+ * what this app needs. Two kinds of difference: an `auth_type` other than the
+ * User Source refuses, because Arcade Headers mode would let anyone with the
+ * key act as anyone; a tool list that is not the nine is a warning. An
+ * `auth_type` Arcade leaves out is not the User Source either.
+ */
+export function gatewayCheck(gateway: unknown, toolkit: string): GatewayCheck {
+  const authType = at(gateway, "auth_type");
+  const tools = at(gateway, "tool_filter.allowed_tools");
+  const have = Array.isArray(tools) ? [...(tools as unknown[])].map(String).sort() : null;
+  const want = [...gatewayTools(toolkit)].sort();
+  const toolDifferences: string[] = [];
+  if (have === null) {
+    toolDifferences.push(`tool_filter.allowed_tools: Arcade has ${JSON.stringify(tools) ?? "nothing"}, this app needs ${JSON.stringify(want)}`);
+  } else {
+    const missing = want.filter((each) => !have.includes(each));
+    const extra = have.filter((each) => !want.includes(each));
+    if (missing.length > 0) toolDifferences.push(`tool_filter.allowed_tools is missing ${missing.join(", ")}`);
+    if (extra.length > 0) toolDifferences.push(`tool_filter.allowed_tools also has ${extra.join(", ")}, which this app does not use`);
+  }
+  return {
+    authType: authType === GATEWAY_AUTH_TYPE ? null : `auth_type: Arcade has ${JSON.stringify(authType) ?? "nothing"}, this app needs "${GATEWAY_AUTH_TYPE}"`,
+    tools: toolDifferences,
+  };
+}
+
+/** The same form of report as {@link pluginDifferences}, for a gateway read back (`schemas.GatewayResponse`). */
+export function gatewayDifferences(gateway: unknown, spec: GatewaySpec): string[] {
+  const differences: string[] = [];
+  const compare = (path: string, have: unknown, want: unknown) => {
+    if (JSON.stringify(have) !== JSON.stringify(want)) {
+      differences.push(`${path}: Arcade has ${JSON.stringify(have) ?? "nothing"}, this app needs ${JSON.stringify(want)}`);
+    }
+  };
+  compare("slug", at(gateway, "slug"), spec.slug);
+  compare("auth_type", at(gateway, "auth_type"), GATEWAY_AUTH_TYPE);
+  compare("user_source_id", at(gateway, "user_source_id"), spec.userSourceId);
+  const tools = at(gateway, "tool_filter.allowed_tools");
+  compare("tool_filter.allowed_tools", Array.isArray(tools) ? [...tools].sort() : tools, [...gatewayTools(spec.toolkit)].sort());
+  return differences;
 }

@@ -11,8 +11,10 @@
  * both fail at a step no hook observes, so an unset one is otherwise
  * discovered mid-rehearsal as "the demo does nothing". They say `configured`
  * or `missing` and never which value is wrong, because the value is a
- * credential. (A third, `gateway`, went with the gateway: the agent calls the
- * Engine directly.)
+ * credential. A third, `gateway`, is there only when `ARCADE_GATEWAY_ID` is
+ * set (`setup-arcade --gateway`), always `configured`, and counts for nothing:
+ * the gateway is optional, for an MCP client, and the agent calls the Engine
+ * directly.
  *
  * Since #81: `panel_stream` — `live`, `fixture` or `unconfigured`. The odd one
  * out, because it has three answers rather than two: a panel can be watching

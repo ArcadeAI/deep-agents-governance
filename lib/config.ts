@@ -69,6 +69,19 @@ export interface IdentityConfig {
    * verifier's calls without moving the Engine's.
    */
   cloudUrl: string;
+  /**
+   * `ARCADE_GATEWAY_ID`: the slug of the MCP gateway `bun run setup-arcade
+   * --gateway` registered, or `""`. Optional, and the agent never reads it:
+   * it calls the Engine directly. Set, the home page shows how to connect an
+   * MCP client such as Claude Code to the same tools under the same hooks
+   * (`components/identity/McpClientPanel.tsx`, `docs/modules/05-mcp-client.md`).
+   */
+  gatewayId: string;
+}
+
+/** Where an MCP client connects to the gateway, `<Engine>/mcp/<slug>`, or `null` with no gateway. The same URL `setup-arcade` prints. */
+export function gatewayUrl(config: IdentitySurface): string | null {
+  return config.identity.gatewayId === "" ? null : `${config.arcadeApiUrl}/mcp/${config.identity.gatewayId}`;
 }
 
 export interface WebConfig {
@@ -164,6 +177,7 @@ export function readIdentitySurface(
       publicUrl: appOrigin(env),
       publicHostConfigured: !appPublicHostIsFallback(env),
       cloudUrl: trimUrl(env.ARCADE_CLOUD_URL) || "https://cloud.arcade.dev",
+      gatewayId: env.ARCADE_GATEWAY_ID?.trim() ?? "",
     },
   };
 }
@@ -252,6 +266,13 @@ export interface DeploymentReadiness {
   status: "ok" | "degraded";
   signin: "configured" | "missing";
   verifier: "configured" | "missing";
+  /**
+   * Present only with `ARCADE_GATEWAY_ID`, and never `missing`: the gateway
+   * is optional (`setup-arcade --gateway`), for an MCP client, and the agent
+   * does not use it. Without it the field is absent rather than a word that
+   * would read as a fault, and it never counts towards `status`.
+   */
+  gateway?: "configured";
 }
 
 export function deploymentReadiness(config: IdentitySurface): DeploymentReadiness {
@@ -262,6 +283,7 @@ export function deploymentReadiness(config: IdentitySurface): DeploymentReadines
   return {
     status: Object.values(capabilities).every((each) => each === "configured") ? "ok" : "degraded",
     ...capabilities,
+    ...(config.identity.gatewayId === "" ? {} : { gateway: "configured" as const }),
   };
 }
 

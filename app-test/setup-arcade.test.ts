@@ -12,8 +12,11 @@
  *   says POST, and the first live run got that 404 instead. Since #30 it serves
  *   the plugins and hooks under one org and project, as the live swagger has
  *   them, and still 404s the bare `/v1/plugins` the second live run was
- *   refused. It serves no gateway and no User Source route: the agent calls the
- *   Engine directly with the project key, so this script asks for neither.
+ *   refused. Without `--gateway` it serves no gateway and no User Source
+ *   route: the agent calls the Engine directly with the project key, so the
+ *   script asks for neither. Under `--gateway` the gateway routes answer on
+ *   the same server and the User Source ones on a Coordinator stand-in of its
+ *   own (#52), each as the live API answered on 2026-09-28.
  * - **The Arcade CLI** is a shell script first on `PATH` that records where it
  *   was run and with what, so `arcade deploy` is observed and never performed.
  * - **The CLI's context** is a `credentials.yaml` in a throwaway `HOME`, in the
@@ -48,7 +51,7 @@ const ORG = "org_standin";
 const PROJECT = "prj_standin";
 const SCOPED = `/v1/orgs/${ORG}/projects/${PROJECT}`;
 /** A User Source id an older `.env` may still hold, from when hop 1 went through a gateway. Never sent or printed. */
-const USER_SOURCE = "us_2standinusersource";
+const USER_SOURCE = "us_2StandInUserSource000000000";
 /** A gateway slug an older `.env` may still hold. Never sent or printed. */
 const OLD_GATEWAY = "loan-desk-old-gateway";
 /** What the faked CLI's credentials hold besides the ids: never to be printed. */
@@ -71,6 +74,9 @@ interface Recorded {
  * any route it does not serve, so it is this stand-in's too.
  */
 const ROUTE_NOT_FOUND = { name: "route_not_found", message: "requested route is not found or method is not allowed" };
+
+/** The Coordinator's User Source routes the stand-in serves (#52), by the name a test injects an answer under. */
+type CoordinatorRoute = "list" | "get" | "test_issuer" | "create";
 
 /** What an Okta custom authorization server publishes as `scopes_supported`, as far as this app asks. */
 const IDP_SCOPES = ["openid", "profile", "email", "offline_access"] as const;
@@ -107,6 +113,26 @@ class StandIn {
   plugins = new Map<string, Json>();
   /** Hooks, as `schemas.HookResponse`, made from each plugin's endpoints. */
   hooks: Json[] = [];
+  /** Gateways (`schemas.GatewayResponse`), as `--gateway` or the dashboard made them. */
+  gateways = new Map<string, Json>();
+  /** When set, the next gateway create answers this instead of creating anything (#52). */
+  nextGatewayCreate: { status: number; body: Json } | null = null;
+  /** When set, a gateway read-back answers this instead (#52). */
+  gatewayReadBack: { status: number; body: Json } | null = null;
+
+  // --- The Coordinator API (#52) --------------------------------------------
+  /**
+   * `unavailable` answers every Coordinator call with the 404 the project key
+   * got for `…/user_sources` on api.arcade.dev (#7). `available` is the contract
+   * the human's agent read on #52 (2026-09-28), and nothing more. Default
+   * available: `--gateway` is the only thing that calls it.
+   */
+  coordinatorMode: "unavailable" | "available" = "available";
+  /** User Sources as the Coordinator stores them, oldest first, secret included, which no read returns. */
+  userSources = new Map<string, Json>();
+  coordinatorRequests: Recorded[] = [];
+  /** When set, the next Coordinator call to that route answers this instead. */
+  nextCoordinator: Partial<Record<CoordinatorRoute, { status: number; body: unknown }>> = {};
   /** When set, a PATCH is stored but its `status` and each endpoint's are not: the plugin reads back as it was. */
   patchIgnoresStatus = false;
   /** When set, a plugin read-back leaves `status` out. */
@@ -147,6 +173,9 @@ class StandIn {
   // once on #28's full run).
   private readonly server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: (request) => this.handle(request) });
   readonly url = `http://127.0.0.1:${this.server.port}`;
+  /** The Coordinator, as `ARCADE_COORDINATOR_URL` names it: under `/api`, like the default `https://cloud.arcade.dev/api`. */
+  private readonly coordinatorServer = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: (request) => this.handleCoordinator(request) });
+  readonly coordinatorUrl = `http://127.0.0.1:${this.coordinatorServer.port}/api`;
   /** The identity provider's org, as `OKTA_ORG_URL` names it. */
   private readonly idpServer = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: (request) => this.handleIdp(request) });
   readonly idpUrl = `http://127.0.0.1:${this.idpServer.port}`;
@@ -155,6 +184,7 @@ class StandIn {
 
   stop(): void {
     this.server.stop(true);
+    this.coordinatorServer.stop(true);
     this.idpServer.stop(true);
   }
 
@@ -179,6 +209,97 @@ class StandIn {
       token_endpoint_auth_methods_supported: ["client_secret_basic", "client_secret_post"],
       ...(this.idp.scopes === undefined ? {} : { scopes_supported: this.idp.scopes }),
     };
+  }
+
+  /**
+   * What the Coordinator checks of an issuer at `test_issuer` and at the
+   * create: its discovery document is reachable, names itself, has a signing
+   * key, and supports each scope asked for. The stand-in reads `idp` instead of the network.
+   */
+  private issuerRefusal(issuer: string, scopes: string[]): string | null {
+    const url = `${issuer.replace(/\/+$/, "")}/.well-known/openid-configuration`;
+    if (this.idp.status !== 200 || issuer.replace(/\/+$/, "") !== this.issuer) return `Could not reach \`${url}\` at this time. Try again.`;
+    const document = this.discoveryDocument();
+    if (document.issuer !== issuer) return `The issuer in \`${url}\` is \`${document.issuer}\`, not \`${issuer}\`.`;
+    if ((this.idp.signingKeys ?? 0) < 1) return `The JWKS at \`${document.jwks_uri}\` has no signing key.`;
+    const unsupported = document.scopes_supported === undefined ? [] : scopes.filter((scope) => !(document.scopes_supported as string[]).includes(scope));
+    if (unsupported.length > 0) return `Scopes not supported by the issuer: ${unsupported.join(", ")}.`;
+    return null;
+  }
+
+  /** A User Source as the Coordinator returns it: every field but the secret. */
+  private userSourceResponse(stored: Json): Json {
+    const { client_secret: _secret, ...shown } = stored;
+    return shown;
+  }
+
+  /** The Coordinator API (#52): `{ code, msg, data }` envelopes, User Sources only. */
+  private async handleCoordinator(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const text = await request.text();
+    const body = text ? (JSON.parse(text) as Json) : undefined;
+    this.coordinatorRequests.push({ method: request.method, path: `${url.pathname}${url.search}`, authorization: request.headers.get("authorization"), body });
+    this.timeline.push(`coordinator ${request.method} ${url.pathname.replace(/^\/api/, "")}${url.search}`);
+    const refused = (status: number, msg: string) => Response.json({ code: status, msg, data: null }, { status });
+    const success = (data: unknown, status = 200) => Response.json({ code: 200, msg: "Request successful", data }, { status });
+    if (request.headers.get("authorization") !== `Bearer ${KEY}`) return refused(401, "Unauthorized");
+    if (this.coordinatorMode === "unavailable") return Response.json(ROUTE_NOT_FOUND, { status: 404 });
+    const route = /^\/api\/v1\/orgs\/([^/]+)\/projects\/([^/]+)\/user_sources(?:\/([^/]+))?$/.exec(url.pathname);
+    if (!route) return Response.json(ROUTE_NOT_FOUND, { status: 404 });
+    if (route[1] !== ORG || route[2] !== PROJECT) return refused(404, "Not Found");
+    const sub = route[3];
+    const name: CoordinatorRoute | null =
+      request.method === "GET" && sub === undefined ? "list"
+      : request.method === "GET" ? "get"
+      : request.method === "POST" && sub === "test_issuer" ? "test_issuer"
+      : request.method === "POST" && sub === undefined ? "create"
+      : null;
+    if (name === null) return refused(405, "Method Not Allowed");
+    const injected = this.nextCoordinator[name];
+    if (injected) {
+      delete this.nextCoordinator[name];
+      return typeof injected.body === "string" ? new Response(injected.body, { status: injected.status }) : Response.json(injected.body, { status: injected.status });
+    }
+    if (name === "list") {
+      const limit = Number(url.searchParams.get("limit") ?? 100);
+      const offset = Number(url.searchParams.get("offset") ?? 0);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 500 || !Number.isInteger(offset) || offset < 0) return refused(422, "Invalid request parameters: limit, offset");
+      const all = [...this.userSources.values()].reverse().map((each) => this.userSourceResponse(each));
+      return success({ limit, offset, total_count: all.length, items: all.slice(offset, offset + limit) });
+    }
+    if (name === "get") {
+      const stored = this.userSources.get(decodeURIComponent(sub!));
+      return stored === undefined ? refused(404, "Not Found") : success(this.userSourceResponse(stored));
+    }
+    if (name === "test_issuer") {
+      if (typeof body?.issuer !== "string" || !/^https?:\/\//.test(body.issuer)) return refused(422, "Invalid request parameters: issuer");
+      const why = this.issuerRefusal(body.issuer, ["openid", "profile", "email"]);
+      return why === null ? new Response(null, { status: 204 }) : refused(422, why);
+    }
+    const invalid: string[] = [];
+    if (typeof body?.name !== "string" || body.name.length < 1 || body.name.length > 255) invalid.push("name");
+    if (body?.protocol !== undefined && body.protocol !== "oidc") invalid.push("protocol");
+    if (typeof body?.issuer !== "string" || !/^https?:\/\//.test(body.issuer)) invalid.push("issuer");
+    if (typeof body?.client_id !== "string" || body.client_id === "") invalid.push("client_id");
+    if (typeof body?.client_secret !== "string" || body.client_secret === "") invalid.push("client_secret");
+    const scopes = body?.scopes ?? ["openid", "profile", "email"];
+    if (!Array.isArray(scopes) || !scopes.includes("openid")) invalid.push("scopes");
+    if (invalid.length > 0) return refused(422, `Invalid request parameters: ${invalid.join(", ")}`);
+    const why = this.issuerRefusal(body!.issuer, [...new Set(scopes as string[])]);
+    if (why !== null) return refused(422, why);
+    const stored = userSourceRecord({
+      id: `us_StandIn${String(++this.ids).padStart(20, "0")}`,
+      name: body!.name,
+      description: body!.description ?? "",
+      issuer: body!.issuer,
+      client_id: body!.client_id,
+      client_secret: body!.client_secret,
+      scopes: [...new Set(scopes as string[])],
+      subject_claim: body!.subject_claim ?? "sub",
+      status: body!.status ?? "active",
+    });
+    this.userSources.set(stored.id, stored);
+    return success(this.userSourceResponse(stored), 201);
   }
 
   /** A plugin as `GET` returns it (`schemas.PluginResponse`): the bearer only as `{ exists }`. */
@@ -323,6 +444,31 @@ class StandIn {
       const plugin = query.get("plugin_id");
       return page(this.hooks.filter((hook) => plugin === null || hook.plugin_id === plugin));
     }
+    // The gateway routes (#52), only ever reached under `--gateway`.
+    if (method === "GET" && rest === "/gateways") return page([...this.gateways.values()]);
+    if (method === "POST" && rest === "/gateways") {
+      if (this.nextGatewayCreate !== null) {
+        const { status, body: answer } = this.nextGatewayCreate;
+        this.nextGatewayCreate = null;
+        return Response.json(answer, { status });
+      }
+      if (body?.auth_type !== "user_source" || !this.userSources.has(body?.user_source_id)) {
+        return Response.json({ name: "malformed_request", message: "user_source_id must name a User Source in this project" }, { status: 400 });
+      }
+      if ([...this.gateways.values()].some((each) => each.slug === body.slug)) {
+        return Response.json({ name: "conflict", message: `slug ${body.slug} is taken` }, { status: 409 });
+      }
+      const id = `gw_${++this.ids}`;
+      const stored = { ...body, id, status: "active" };
+      this.gateways.set(id, stored);
+      return Response.json(stored, { status: 201 });
+    }
+    const gatewayId = /^\/gateways\/([^/]+)$/.exec(rest)?.[1];
+    if (gatewayId !== undefined && method === "GET") {
+      if (this.gatewayReadBack !== null) return Response.json(this.gatewayReadBack.body, { status: this.gatewayReadBack.status });
+      const stored = this.gateways.get(gatewayId);
+      return stored ? Response.json(stored) : Response.json({ name: "not_found", message: "gateway not found" }, { status: 404 });
+    }
     // The Arcade CLI's `server_already_exists`: org-scoped, 404 when the server is missing.
     const worker = /^\/workers\/([^/]+)$/.exec(rest)?.[1];
     if (worker !== undefined && method === "GET") {
@@ -334,6 +480,55 @@ class StandIn {
     return Response.json(ROUTE_NOT_FOUND, { status: 404 });
   }
 }
+
+/**
+ * A User Source with every key the human measured on #52 (`data.items.N`), as
+ * this app's would be: `binding_type` `project`, `protocol` `oidc`, and
+ * `active`, which the read by id requires.
+ */
+function userSourceRecord(fields: Json): Json {
+  return {
+    name: "Loans Approval Limits",
+    description: "The app's sign-in, through its identity provider (hop 1)",
+    issuer: arcade.issuer,
+    binding_type: "project",
+    protocol: "oidc",
+    status: "active",
+    subject_claim: "email",
+    scopes: ["openid", "profile", "email"],
+    organization_id: ORG,
+    project_id: PROJECT,
+    created_at: "2026-09-28T00:00:00Z",
+    updated_at: "2026-09-28T00:00:00Z",
+    ...fields,
+  };
+}
+
+/** A User Source somebody made in the dashboard, for this app's issuer and client. */
+function dashboardUserSource(overrides: Json = {}): Json {
+  const source = userSourceRecord({ id: USER_SOURCE, client_id: CLIENT_ID, client_secret: CLIENT_SECRET, ...overrides });
+  arcade.userSources.set(source.id, source);
+  return source;
+}
+
+/** A gateway somebody made in the dashboard, under the slug a run on `HOST` derives. */
+function dashboardGateway(overrides: Json = {}): Json {
+  const gateway = {
+    id: `gw_dashboard_${arcade.gateways.size + 1}`,
+    name: "Loans Approval Limits",
+    slug: "loan-desk-template-test",
+    status: "active",
+    auth_type: "user_source",
+    user_source_id: USER_SOURCE,
+    tool_filter: { allowed_tools: SIX_TOOLS },
+    ...overrides,
+  };
+  arcade.gateways.set(gateway.id, gateway);
+  return gateway;
+}
+
+/** The gateway's tool filter: the six LoanDesk tools, then Gmail and Slack (`gatewayTools` in arcade.ts). */
+const SIX_TOOLS = ["LoanDesk.SearchLoans", "LoanDesk.GetLoan", "LoanDesk.ApproveLoan", "LoanDesk.DenyLoan", "LoanDesk.RequestApproval", "LoanDesk.Decide", "Gmail.SendEmail", "Gmail.ListEmails", "Slack.SendMessage"];
 
 const scratch = realpathSync(mkdtempSync(join(tmpdir(), "cg-setup-arcade-")));
 let arcade: StandIn;
@@ -470,6 +665,7 @@ async function setupArcade(cwd: string, ...args: Array<string | RunOptions>): Pr
     env: childEnv({
       ...options.shell,
       ARCADE_API_URL: arcade.url,
+      ARCADE_COORDINATOR_URL: arcade.coordinatorUrl,
       HOME: project.home,
       PATH: `${FAKE_BIN}:${process.env.PATH ?? ""}`,
       FAKE_ARCADE_LOG: join(scratch, `${cwd.slice(scratch.length + 1)}.arcade.log`),
@@ -501,7 +697,7 @@ function envOf(dir: string): Record<string, string> {
 }
 
 /** `METHOD /path`, with the ids Arcade minted written `{id}`, so a real run and a dry run compare. */
-const normalise = (line: string) => line.replace(/plg_\d+|<plugin_id>/g, "{id}");
+const normalise = (line: string) => line.replace(/plg_\d+|<plugin_id>|gw_\d+|<gateway_id>|us_[0-9A-Za-z]+|<user_source_id>/g, "{id}");
 const sequence = (requests: Recorded[]) => requests.map((each) => normalise(`${each.method} ${each.path}`));
 
 /** The key's check, the first call of every run that found a project (#30). */
@@ -534,6 +730,21 @@ const RERUN = [
 /** What a run adds when it finds the hooks disabled: turned on, and read back. */
 const TURN_ON = [`PATCH ${SCOPED}/plugins/{id}`, `GET ${SCOPED}/plugins/{id}`, `GET ${SCOPED}/hooks?plugin_id={id}`];
 const DEPLOYS = ["mcp|deploy"];
+/** `--gateway` (#52): the gateway searched for by slug, after the deploys. */
+const GATEWAY_CHECK = `GET ${SCOPED}/gateways?limit=100`;
+/** What a fresh `--gateway` run adds after the check: the gateway created and read back. */
+const GATEWAY_CREATE = [`POST ${SCOPED}/gateways`, `GET ${SCOPED}/gateways/{id}`];
+/** The Coordinator's User Source route under the stand-in's project (#52), as a sequence names it. */
+const USER_SOURCES = `/v1/orgs/${ORG}/projects/${PROJECT}/user_sources`;
+const LIST = `GET ${USER_SOURCES}?limit=100&offset=0`;
+const TEST_ISSUER = `POST ${USER_SOURCES}/test_issuer`;
+const READ_BY_ID = `GET ${USER_SOURCES}/{id}`;
+/** A fresh `--gateway` run's Coordinator calls: the list, the issuer check, the create, the read-back by id. */
+const FIRST_COORDINATOR = [LIST, TEST_ISSUER, `POST ${USER_SOURCES}`, READ_BY_ID];
+/** A rerun's: the list finds it, and it is read back by id. */
+const RERUN_COORDINATOR = [LIST, READ_BY_ID];
+const coordinatorSequence = () =>
+  arcade.coordinatorRequests.map((each) => `${each.method} ${each.path.replace(/^\/api/, "").replace(/\/user_sources\/us_[0-9A-Za-z]+$/, "/user_sources/{id}")}`);
 /**
  * The hooks as Arcade holds them, field by field: the three URLs on the
  * public host, fail closed, the health path, `.env`'s bearer, which the
@@ -565,6 +776,7 @@ function hooksAreRegistered(dir: string, status: "inactive" | "active"): void {
 /** No request about a gateway or a User Source, of any method, under any path: there is neither to find or make. */
 function noGatewayRequest(): void {
   expect(arcade.requests.filter((each) => /\/(gateways|user_sources)\b/.test(each.path)).map((each) => `${each.method} ${each.path}`)).toEqual([]);
+  expect(arcade.coordinatorRequests).toEqual([]);
 }
 
 /** What somebody switching the hooks off in the dashboard leaves: the plugin, every endpoint and every hook `inactive`. */
@@ -670,14 +882,15 @@ test("a first run registers every API-able piece with the hooks on, deploys the 
   expect(new Set([env.SESSION_SECRET, env.ARCADE_HOOK_SIGNING_SECRET, env.APPROVALS_STORE_TOKEN]).size).toBe(3);
   // What `bun run okta-setup` wrote is read, and left as it was.
   expect([env.IDP_ISSUER, env.IDP_CLIENT_ID, env.IDP_CLIENT_SECRET]).toEqual([arcade.issuer, CLIENT_ID, CLIENT_SECRET]);
-  // No gateway slug: there is no gateway to name.
-  expect("ARCADE_GATEWAY_ID" in env).toBe(false);
+  // No gateway slug: without --gateway there is no gateway to name, and the line stays blank.
+  expect(env.ARCADE_GATEWAY_ID ?? "").toBe("");
   expect(env.GOVERNANCE_STREAM).toBe("hooks");
   // Every key .env.example says setup-arcade fills is filled.
   const example = readFileSync(join(ROOT, ".env.example"), "utf8");
   const section = example.slice(example.indexOf("# --- Filled in by `bun run setup-arcade"), example.indexOf("# --- Optional"));
-  const owned = [...section.matchAll(/^([A-Z_][A-Z0-9_]*)=$/gm)].map(([, key]) => key!);
-  // Five since ARCADE_GATEWAY_ID went: the sweep has to find them, or it proves nothing.
+  // ARCADE_GATEWAY_ID is filled only under --gateway.
+  const owned = [...section.matchAll(/^([A-Z_][A-Z0-9_]*)=$/gm)].map(([, key]) => key!).filter((key) => key !== "ARCADE_GATEWAY_ID");
+  // Five: the sweep has to find them, or it proves nothing.
   expect(owned.length).toBeGreaterThanOrEqual(5);
   for (const key of owned) expect(env[key], `setup-arcade left ${key} blank`).toMatch(/\S/);
   expect(env.ARCADE_API_KEY).toBe(KEY);
@@ -907,24 +1120,28 @@ test("hooks that read back not active fail the run: a create, a turn-on, and a r
   expect(silent.stderr).toContain('  - status: Arcade has nothing, this app needs "active"');
 }, 90_000);
 
-test("the retired --gateway flag is refused as an unknown option, before anything is sent", async () => {
-  const run = await setupArcade(project("retired-flag"), "--gateway", "loan-desk");
-  expect(run.code).toBe(64);
-  expect(run.stderr).toContain("--gateway: not an option of this command");
-  expect(run.stderr).toContain("usage: bun run setup-arcade <ngrok-host> [--dry-run] [--skip-deploy] [--redeploy]\n");
+test("--gateway with a slug that is not one is refused before anything is sent, and an unknown flag names the usage", async () => {
+  const bad = await setupArcade(project("bad-slug"), "--gateway=Loan_Desk");
+  expect(bad.code).toBe(64);
+  expect(bad.stderr).toContain("--gateway Loan_Desk: a slug is lowercase letters, digits and hyphens");
+  const unknown = await setupArcade(project("unknown-flag"), "--gateways");
+  expect(unknown.code).toBe(64);
+  expect(unknown.stderr).toContain("--gateways: not an option of this command");
+  expect(unknown.stderr).toContain("usage: bun run setup-arcade <ngrok-host> [--dry-run] [--skip-deploy] [--redeploy] [--gateway[=<slug>]]\n");
   expect(arcade.requests).toEqual([]);
+  noGatewayRequest();
 });
 
-test("a leftover ARCADE_GATEWAY_ID or ARCADE_USER_SOURCE_ID in .env is ignored with a one-line note each, not an error", async () => {
-  const dir = project("leftover-gateway", (env) => `${env}\nARCADE_GATEWAY_ID=${OLD_GATEWAY}\nARCADE_USER_SOURCE_ID=${USER_SOURCE}\n`);
+test("without --gateway, ARCADE_GATEWAY_ID in .env is left alone with a note, and ARCADE_USER_SOURCE_ID is ignored with one", async () => {
+  const dir = project("leftover-gateway", (env) => `${env.replace(/^ARCADE_GATEWAY_ID=$/m, `ARCADE_GATEWAY_ID=${OLD_GATEWAY}`)}\nARCADE_USER_SOURCE_ID=${USER_SOURCE}\n`);
   const run = await setupArcade(dir);
   expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(0);
   const notes = run.stdout.split("\n").filter((line) => /ARCADE_(GATEWAY|USER_SOURCE)_ID/.test(line));
   expect(notes).toEqual([
-    "  note          ARCADE_GATEWAY_ID is set, and ignored: there is no gateway or User Source to register, so you can delete it",
-    "  note          ARCADE_USER_SOURCE_ID is set, and ignored: there is no gateway or User Source to register, so you can delete it",
+    `  note          ARCADE_GATEWAY_ID=${OLD_GATEWAY} is set; this run leaves the gateway as it is (pass --gateway to check or create it)`,
+    "  note          ARCADE_USER_SOURCE_ID is set, and ignored: the User Source is found by its issuer and client, so you can delete it",
   ]);
-  for (const value of [OLD_GATEWAY, USER_SOURCE]) expect(`${run.stdout}${run.stderr}`).not.toContain(value);
+  expect(`${run.stdout}${run.stderr}`).not.toContain(USER_SOURCE);
   expect(sequence(arcade.requests)).toEqual(FIRST_RUN);
   noGatewayRequest();
   // Left in .env as they were: deleting a line is the developer's call.
@@ -934,7 +1151,7 @@ test("a leftover ARCADE_GATEWAY_ID or ARCADE_USER_SOURCE_ID in .env is ignored w
   expect(clean.stdout).not.toContain("note          ARCADE_");
 }, 60_000);
 
-test("it never asks Arcade about a gateway or a User Source and never names Arcade Headers mode, in a run, a rerun or a dry one", async () => {
+test("without --gateway it never asks Arcade about a gateway or a User Source, and never names Arcade Headers mode, in a run, a rerun or a dry one", async () => {
   const dir = project("no-headers");
   const first = await setupArcade(dir);
   const second = await setupArcade(dir);
@@ -950,6 +1167,253 @@ test("it never asks Arcade about a gateway or a User Source and never names Arca
   arcade.requests = [{ method: "GET", path: `/v1/orgs/${ORG}/projects/${PROJECT}/user_sources`, authorization: null, body: undefined }];
   expect(() => noGatewayRequest()).toThrow();
 }, 90_000);
+
+// --- --gateway (#52): the User Source and the gateway, by API ------------------
+
+test("--gateway on a fresh project: the User Source through the Coordinator, the gateway through it with the nine tools, each read back, and ARCADE_GATEWAY_ID written", async () => {
+  const dir = project("gateway-first");
+  const run = await setupArcade(dir, "--gateway");
+  console.log(`--- setup-arcade ${HOST} --gateway, the first run ---\n${run.stdout}${run.stderr}`);
+  expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(0);
+
+  // Arcade's API: the first run as without the flag, then the gateway searched, created and read back. The hooks are not touched again.
+  expect(sequence(arcade.requests)).toEqual([...FIRST_RUN, GATEWAY_CHECK, ...GATEWAY_CREATE]);
+  expect(coordinatorSequence()).toEqual(FIRST_COORDINATOR);
+  for (const request of [...arcade.requests, ...arcade.coordinatorRequests]) expect(request.authorization).toBe(`Bearer ${KEY}`);
+  hooksAreRegistered(dir, "active");
+  expect(arcade.requests.filter((each) => each.method === "PATCH")).toEqual([]);
+
+  // The User Source: the dashboard form's fields, the Okta app's client, IDP_ISSUER, email as the join key.
+  expect(arcade.userSources.size).toBe(1);
+  const [source] = [...arcade.userSources.values()] as [Json];
+  const [checked, create] = arcade.coordinatorRequests.filter((each) => each.method === "POST");
+  expect(checked!.body).toEqual({ issuer: arcade.issuer });
+  expect(create!.body).toEqual({
+    name: "Loans Approval Limits",
+    description: "The app's sign-in, through its identity provider (hop 1)",
+    protocol: "oidc",
+    issuer: arcade.issuer,
+    client_id: CLIENT_ID,
+    client_secret: CLIENT_SECRET,
+    subject_claim: "email",
+    scopes: ["openid", "profile", "email"],
+    status: "active",
+  });
+  expect(run.stdout).toContain(`user source: created Loans Approval Limits (${source.id}), issuer ${arcade.issuer}, client ${CLIENT_ID}, status active (read back)`);
+
+  // The gateway: through that User Source, never Headers, exactly the nine tools.
+  const created = arcade.requests.find((each) => each.method === "POST" && each.path === `${SCOPED}/gateways`)!.body as Json;
+  expect(created).toEqual({
+    name: "Loans Approval Limits",
+    description: "The loan officer's agent",
+    slug: "loan-desk-template-test",
+    auth_type: "user_source",
+    user_source_id: source.id,
+    tool_filter: { allowed_tools: SIX_TOOLS },
+  });
+  expect(arcade.gateways.size).toBe(1);
+  expect(run.stdout).toContain(`gateway: created loan-desk-template-test, through the User Source ${source.id}, with the six LoanDesk tools and Gmail and Slack (read back)`);
+  expect(run.stdout).toContain(`gateway: ${arcade.url}/mcp/loan-desk-template-test, written to .env as ARCADE_GATEWAY_ID`);
+
+  // .env: the slug, on the line .env.example leaves blank for it.
+  expect(envOf(dir).ARCADE_GATEWAY_ID).toBe("loan-desk-template-test");
+  // No form, and the steps end on the MCP client.
+  expect(formOrder(run.stdout)).toEqual([]);
+  expect(thenList(run.stdout).split("\n").slice(1)).toEqual([
+    '  1. Allowlist the provider\'s callback on the Okta app: OKTA_API_TOKEN="op://<vault>/<item>/<field>" op run -- bun run okta-setup',
+    "  2. Start `bun run dev` (or restart it, if it is already running), so the app reads the new .env.",
+    `  3. Start the tunnel: ngrok http --url=${HOST} 3000`,
+    `  4. Open ${ORIGIN}, never localhost, and sign in.`,
+    `  5. Connect an MCP client to the gateway: claude mcp add --transport http loan-desk ${arcade.url}/mcp/loan-desk-template-test, then /mcp in Claude Code to sign in at Okta.`,
+  ]);
+  expect(`${run.stdout}${run.stderr}`).not.toContain(KEY);
+  expect(`${run.stdout}${run.stderr}`).not.toContain(CLIENT_SECRET);
+  expect(JSON.stringify([...arcade.requests, ...arcade.coordinatorRequests])).not.toMatch(/arcade_header/i);
+}, 60_000);
+
+test("--gateway again finds both and changes nothing; without the flag the next run leaves the gateway alone with a note", async () => {
+  const dir = project("gateway-rerun");
+  expect((await setupArcade(dir, "--gateway")).code).toBe(0);
+  const envText = readFileSync(join(dir, ".env"), "utf8");
+  const gateways = JSON.stringify([...arcade.gateways.values()]);
+  arcade.requests = [];
+  arcade.coordinatorRequests = [];
+
+  const again = await setupArcade(dir, "--gateway");
+  expect(again.code, `${again.stdout}\n${again.stderr}`).toBe(0);
+  expect(sequence(arcade.requests)).toEqual([...RERUN, GATEWAY_CHECK]);
+  expect(coordinatorSequence()).toEqual(RERUN_COORDINATOR);
+  const [source] = [...arcade.userSources.values()] as [Json];
+  expect(again.stdout).toContain(`user source: found Loans Approval Limits (${source.id}), issuer ${arcade.issuer}, client ${CLIENT_ID}; it matches and is left as it is`);
+  expect(again.stdout).toContain(`gateway: found loan-desk-template-test, through the User Source ${source.id}; it is left as it is`);
+  expect(again.stdout).toContain(`gateway: ${arcade.url}/mcp/loan-desk-template-test (ARCADE_GATEWAY_ID is already in .env)`);
+  expect(readFileSync(join(dir, ".env"), "utf8")).toBe(envText);
+  expect(JSON.stringify([...arcade.gateways.values()])).toBe(gateways);
+  expect(arcade.userSources.size).toBe(1);
+
+  // The flag off: the slug in .env is a note, and nothing about a gateway is asked.
+  arcade.requests = [];
+  arcade.coordinatorRequests = [];
+  const plain = await setupArcade(dir);
+  expect(plain.code, `${plain.stdout}\n${plain.stderr}`).toBe(0);
+  expect(plain.stdout).toContain("  note          ARCADE_GATEWAY_ID=loan-desk-template-test is set; this run leaves the gateway as it is (pass --gateway to check or create it)");
+  expect(sequence(arcade.requests)).toEqual(RERUN);
+  noGatewayRequest();
+  expect(envOf(dir).ARCADE_GATEWAY_ID).toBe("loan-desk-template-test");
+  expect(thenList(plain.stdout)).not.toContain("claude mcp add");
+}, 90_000);
+
+test("--gateway=<slug> names the gateway, --gateway <slug> too, and a slug that disagrees with .env is refused", async () => {
+  const dir = project("gateway-slug");
+  const run = await setupArcade(dir, "--gateway=loan-desk-mine");
+  expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(0);
+  expect([...arcade.gateways.values()].map((each) => each.slug)).toEqual(["loan-desk-mine"]);
+  expect(envOf(dir).ARCADE_GATEWAY_ID).toBe("loan-desk-mine");
+  // The same slug, as a separate word: found.
+  arcade.requests = [];
+  const spaced = await setupArcade(dir, "--gateway", "loan-desk-mine");
+  expect(spaced.code, `${spaced.stdout}\n${spaced.stderr}`).toBe(0);
+  expect(spaced.stdout).toContain("gateway: found loan-desk-mine");
+  expect(arcade.gateways.size).toBe(1);
+  // Another slug, with .env naming this one: refused before anything is sent.
+  arcade.requests = [];
+  arcade.coordinatorRequests = [];
+  const other = await setupArcade(dir, "--gateway=loan-desk-other");
+  expect(other.code).toBe(1);
+  expect(other.stderr).toContain(".env has ARCADE_GATEWAY_ID=loan-desk-mine, and this run was given --gateway loan-desk-other. Blank it in .env to use loan-desk-other.");
+  expect(arcade.requests).toEqual([]);
+  noGatewayRequest();
+}, 90_000);
+
+test("--gateway --dry-run prints the Coordinator and gateway requests after the deploys, and writes, sends and deploys nothing", async () => {
+  const dir = project("gateway-dry");
+  const before = readFileSync(join(dir, ".env"), "utf8");
+  const run = await setupArcade(dir, "--gateway", "--dry-run");
+  console.log(`--- setup-arcade ${HOST} --gateway --dry-run ---\n${run.stdout}${run.stderr}`);
+  expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(0);
+  expect(arcade.requests).toEqual([]);
+  expect(arcade.coordinatorRequests).toEqual([]);
+  expect(projects.get(dir)!.deploys()).toEqual([]);
+  expect(readFileSync(join(dir, ".env"), "utf8")).toBe(before);
+  expect(printedRequests(run.stdout)).toEqual([...FIRST_RUN, ...FIRST_COORDINATOR, GATEWAY_CHECK, ...GATEWAY_CREATE]);
+  expect(run.stdout).toContain(`  gateway       loan-desk-template-test  (${arcade.url}/mcp/loan-desk-template-test)`);
+  expect(run.stdout).toMatch(/would fill .*\bARCADE_GATEWAY_ID \(loan-desk-template-test, once the gateway exists\)/);
+  expect(bodyAfter(run.stdout, `  POST ${arcade.coordinatorUrl}${USER_SOURCES}/test_issuer\n`)).toEqual({ issuer: arcade.issuer });
+  const source = bodyAfter(run.stdout, `  POST ${arcade.coordinatorUrl}${USER_SOURCES}\n`);
+  expect(source.client_id).toBe(CLIENT_ID);
+  expect(source.client_secret).toBe("<IDP_CLIENT_SECRET from .env>");
+  const gateway = bodyAfter(run.stdout, `  POST ${arcade.url}${SCOPED}/gateways\n`);
+  expect(gateway.slug).toBe("loan-desk-template-test");
+  expect(gateway.auth_type).toBe("user_source");
+  expect(gateway.tool_filter.allowed_tools).toEqual(SIX_TOOLS);
+  expect(run.stdout).toContain("then ARCADE_GATEWAY_ID=loan-desk-template-test is written to .env");
+  expect(run.stdout).not.toContain(CLIENT_SECRET);
+  expect(run.stdout).not.toContain(KEY);
+  expect(formOrder(run.stdout)).toEqual([]);
+  expect(thenList(run.stdout)).toContain("claude mcp add --transport http loan-desk");
+});
+
+test("--gateway with the Coordinator unavailable registers the hooks, then stops on the User Source and gateway forms, exit 1, nothing written for the gateway", async () => {
+  const dir = project("gateway-no-coordinator");
+  arcade.coordinatorMode = "unavailable";
+  const run = await setupArcade(dir, "--gateway");
+  console.log(`--- setup-arcade ${HOST} --gateway, Coordinator unavailable ---\n${run.stdout}${run.stderr}`);
+  expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(1);
+  // Everything up to the gateway is done, and the hooks are on.
+  expect(sequence(arcade.requests)).toEqual(FIRST_RUN);
+  expect(coordinatorSequence()).toEqual([LIST]);
+  hooksAreRegistered(dir, "active");
+  expect(projects.get(dir)!.deploys()).toEqual(DEPLOYS);
+  expect(run.stderr).toContain("setup-arcade: ");
+  expect(run.stdout).toContain("The User Source and the gateway were not registered by API, so they are the dashboard forms below. Everything above is done.");
+  expect(run.stdout).toContain("Two dashboard forms are left, in the order you fill them in:");
+  expect(formOrder(run.stdout)).toEqual(["Arcade dashboard → your project → User Sources → Create User Source", "Arcade dashboard → your project → MCP Gateways → Create Gateway"]);
+  expect(run.stdout).toContain(`│  Issuer URL      ${arcade.issuer}`);
+  expect(run.stdout).toContain("│  Slug              loan-desk-template-test        ← .env's ARCADE_GATEWAY_ID");
+  expect(run.stdout).not.toContain(CLIENT_SECRET);
+  expect(envOf(dir).ARCADE_GATEWAY_ID ?? "").toBe("");
+  expect(thenList(run.stdout)).toContain("Fill in the User Source form and then the gateway form above");
+  // The provider, the secrets, the hooks: a rerun with the Coordinator back finishes the job without redoing them.
+  arcade.coordinatorMode = "available";
+  arcade.requests = [];
+  const again = await setupArcade(dir, "--gateway");
+  expect(again.code, `${again.stdout}\n${again.stderr}`).toBe(0);
+  expect(sequence(arcade.requests)).toEqual([...RERUN, GATEWAY_CHECK, ...GATEWAY_CREATE]);
+  expect(envOf(dir).ARCADE_GATEWAY_ID).toBe("loan-desk-template-test");
+}, 90_000);
+
+test("--gateway with no org and project prints the hooks, User Source and gateway forms, and exits 0", async () => {
+  const dir = project("gateway-no-scope", (env) => env, null);
+  const run = await setupArcade(dir, "--gateway");
+  expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(0);
+  expect(run.stdout).toContain("The hooks, the User Source and the gateway are printed as dashboard forms instead.");
+  expect(run.stdout).toContain("Three dashboard forms are left, in the order you fill them in:");
+  expect(formOrder(run.stdout)).toEqual(["hooks", "Arcade dashboard → your project → User Sources → Create User Source", "Arcade dashboard → your project → MCP Gateways → Create Gateway"]);
+  noGatewayRequest();
+  expect(envOf(dir).ARCADE_GATEWAY_ID ?? "").toBe("");
+}, 60_000);
+
+test("--gateway with the slug taken elsewhere stops on the gateway form, with the User Source registered", async () => {
+  const dir = project("gateway-taken");
+  arcade.nextGatewayCreate = { status: 409, body: { name: "conflict", message: "slug loan-desk-template-test is taken" } };
+  const run = await setupArcade(dir, "--gateway");
+  expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(1);
+  expect(run.stderr).toContain("Arcade says the slug loan-desk-template-test is taken. Blank ARCADE_GATEWAY_ID in .env and run this with --gateway=<another-slug>");
+  const [source] = [...arcade.userSources.values()] as [Json];
+  expect(run.stdout).toContain(`The User Source ${source.id} is registered and the gateway is not, so the gateway is the dashboard form below.`);
+  expect(formOrder(run.stdout)).toEqual(["Arcade dashboard → your project → MCP Gateways → Create Gateway"]);
+  expect(run.stdout).toContain(`(${source.id}, already registered)`);
+  expect(envOf(dir).ARCADE_GATEWAY_ID ?? "").toBe("");
+  // Another slug: created, and the User Source found.
+  arcade.requests = [];
+  arcade.coordinatorRequests = [];
+  const other = await setupArcade(dir, "--gateway=loan-desk-template-test-2");
+  expect(other.code, `${other.stdout}\n${other.stderr}`).toBe(0);
+  expect(coordinatorSequence()).toEqual(RERUN_COORDINATOR);
+  expect(sequence(arcade.requests)).toEqual([...RERUN, GATEWAY_CHECK, ...GATEWAY_CREATE]);
+  expect(envOf(dir).ARCADE_GATEWAY_ID).toBe("loan-desk-template-test-2");
+}, 90_000);
+
+test("--gateway finds a dashboard-made gateway on the slug, and refuses one that does not authenticate through the User Source", async () => {
+  const dir = project("gateway-dashboard");
+  dashboardUserSource();
+  dashboardGateway();
+  const run = await setupArcade(dir, "--gateway");
+  expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(0);
+  expect(coordinatorSequence()).toEqual(RERUN_COORDINATOR);
+  expect(run.stdout).toContain(`gateway: found loan-desk-template-test, through the User Source ${USER_SOURCE}; it is left as it is`);
+  expect(arcade.requests.filter((each) => each.method === "POST" && each.path.endsWith("/gateways"))).toEqual([]);
+  expect(envOf(dir).ARCADE_GATEWAY_ID).toBe("loan-desk-template-test");
+
+  for (const authType of ["arcade", ["arcade", "header"].join("_"), undefined]) {
+    arcade.gateways.clear();
+    dashboardGateway({ auth_type: authType, user_source_id: undefined });
+    const refused = await setupArcade(dir, "--gateway");
+    expect(refused.code, `${authType}: ${refused.stdout}\n${refused.stderr}`).toBe(1);
+    expect(refused.stderr).toContain("the gateway loan-desk-template-test does not authenticate through this app's User Source:");
+    expect(refused.stderr).toContain(`  - auth_type: Arcade has ${JSON.stringify(authType) ?? "nothing"}, this app needs "user_source"`);
+    expect(refused.stderr).toContain("this template never runs a gateway on Arcade Headers or on Arcade accounts");
+  }
+  // A tool list that is not the nine: found anyway, with the differences as warnings.
+  arcade.gateways.clear();
+  dashboardGateway({ tool_filter: { allowed_tools: [...SIX_TOOLS.filter((tool) => tool !== "LoanDesk.DenyLoan"), "Elsewhere.Other"] } });
+  const differs = await setupArcade(dir, "--gateway");
+  expect(differs.code, `${differs.stdout}\n${differs.stderr}`).toBe(0);
+  expect(differs.stdout).toContain("  warning       tool_filter.allowed_tools is missing LoanDesk.DenyLoan");
+  expect(differs.stdout).toContain("  warning       tool_filter.allowed_tools also has Elsewhere.Other, which this app does not use");
+}, 120_000);
+
+test("--gateway with a User Source that differs for this issuer stops, edits nothing, and creates no gateway", async () => {
+  const dir = project("gateway-source-differs");
+  dashboardUserSource({ client_id: "0oaSomebodyElses" });
+  const run = await setupArcade(dir, "--gateway");
+  expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(1);
+  expect(run.stderr).toContain(`  - client_id: Arcade has "0oaSomebodyElses", this app needs "${CLIENT_ID}"`);
+  expect(run.stderr).toContain("this command never edits a User Source");
+  expect(coordinatorSequence()).toEqual([LIST]);
+  expect(arcade.gateways.size).toBe(0);
+  expect(envOf(dir).ARCADE_GATEWAY_ID ?? "").toBe("");
+}, 60_000);
 
 /** The routes real Arcade does not have (#28): a bare `/v1/plugins`, and a bare `/v1/hooks`. */
 const BARE_PLUGIN_OR_HOOK_ROUTE = /^\/v1\/(plugins|hooks)(\/|\?|$)/;
@@ -1273,7 +1737,7 @@ test("a rerun resumes from the live project's state after run 1: the provider ma
   const example = readFileSync(join(ROOT, ".env.example"), "utf8");
   const section = example.slice(example.indexOf("# --- Filled in by `bun run setup-arcade"), example.indexOf("# --- Optional"));
   const envBefore = envOf(dir);
-  for (const [, key] of section.matchAll(/^([A-Z_][A-Z0-9_]*)=$/gm)) expect(envBefore[key!], `block 2 left ${key} blank`).toMatch(/\S/);
+  for (const [, key] of section.matchAll(/^([A-Z_][A-Z0-9_]*)=$/gm)) if (key !== "ARCADE_GATEWAY_ID") expect(envBefore[key!], `block 2 left ${key} blank`).toMatch(/\S/);
   expect(envBefore.ARCADE_PROVIDER_CALLBACK).toBe(CALLBACK);
   expect(arcade.secrets.size).toBe(0);
   expect(arcade.verifier).toEqual({ verifier_url: "", unsafe_skip_verification: false });
@@ -1346,7 +1810,7 @@ test("from the live project's state after run 3, the dry run tells the truth, an
   const envBefore = envOf(dir);
   const example = readFileSync(join(ROOT, ".env.example"), "utf8");
   const block2 = example.slice(example.indexOf("# --- Filled in by `bun run setup-arcade"), example.indexOf("# --- Optional"));
-  for (const [, key] of block2.matchAll(/^([A-Z_][A-Z0-9_]*)=$/gm)) expect(envBefore[key!], `block 2 left ${key} blank`).toMatch(/\S/);
+  for (const [, key] of block2.matchAll(/^([A-Z_][A-Z0-9_]*)=$/gm)) if (key !== "ARCADE_GATEWAY_ID") expect(envBefore[key!], `block 2 left ${key} blank`).toMatch(/\S/);
   const secretsBefore = new Map(arcade.secrets);
   const envText = readFileSync(join(dir, ".env"), "utf8");
   const provider = JSON.stringify(arcade.providers.get("app-identity"));

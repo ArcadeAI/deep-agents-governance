@@ -503,6 +503,29 @@
   margin: 0 0 0.6em;
 }
 
+/* "Connect your MCP client", only on a deployment with a gateway. Same paper,
+   same rule, one command to copy. */
+.bank-mcp-client {
+  margin-top: 0.9em;
+  padding-top: 0.7em;
+  border-top: 1px solid #c9c5bb;
+}
+.bank-panel-subtitle {
+  margin: 0 0 0.4em;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.bank-mcp-command {
+  margin: 0 0 0.6em;
+  padding: 0.45em 0.6em;
+  overflow-x: auto;
+  font-size: 0.78rem;
+  background: #f1efe9;
+  border: 1px solid #c9c5bb;
+}
+
 /* --- /loans: the board on the presenter's second screen ------------------- */
 
 /* Full-screen and sized for the back of the room, which is the only thing that

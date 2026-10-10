@@ -34,18 +34,21 @@
  *
  * The assistant is not on this page. It is the Deep Agent in `agent/`, on
  * Managed Deep Agents; the bank pane says where to open it, and links there
- * when `AGENT_URL` names a deployment.
+ * when `AGENT_URL` names a deployment. With `ARCADE_GATEWAY_ID` set
+ * (`setup-arcade --gateway`), the same column says how to connect an MCP
+ * client to the gateway: the one optional surface, and the agent ignores it.
  */
 import type { CSSProperties } from "react";
 import { cookies, headers } from "next/headers";
 
-import { configurationProblems, readIdentitySurface } from "../lib/config.ts";
+import { configurationProblems, gatewayUrl, readIdentitySurface } from "../lib/config.ts";
 import { originMismatch } from "../lib/origin.ts";
 import { readSessionFromCookies } from "../auth/session.ts";
 import { readLoanBook } from "../lib/loan-context/read.ts";
 import { ConfigurationBanner } from "../components/identity/ConfigurationBanner.tsx";
 import { OriginBanner } from "../components/identity/OriginBanner.tsx";
 import { SessionChrome } from "../components/identity/SessionChrome.tsx";
+import { McpClientPanel } from "../components/identity/McpClientPanel.tsx";
 import { BankPane } from "../components/bank/BankPane.tsx";
 
 /**
@@ -90,6 +93,7 @@ export default async function Home() {
 
   const problems = configurationProblems(config);
   const mismatch = originMismatch(await headers());
+  const mcpUrl = gatewayUrl(config);
 
   return (
     <>
@@ -110,6 +114,7 @@ export default async function Home() {
         identity={<SessionChrome session={session} problems={problems} />}
         loans={loans}
         agentUrl={process.env.AGENT_URL?.trim() || null}
+        mcpClient={mcpUrl === null ? null : <McpClientPanel url={mcpUrl} />}
       />
       <a href="/panel" style={PANEL_LINK}>
         Control plane ↗
