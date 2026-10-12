@@ -3,9 +3,10 @@
 The four tools are stateless clients, so the only honest test drives them
 through the real API: `bun scripts/loans.ts`, the app's loan module on a port
 of its own and laid out under `/bank` exactly as the app serves it (#5), with a
-fresh `loans.db` in a temp directory. Tokens are validated
-against a tiny fake that serves `/oauth2/userinfo` for two known bearer
-tokens — the one endpoint of `apps/idp` (#36) the API ever calls.
+fresh `loans.db` in a temp directory. Tokens are validated against a tiny
+fake issuer shaped like Okta's: a discovery document, and the userinfo
+endpoint it names answering for two known bearer tokens. Userinfo is the one
+identity endpoint the API ever calls, and it finds it through discovery.
 """
 
 import json
@@ -92,9 +93,17 @@ def _stop(child: subprocess.Popen) -> None:
 
 class _Userinfo(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
+        issuer = f"http://127.0.0.1:{self.server.server_port}/oauth2/default"
+        if self.path == "/oauth2/default/.well-known/openid-configuration":
+            body = json.dumps({"issuer": issuer, "userinfo_endpoint": f"{issuer}/v1/userinfo"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         token = (self.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
         email = TOKENS.get(token)
-        if self.path != "/oauth2/userinfo" or email is None:
+        if self.path != "/oauth2/default/v1/userinfo" or email is None:
             self.send_response(401)
             self.end_headers()
             return
@@ -145,7 +154,7 @@ def _boot_loan_app(bun: str, tmp: Path, idp_port: int) -> tuple[subprocess.Popen
             **os.environ,
             "PORT": str(port),
             "LOANS_DB_PATH": str(tmp / "loans.db"),
-            "IDENTITY_HOST": f"localhost:{idp_port}",
+            "IDP_ISSUER": f"http://127.0.0.1:{idp_port}/oauth2/default",
         }
         child = subprocess.Popen(
             [bun, str(LOAN_APP_ENTRYPOINT)],

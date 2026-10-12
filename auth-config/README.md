@@ -11,60 +11,71 @@ until you fill it in, so fill in a copy, not these files.
 
 | File | What it registers | Arcade dashboard |
 |---|---|---|
-| `user-source.json` | Hop 1: the gateway's users sign in with the app's own OpenID Connect | User Sources → Create |
-| `gateway.json` | The MCP gateway the agent calls: the six loan desk tools, Gmail and Slack, through the User Source | MCP Gateways → Create |
 | `app-identity-provider.json` | Hop 2: the custom OAuth 2.0 provider the loan tools use to call the loan API as the caller | Auth Providers → Custom → OAuth 2.0 |
 | `custom-verifier.json` | The app confirms who finished an Arcade sign-in, so a link cannot be used by someone else | Auth → User Verification |
 | `hooks-plugin.json` | The contextual access hooks: `/hooks/access`, `/hooks/pre`, `/hooks/post`, fail closed | Contextual Access → Webhook plugin |
+| `user-source.json` | Optional, with `--gateway`: hop 1 for an MCP client, the app's Okta sign-in as a User Source | User Sources → Create User Source |
+| `gateway.json` | Optional, with `--gateway`: the MCP gateway Claude Code connects to, through that User Source, with the nine tools | MCP Gateways → Create Gateway |
 
 Google (Gmail) and Slack need nothing here: they are Arcade's built-in providers, and
 each person authorizes them the first time the agent uses them.
+
+The agent needs no User Source and no MCP gateway. It calls the Arcade Engine directly
+with the project API key and the signed-in person's email as `user_id` (`agent/agent.py`),
+and the hooks govern every call it makes. The last two files are for the optional MCP
+client path (`docs/modules/03-govern.md`): `bun run setup-arcade <host> --gateway`
+sends them, the User Source through the Coordinator API at `cloud.arcade.dev` and the
+gateway through the Engine's admin API, and writes the slug to `.env` as
+`ARCADE_GATEWAY_ID`. Without the flag, nothing reads or creates either.
 
 ## The placeholders
 
 | Placeholder | Where it comes from |
 |---|---|
 | `<APP_PUBLIC_HOST>` | your ngrok domain, host form (`my-app.ngrok.app`), as in `.env` |
-| `<ARCADE_USER_SOURCE_CLIENT_ID>` / `_SECRET>` | the app's `arcade-user-source` client: `bun run oauth-client --client arcade-user-source --rotate` |
-| `<ARCADE_CLIENT_ID>` / `<ARCADE_CLIENT_SECRET>` | the app's `arcade` client: `bun run oauth-client --client arcade --rotate` |
+| `<IDP_ISSUER>` | the Okta authorization server's issuer, `https://<org>.okta.com/oauth2/default`, as `bun run okta-setup` writes it to `.env` |
+| `<IDP_CLIENT_ID>` / `<IDP_CLIENT_SECRET>` | the Okta app's client, the values of those names in `.env`. Hop 2, the app's own sign-in and `agent/ask.py` all use this one client |
 | `<ARCADE_HOOK_SIGNING_SECRET>` | the value of that name in `.env` |
-| `<ARCADE_GATEWAY_ID>` | a slug you pick; set `.env`'s `ARCADE_GATEWAY_ID` to the same |
-| `<USER_SOURCE_ID>` | the `us_…` id Arcade gives the User Source when you create it |
+| `<ARCADE_GATEWAY_ID>` | the gateway's slug, yours to choose: `setup-arcade --gateway` derives `loan-desk-<first label of the host>`. Slugs are unique across Arcade, not per project |
+| `<USER_SOURCE_ID>` | the id Arcade answers `user-source.json` with (`us_…`), shown on the User Source's page |
 
 ## Order
 
-1. The app and the tunnel are up first: Arcade reads the User Source's issuer and the
-   hooks' health check through the tunnel when you save them.
-2. `user-source.json`, then `gateway.json`, which names the User Source.
-3. `app-identity-provider.json`. Arcade answers with the provider's callback,
-   `https://cloud.arcade.dev/api/v1/oauth/<provider id>/callback`: allowlist it on the
-   app's `arcade` client.
-4. `custom-verifier.json`.
-5. `hooks-plugin.json` last. Active hooks filter the tool list the gateway form shows,
-   so create the gateway before turning them on.
+1. The app and the tunnel are up first: Arcade reads the hooks' health check through
+   the tunnel when you save them.
+2. `app-identity-provider.json`. Arcade answers with the provider's callback: put it in
+   `.env` as `ARCADE_PROVIDER_CALLBACK` and run `bun run okta-setup`, which adds it to the
+   Okta app's redirect URIs, or add it there yourself.
+3. `custom-verifier.json`.
+4. `hooks-plugin.json`, created active.
+5. Optional: `user-source.json`, then `gateway.json` with the User Source's id. The User
+   Source's callback, `https://cloud.arcade.dev/oauth2/intermediate_callback`, is already on
+   the Okta app's redirect URIs: `bun run okta-setup` always allowlists it.
 
 ## Who is who
 
 | Who | Provider | Notes |
 |---|---|---|
-| The person using the agent (hop 1) | **User Source**: the app's own sign-in | Subject claim `email`, not the default `sub`: the email the agent acts as is the email the hooks govern. Its callback, `https://cloud.arcade.dev/oauth2/intermediate_callback`, is already allowlisted on the `arcade-user-source` client. |
-| The loan API, called by the loan tools (hop 2) | **Custom OAuth 2.0 provider** `app-identity`, served by `auth/provider/` | The tools in `mcp/loan_desk/loans.py` declare `OAuth2(id="app-identity", scopes=["openid", "email"])`, and a test keeps that id equal to the provider's. The loan API attributes each call to the email in the token. |
+| The person using the agent | **Okta**, through the app's sign-in or `agent/ask.py` | The agent verifies the ID token and passes its `email` to Arcade as `user_id`: the email the agent acts as is the email the hooks govern. |
+| The loan API, called by the loan tools (hop 2) | **Custom OAuth 2.0 provider** `app-identity`, at Okta | The tools in `mcp/loan_desk/loans.py` declare `OAuth2(id="app-identity", scopes=["openid", "email"])`, and a test keeps that id equal to the provider's. The loan API attributes each call to the email in the token. |
 | Slack, for the approval DM and the channel post | **Arcade's built-in Slack provider** | `RequestApproval` asks for `chat:write`, `im:write`, `users:read`, `users:read.email`. The token is the requester's, so both messages arrive under their name. Arcade routes this provider through its own verifier, so the requester must be a member of the Arcade project (`docs/app-users-and-arcade-accounts.md`). |
 | Gmail | **Arcade's built-in Google provider** | The caller's own Google account. |
 
-The agent itself is not an identity: it verifies the app's ID tokens
-(`agent/identity.py`) and passes the caller's email to Arcade on every call.
+The agent itself is not an identity: it verifies Okta's ID tokens against the issuer's
+published keys (`agent/identity.py`) and passes the caller's email to Arcade on every call.
 
 ## Bringing your own identity provider
 
-`app-identity-provider.json` points at the app's own provider. To use Okta or Auth0
-instead, keep the id `app-identity` and point the three endpoints at your tenant's
-authorize, token and userinfo URLs, with `user_id` still read from `$.email`, and make
-the User Source's issuer your tenant. The hooks key on that email, so nothing else
-changes.
+The file spells Okta's endpoint paths under `<IDP_ISSUER>` because that is the
+workshop's provider. `bun run setup-arcade` does not: it reads the authorize, token and
+userinfo URLs from the issuer's discovery document and registers those. To paste the body
+for Auth0 or another provider, keep the id `app-identity`, use the three endpoints its
+`/.well-known/openid-configuration` names, with `user_id` still read from `$.email`. The
+hooks key on that email, so nothing else changes.
 
 ## Where the people are
 
-The personas, their passwords, roles and clearances live in `idp.db` and
-`governance.db`, both on your machine: `bun run users add <email> --name … --role … --clearance …`,
-or `bun run users seed-demo` for the demo cast. Nothing about a person is stored at Arcade.
+Each person's account and password live in Okta, and their role and clearance in
+`governance.db` on your machine. `bun run users add <email> --name … --role … --clearance …`
+writes both, or `bun run users seed-demo` the demo cast, with the Okta API token through
+`op run`. Nothing about a person is stored at Arcade.

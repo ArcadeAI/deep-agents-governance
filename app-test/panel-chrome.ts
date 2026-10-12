@@ -456,8 +456,6 @@ export async function measurePanelChrome(options: MeasureOptions = {}): Promise<
                 // The app holds the loan book since #5; a throwaway one, not a
                 // loans.db in the repo.
                 LOANS_DB_PATH: ":memory:",
-                // And the identity provider since #6: not `./idp.db` either.
-                IDP_DB_PATH: ":memory:",
                 // The live stream, pointed at the stub. Without this the page
                 // resolves to the replay and there is no health strip to measure.
                 GOVERNANCE_STREAM: "hooks",

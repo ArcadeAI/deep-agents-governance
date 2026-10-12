@@ -3,7 +3,7 @@
  * (#6, criterion 7; the finding from #4).
  *
  * `APP_PUBLIC_HOST` is the ngrok host: the address Arcade Cloud reaches the
- * app at. Since #6 it is also the identity provider's issuer. A server-side
+ * app at. A server-side
  * read of one of the app's own modules addressed to it would leave the
  * machine, cross the tunnel and come back in — slower, rate-limited by
  * ngrok, and broken the moment the tunnel is down, which is when a presenter
@@ -15,13 +15,17 @@
  * touching the network. A reader that addressed the public host would show up
  * in the record; the last test plants one to show that it does.
  *
- * The readers, from the list on #4 and the ones #6 adds:
+ * The identity provider (Okta) is not one of the app's own modules, so its
+ * readers go to the issuer and nowhere else. The recorder answers for it, so
+ * those readers run to the end.
+ *
+ * The readers:
  *
  *   - the panel's status strip and its Reset button (`lib/governance/control-plane.ts`)
  *   - the approval page, and the chat's approval-status poll (`lib/approvals-store.ts`)
- *   - the loan module's bearer validation (`api/actor.ts`, `IDENTITY_HOST`)
- *   - the web sign-in's token exchange, userinfo and auth-method lookup,
- *     and the bank screens' token refresh (`auth/oidc.ts`)
+ *   - the loan module's bearer validation (`api/actor.ts`), at the issuer
+ *   - the web sign-in's discovery, token exchange and userinfo, and the bank
+ *     screens' token refresh (`auth/oidc.ts`), at the issuer
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 
@@ -29,7 +33,7 @@ import { appOrigin, readIdentitySurface, readWebConfig } from "../lib/config.ts"
 import { fetchApproval, fetchRoster } from "../lib/approvals-store.ts";
 import { readControlPlane, resetToken, runReset } from "../lib/governance/control-plane.ts";
 import { signinCallback } from "../auth/handlers.ts";
-import { identityLink, linkIdentity, type IdentityLink } from "../auth/link.ts";
+import { forgetDiscovery } from "../auth/discovery.ts";
 import { refreshIdpToken } from "../auth/oidc.ts";
 import { SIGNIN_COOKIE, writeLeg, type SigninLeg } from "../auth/session.ts";
 import { actorFromRequest } from "../api/actor.ts";
@@ -39,11 +43,15 @@ import { loanModuleConfig } from "../api/instance.ts";
 const PUBLIC_HOST = "app-public-host.invalid";
 const PORT = "4999";
 const SESSION_SECRET = "server-side-readers-suite-secret-0123456789";
+/** The identity provider: a host of its own, never the app's. */
+const IDP_HOST = "idp.example.invalid";
+const ISSUER = `https://${IDP_HOST}/oauth2/default`;
 
 const ENV = {
   APP_PUBLIC_HOST: PUBLIC_HOST,
   PORT,
   SESSION_SECRET,
+  IDP_ISSUER: ISSUER,
   IDP_CLIENT_ID: "client-c",
   IDP_CLIENT_SECRET: "client-c-secret",
   RESET_TOKEN: "reset-token-for-the-reader-suite",
@@ -52,50 +60,53 @@ const ENV = {
 
 /** Every URL anything in this process asked the network for. */
 let requested: string[] = [];
-/** Every URL the identity provider was asked for, in-process. */
-let answeredInProcess: string[] = [];
 
 const realFetch = globalThis.fetch;
 const previous: Record<string, string | undefined> = {};
-let previousLink: IdentityLink | undefined;
+
+/** The identity provider's answers to the calls sign-in and renewal make. */
+function identityProvider(url: URL): Response {
+  if (url.pathname === "/oauth2/default/.well-known/openid-configuration") {
+    return Response.json({
+      issuer: ISSUER,
+      authorization_endpoint: `${ISSUER}/v1/authorize`,
+      token_endpoint: `${ISSUER}/v1/token`,
+      userinfo_endpoint: `${ISSUER}/v1/userinfo`,
+      jwks_uri: `${ISSUER}/v1/keys`,
+      token_endpoint_auth_methods_supported: ["client_secret_basic"],
+    });
+  }
+  if (url.pathname === "/oauth2/default/v1/token") return Response.json({ access_token: "at-alice", expires_in: 3600, refresh_token: "rt" });
+  if (url.pathname === "/oauth2/default/v1/userinfo") return Response.json({ sub: "alice", email: "alice@bank.example" });
+  return new Response("not found", { status: 404 });
+}
 
 beforeAll(() => {
   for (const [key, value] of Object.entries(ENV)) {
     previous[key] = process.env[key];
     process.env[key] = value;
   }
-  for (const key of ["CONTROL_PLANE_HOST", "IDENTITY_HOST"]) {
+  for (const key of ["CONTROL_PLANE_HOST"]) {
     previous[key] = process.env[key];
     delete process.env[key];
   }
 
   globalThis.fetch = Object.assign(
     async (input: string | URL | Request) => {
-      requested.push(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
-      return new Response("the recorder answers everything with 503", { status: 503 });
+      const href = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      requested.push(href);
+      const url = new URL(href);
+      if (url.host === IDP_HOST) return identityProvider(url);
+      return new Response("the recorder answers everything else with 503", { status: 503 });
     },
     { preconnect: realFetch.preconnect },
   ) as typeof fetch;
-
-  // The identity provider, as this process has it: in-process. A stand-in
-  // that answers the three calls sign-in makes, so the reader runs to the end.
-  previousLink = identityLink();
-  linkIdentity({
-    failure: () => null,
-    async fetch(request) {
-      answeredInProcess.push(request.url);
-      const { pathname } = new URL(request.url);
-      if (pathname === "/identity/health") return Response.json({ oauth: { token_endpoint_auth_method: "client_secret_basic" } });
-      if (pathname === "/oauth2/token") return Response.json({ access_token: "at-alice", expires_in: 3600, refresh_token: "rt" });
-      if (pathname === "/oauth2/userinfo") return Response.json({ sub: "alice", email: "alice@bank.example" });
-      return new Response("not found", { status: 404 });
-    },
-  });
+  forgetDiscovery();
 });
 
 afterAll(() => {
   globalThis.fetch = realFetch;
-  linkIdentity(previousLink);
+  forgetDiscovery();
   for (const [key, value] of Object.entries(previous)) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
@@ -109,14 +120,13 @@ function hosts(urls: string[]): string[] {
 
 function reset() {
   requested = [];
-  answeredInProcess = [];
 }
 
 describe("with APP_PUBLIC_HOST set to the tunnel", () => {
   test("the configuration names it as the public host, so the premise holds", () => {
     const config = readWebConfig();
     expect(config.hooksHost).toBe(PUBLIC_HOST);
-    expect(config.identity.idpIssuer).toBe(`https://${PUBLIC_HOST}`);
+    expect(config.identity.idpIssuer).toBe(ISSUER);
     expect(appOrigin()).toBe(`https://${PUBLIC_HOST}`);
   });
 
@@ -142,19 +152,19 @@ describe("with APP_PUBLIC_HOST set to the tunnel", () => {
     expect(hosts(requested)).toEqual([`localhost:${PORT}`]);
   });
 
-  test("the loan module validates a bearer at the app's own listener", async () => {
+  test("the loan module validates a bearer at the issuer", async () => {
     reset();
-    const { idpHost } = loanModuleConfig();
-    expect(idpHost).toBe(`localhost:${PORT}`);
+    const { idpIssuer } = loanModuleConfig();
+    expect(idpIssuer).toBe(ISSUER);
     await actorFromRequest(
       new Request("http://localhost/loans", { headers: { authorization: "Bearer a-token-nobody-issued" } }),
-      idpHost,
+      idpIssuer,
     ).catch(() => undefined);
     expect(requested.length).toBeGreaterThan(0);
-    expect(hosts(requested)).toEqual([`localhost:${PORT}`]);
+    expect(hosts(requested)).toEqual([IDP_HOST]);
   });
 
-  test("the web sign-in exchanges its code and reads userinfo in-process, and fetches nothing", async () => {
+  test("the web sign-in exchanges its code and reads userinfo at the issuer", async () => {
     reset();
     const config = readIdentitySurface();
     const leg: SigninLeg = { state: "state", verifier: "v".repeat(43), next: "/" };
@@ -170,26 +180,25 @@ describe("with APP_PUBLIC_HOST set to the tunnel", () => {
     // It signed the person in, so every call it needed was answered...
     expect(answer.status).toBe(303);
     expect(answer.headers.getSetCookie().some((each) => each.startsWith("cg_session"))).toBe(true);
-    // ...by the provider in this process, and not one of them by the network.
-    expect(answeredInProcess.map((url) => new URL(url).pathname).sort()).toEqual([
-      "/identity/health",
-      "/oauth2/token",
-      "/oauth2/userinfo",
-    ]);
-    expect(requested).toEqual([]);
+    // ...by the issuer, and nothing else was asked. Discovery is cached, so
+    // it may or may not appear here depending on the order tests ran in.
+    expect(hosts(requested)).toEqual([IDP_HOST]);
+    expect(requested.map((url) => new URL(url).pathname)).toEqual(
+      expect.arrayContaining(["/oauth2/default/v1/token", "/oauth2/default/v1/userinfo"]),
+    );
   });
 
-  test("the bank screens renew their token in-process too", async () => {
+  test("the bank screens renew their token at the issuer too", async () => {
     reset();
     const renewed = await refreshIdpToken({
-      issuer: appOrigin(),
+      issuer: ISSUER,
       clientId: "client-c",
       clientSecret: "client-c-secret",
       refreshToken: "rt",
     });
     expect(renewed.ok).toBe(true);
-    expect(answeredInProcess.map((url) => new URL(url).pathname)).toContain("/oauth2/token");
-    expect(requested).toEqual([]);
+    expect(requested.map((url) => new URL(url).pathname)).toContain("/oauth2/default/v1/token");
+    expect(hosts(requested)).toEqual([IDP_HOST]);
   });
 });
 

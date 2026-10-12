@@ -1,20 +1,22 @@
 /**
- * Sign-in, the gateway hop, and the custom verifier — over real HTTP, against a
- * real `apps/idp`.
+ * Sign-in and the custom verifier, over real HTTP, against an OIDC identity
+ * provider standing in for Okta. There is no gateway hop: the agent calls the
+ * Engine directly with the project key.
  *
  * What is real and what stands in is stated in `identity-harness.ts` and is
- * worth restating because the value of this suite depends on it: the identity
- * provider is the actual service, booted as a subprocess with its own client C;
- * the route handlers are the actual handlers, mounted behind an actual server
- * and driven with a cookie jar; and the only stand-in is Arcade Cloud, at the
- * network edge, speaking the discovery and confirmation chain spikes #04 and
- * #75 measured off the live service.
+ * worth restating because the value of this suite depends on it: the route
+ * handlers are the actual handlers, mounted behind an actual server and driven
+ * with a cookie jar, and they find every identity endpoint through
+ * `IDP_ISSUER`'s discovery document, as they do against Okta. Two things stand
+ * in at the network edge: the identity provider (`scripts/oidc-stand-in.ts`,
+ * shaped like an Okta custom authorization server) and Arcade Cloud, speaking
+ * the confirmation chain spikes #04 and #75 measured off the live service.
  *
  * The measurements this suite exists to make, rather than assume:
  *
- *  - which host renders the login page (cg-idp's, never Arcade's)
- *  - that `prompt=login` actually forces re-authentication on Better Auth, so a
- *    persona switch cannot silently continue as the previous persona
+ *  - which host renders the login page (the identity provider's, never Arcade's)
+ *  - that `prompt=login` is sent and forces re-authentication, so a persona
+ *    switch cannot silently continue as the previous persona
  *  - that `confirm_user` receives the email from the sealed session and nothing
  *    from the request
  *  - that `next_uri` is fetched server-side, without which the grant does not
@@ -24,7 +26,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:tes
 
 import { deploymentReadiness, readIdentitySurface, readWebConfig } from "../lib/config.ts";
 import { readSession } from "../auth/session.ts";
-import { SIGNIN_PATH } from "../auth/handlers.ts";
+import { CHAT_PAGE, SIGNIN_PATH } from "../auth/handlers.ts";
 import { SESSION_SECRET_MIN_LENGTH, sessionSecretProblem } from "../auth/seal.ts";
 import {
   Browser,
@@ -35,12 +37,10 @@ import {
   type IdentityHarness,
 } from "./identity-harness.ts";
 import { bootTestControlPlane } from "./control-plane-instance.ts";
-import { openTestIdentity } from "./identity-instance.ts";
 import { openTestLoanBook } from "./loan-module-instance.ts";
 
 bootTestControlPlane();
 openTestLoanBook();
-await openTestIdentity();
 
 /** Put `process.env` back exactly as it was, including keys that were unset. */
 function restoreEnv(previous: NodeJS.ProcessEnv, keys: string[]) {
@@ -90,26 +90,25 @@ function sessionOf(browser: Browser) {
 
 describe("signing in as a person", () => {
   /**
-   * #176's third criterion, against the real IdP.
+   * #176's third criterion, against the identity provider.
    *
    * The bank's chrome renders **one** `Sign in` and its href is this path with
    * nothing on it — no persona hint, because there are no persona buttons left
    * to have pressed. What has to still be true is the thing that was always the
-   * point: the browser lands on **cg-idp's** login page, and the person who
+   * point: the browser lands on **the identity provider's** login page, and the person who
    * comes back is whoever types a password there.
    *
    * The literal is imported rather than typed, so this and
    * `components/identity/SessionChrome.tsx` cannot drift into testing different
    * addresses.
    */
-  test("the chrome's one Sign in lands on cg-idp's login page, with no persona chosen", async () => {
+  test("the chrome's one Sign in lands on the identity provider's login page, with no persona chosen", async () => {
     const browser = new Browser();
     const started = await browser.fetch(`${harness.webUrl}${SIGNIN_PATH}`);
 
     expect(started.status).toBe(303);
     const authorize = new URL(started.headers.get("location")!);
-    expect(authorize.origin).toBe(harness.idpUrl);
-    expect(authorize.pathname).toBe("/oauth2/authorize");
+    expect(`${authorize.origin}${authorize.pathname}`).toBe(harness.idp.endpoints.authorize);
     expect(authorize.searchParams.get("client_id")).toBe(harness.config.identity.idpClientId);
     expect(authorize.searchParams.get("redirect_uri")).toBe(`${harness.webUrl}/api/auth/callback`);
     // Still forced re-authentication, so a browser that was somebody a moment
@@ -117,7 +116,7 @@ describe("signing in as a person", () => {
     expect(authorize.searchParams.get("prompt")).toBe("login");
 
     const landed = await browser.follow(authorize.toString(), (fields) => fields, { limit: 4 });
-    expect(new URL(landed.url).origin).toBe(harness.idpUrl);
+    expect(new URL(landed.url).origin).toBe(new URL(harness.idpUrl).origin);
     expect(landed.html).toContain("Sign in");
   });
 
@@ -127,9 +126,8 @@ describe("signing in as a person", () => {
 
     expect(started.status).toBe(303);
     const authorize = new URL(started.headers.get("location")!);
-    // The IdP's own origin, and the IdP's own authorize endpoint.
-    expect(authorize.origin).toBe(harness.idpUrl);
-    expect(authorize.pathname).toBe("/oauth2/authorize");
+    // The authorize endpoint the issuer's discovery document names.
+    expect(`${authorize.origin}${authorize.pathname}`).toBe(harness.idp.endpoints.authorize);
     expect(authorize.searchParams.get("client_id")).toBe(harness.config.identity.idpClientId);
     expect(authorize.searchParams.get("redirect_uri")).toBe(`${harness.webUrl}/api/auth/callback`);
     expect(authorize.searchParams.get("code_challenge_method")).toBe("S256");
@@ -137,14 +135,15 @@ describe("signing in as a person", () => {
 
     // Follow it and see who actually rendered a form.
     const landed = await browser.follow(authorize.toString(), (fields) => fields, { limit: 4 });
-    expect(new URL(landed.url).origin).toBe(harness.idpUrl);
+    expect(new URL(landed.url).origin).toBe(new URL(harness.idpUrl).origin);
     expect(landed.html).toContain("Sign in");
   });
 
   test("after login the sealed cookie carries Alice's lowercase email", async () => {
     const browser = new Browser();
-    const ended = await signInAs(browser, harness, "dana", { stopAt: "/api/arcade/start" });
-    expect(ended.url).toContain("/api/arcade/start");
+    const ended = await signInAs(browser, harness, "dana", { stopAtLanding: true });
+    // Straight to the bank's screen: there is no hop 1 to send anybody to.
+    expect(ended.url).toBe(`${harness.webUrl}${CHAT_PAGE}`);
 
     const session = await sessionOf(browser);
     expect(session?.email).toBe(PEOPLE.dana.email);
@@ -156,7 +155,7 @@ describe("signing in as a person", () => {
 
   test("the cookie the browser was given is HttpOnly and unreadable without the key", async () => {
     const browser = new Browser();
-    await signInAs(browser, harness, "dana", { stopAt: "/api/arcade/start" });
+    await signInAs(browser, harness, "dana", { stopAtLanding: true });
 
     const sealed = browser.cookies.get("cg_session.0")!;
     expect(sealed).toBeTruthy();
@@ -192,9 +191,9 @@ describe("signing in as a person", () => {
         ...("email" in fields ? { email: PEOPLE.sam.email, password: PEOPLE.sam.password } : {}),
         ...("decision" in fields ? { decision: "allow" } : {}),
       }),
-      { stopAt: "/api/arcade/start" },
+      { stopAtUrl: `${harness.webUrl}${CHAT_PAGE}` },
     );
-    expect(ended.url).toContain("/api/arcade/start");
+    expect(ended.url).toBe(`${harness.webUrl}${CHAT_PAGE}`);
     expect((await sessionOf(browser))?.email).toBe(PEOPLE.sam.email);
   });
 
@@ -218,18 +217,18 @@ describe("signing in as a person", () => {
 describe("switching persona", () => {
   test("Alice then Bob in one browser: the second sign-in asks for a password again", async () => {
     const browser = new Browser();
-    await signInAs(browser, harness, "dana", { stopAt: "/api/arcade/start" });
+    await signInAs(browser, harness, "dana", { stopAtLanding: true });
     expect((await sessionOf(browser))?.email).toBe(PEOPLE.dana.email);
 
-    // The browser still holds the IdP's own session cookie from Alice's login.
-    // This is the condition the measurement needs: without `prompt=login`,
-    // Better Auth would continue the authorization off that session and never
-    // show a form.
-    const idpSessionCookies = [...browser.cookies.keys()].filter((name) => name.includes("session"));
+    // The browser still holds the IdP's own session cookie from Alice's login
+    // (Okta's `sid`). This is the condition the measurement needs: without
+    // `prompt=login`, the provider would continue the authorization off that
+    // session and never show a form.
+    const idpSessionCookies = [...browser.cookies.keys()].filter((name) => name.endsWith("sid"));
     expect(idpSessionCookies.length).toBeGreaterThan(0);
 
     const pagesBefore = browser.pageHosts.length;
-    await signInAs(browser, harness, "sam", { stopAt: "/api/arcade/start" });
+    await signInAs(browser, harness, "sam", { stopAtLanding: true });
 
     // Measured, not assumed. Run with `prompt: "login"` commented out of
     // `signin()`, the same two sign-ins produce:
@@ -258,7 +257,7 @@ describe("switching persona", () => {
 
   test("starting a sign-in clears the old session before leaving, not after coming back", async () => {
     const browser = new Browser();
-    await signInAs(browser, harness, "dana", { stopAt: "/api/arcade/start" });
+    await signInAs(browser, harness, "dana", { stopAtLanding: true });
     expect((await sessionOf(browser))?.email).toBe(PEOPLE.dana.email);
 
     // Press "Sign in as Bob" and then abandon it at the IdP's login page.
@@ -267,11 +266,10 @@ describe("switching persona", () => {
     expect(await sessionOf(browser)).toBeNull();
   });
 
-  test("signing out forgets the persona and the gateway token together", async () => {
+  test("signing out forgets the persona and the IdP token together", async () => {
     const browser = new Browser();
-    await signInAs(browser, harness, "morgan", { stopAt: "/api/arcade/start" });
-    await completeGateway(browser);
-    expect((await sessionOf(browser))?.gateway?.access_token).toBeTruthy();
+    await signInAs(browser, harness, "morgan", { stopAtLanding: true });
+    expect((await sessionOf(browser))?.idp?.access_token).toBeTruthy();
 
     const out = await browser.fetch(`${harness.webUrl}/api/auth/signout`, { method: "POST" });
     expect(out.status).toBe(303);
@@ -279,134 +277,10 @@ describe("switching persona", () => {
   });
 });
 
-/** Drive hop 1 to completion from a signed-in browser and land back on the app. */
-async function completeGateway(browser: Browser) {
-  return browser.follow(
-    `${harness.webUrl}/api/arcade/start`,
-    (fields) => ({ ...fields, ...("decision" in fields ? { decision: "allow" } : {}) }),
-  );
-}
-
-describe("hop 1 — the gateway token", () => {
-  test("after sign-in the gateway authorization completes and a token is stored", async () => {
-    const browser = new Browser();
-    await signInAs(browser, harness, "dana", { stopAt: "/api/arcade/start" });
-    const landed = await completeGateway(browser);
-
-    expect(landed.html).toContain("home");
-    const session = await sessionOf(browser);
-    expect(session?.email).toBe(PEOPLE.dana.email);
-    expect(session?.gateway?.access_token).toMatch(/^gw-access-/);
-    expect(session?.gateway?.refresh_token).toMatch(/^gw-refresh-/);
-    expect(session!.gateway!.expires_at).toBeGreaterThan(Date.now());
-
-    // The redirect URI registered with the gateway is this service's HTTPS-form
-    // public callback, not a loopback port — which is the whole reason
-    // `apps/web` drives this flow instead of `MCPClient.authenticate()`.
-    expect(harness.arcade.registrations.at(-1)?.redirect_uris).toEqual([
-      `${harness.webUrl}/api/arcade/callback`,
-    ]);
-  });
-
-  test("the stored token is the bearer the gateway accepts", async () => {
-    const browser = new Browser();
-    await signInAs(browser, harness, "riley", { stopAt: "/api/arcade/start" });
-    await completeGateway(browser);
-    const session = await sessionOf(browser);
-
-    const listed = await fetch(`${harness.config.arcadeApiUrl}/mcp/cg-demo-us`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${session!.gateway!.access_token}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
-    });
-    expect(listed.status).toBe(200);
-    expect(harness.arcade.bearers.at(-1)).toBe(session!.gateway!.access_token);
-  });
-
-  test("the MCP client is registered once, so consent is not asked again per sign-in", async () => {
-    const before = harness.arcade.registrations.length;
-    const first = new Browser();
-    await signInAs(first, harness, "dana", { stopAt: "/api/arcade/start" });
-    await completeGateway(first);
-    const second = new Browser();
-    await signInAs(second, harness, "sam", { stopAt: "/api/arcade/start" });
-    await completeGateway(second);
-
-    // Arcade renders its gateway consent screen once per persona per MCP client
-    // id, so a fresh registration per sign-in would mean a consent screen per
-    // sign-in. One registration, two personas.
-    expect(harness.arcade.registrations.length).toBe(before);
-  });
-
-  test("starting hop 1 with no session sends the browser to sign in first", async () => {
-    const browser = new Browser();
-    const started = await browser.fetch(`${harness.webUrl}/api/arcade/start`);
-    expect(started.status).toBe(303);
-    expect(started.headers.get("location")).toContain("/api/auth/signin");
-  });
-
-  test("a gateway callback whose state this browser did not issue is refused", async () => {
-    const browser = new Browser();
-    await signInAs(browser, harness, "dana", { stopAt: "/api/arcade/start" });
-    await browser.fetch(`${harness.webUrl}/api/arcade/start`);
-    const forged = await browser.fetch(`${harness.webUrl}/api/arcade/callback?code=x&state=wrong`);
-    expect(forged.status).toBe(400);
-    expect((await sessionOf(browser))?.gateway).toBeUndefined();
-  });
-});
-
-describe("hop 1 — refresh, server-side", () => {
-  test("a token close to expiry is refreshed without the browser doing anything", async () => {
-    const { liveGatewayToken } = await import("../auth/handlers.ts");
-
-    const browser = new Browser();
-    await signInAs(browser, harness, "dana", { stopAt: "/api/arcade/start" });
-    await completeGateway(browser);
-    const session = (await sessionOf(browser))!;
-
-    const refreshesBefore = harness.arcade.refreshes;
-    // Ask for the bearer as if the token were about to expire.
-    const live = await liveGatewayToken(session, harness.config, session.gateway!.expires_at);
-    expect(live.token).toBeTruthy();
-    expect(harness.arcade.refreshes).toBe(refreshesBefore + 1);
-    expect(live.token).not.toBe(session.gateway!.access_token);
-    if (live.token) {
-      expect(live.session.gateway!.expires_at).toBeGreaterThan(session.gateway!.expires_at);
-      // A rotated refresh token replaces the old one; a server that does not
-      // rotate leaves the old one in place rather than losing it.
-      expect(live.session.gateway!.refresh_token).toBeTruthy();
-    }
-  });
-
-  test("a live token is returned as it stands, with no call to the gateway", async () => {
-    const { liveGatewayToken } = await import("../auth/handlers.ts");
-
-    const browser = new Browser();
-    await signInAs(browser, harness, "sam", { stopAt: "/api/arcade/start" });
-    await completeGateway(browser);
-    const session = (await sessionOf(browser))!;
-
-    const refreshesBefore = harness.arcade.refreshes;
-    const live = await liveGatewayToken(session, harness.config);
-    expect(live.token).toBe(session.gateway!.access_token);
-    expect(harness.arcade.refreshes).toBe(refreshesBefore);
-  });
-
-  test("no token at all is reported as a reason, not as an empty string", async () => {
-    const { liveGatewayToken } = await import("../auth/handlers.ts");
-    const live = await liveGatewayToken({ email: PEOPLE.dana.email, signed_in_at: 1 }, harness.config);
-    expect(live.token).toBeNull();
-    if (live.token === null) expect(live.reason).toContain("no gateway token");
-  });
-});
-
 describe("hop 2 — the custom verifier", () => {
   test("with a session it confirms the flow as the signed-in persona and fetches next_uri", async () => {
     const browser = new Browser();
-    await signInAs(browser, harness, "dana", { stopAt: "/api/arcade/start" });
+    await signInAs(browser, harness, "dana", { stopAtLanding: true });
 
     const flowId = `flow-${crypto.randomUUID()}`;
     const verified = await browser.fetch(`${harness.webUrl}/api/arcade/verify?flow_id=${flowId}`);
@@ -427,7 +301,7 @@ describe("hop 2 — the custom verifier", () => {
 
   test("the confirmed identity comes from the session even when the request suggests another", async () => {
     const browser = new Browser();
-    await signInAs(browser, harness, "sam", { stopAt: "/api/arcade/start" });
+    await signInAs(browser, harness, "sam", { stopAtLanding: true });
 
     const flowId = `flow-${crypto.randomUUID()}`;
     // A parameter Arcade does not send and this route does not read. Bob's
@@ -438,7 +312,7 @@ describe("hop 2 — the custom verifier", () => {
 
   test("a request carrying user_id or email is refused outright", async () => {
     const browser = new Browser();
-    await signInAs(browser, harness, "dana", { stopAt: "/api/arcade/start" });
+    await signInAs(browser, harness, "dana", { stopAtLanding: true });
 
     for (const [name, value] of [
       ["user_id", "michael@bank.example"],
@@ -458,7 +332,7 @@ describe("hop 2 — the custom verifier", () => {
 
   test("no flow_id is a clear refusal, not a login", async () => {
     const browser = new Browser();
-    await signInAs(browser, harness, "dana", { stopAt: "/api/arcade/start" });
+    await signInAs(browser, harness, "dana", { stopAtLanding: true });
     const refused = await browser.fetch(`${harness.webUrl}/api/arcade/verify`);
     expect(refused.status).toBe(400);
     expect(await refused.text()).toContain("flow_id");
@@ -466,7 +340,7 @@ describe("hop 2 — the custom verifier", () => {
 
   test("a confirm_user refusal is shown verbatim and nothing is authorized", async () => {
     const browser = new Browser();
-    await signInAs(browser, harness, "dana", { stopAt: "/api/arcade/start" });
+    await signInAs(browser, harness, "dana", { stopAtLanding: true });
     harness.arcade.failConfirm = { status: 400, body: '{"code":400,"msg":"Bad request"}' };
 
     const failed = await browser.fetch(`${harness.webUrl}/api/arcade/verify?flow_id=doomed`);
@@ -479,7 +353,7 @@ describe("hop 2 — the custom verifier", () => {
 
   test("a 200 with no next_uri says so instead of claiming the grant landed", async () => {
     const browser = new Browser();
-    await signInAs(browser, harness, "dana", { stopAt: "/api/arcade/start" });
+    await signInAs(browser, harness, "dana", { stopAtLanding: true });
     harness.arcade.omitNextUri = true;
 
     const answered = await browser.fetch(`${harness.webUrl}/api/arcade/verify?flow_id=no-next`);
@@ -548,42 +422,40 @@ describe("hop 2 — the no-session path, which is the human's case", () => {
 
     // A second browser signing in does not pick up the first one's flow.
     const two = new Browser();
-    await signInAs(two, harness, "morgan", { stopAt: "/api/arcade/start" });
+    await signInAs(two, harness, "morgan", { stopAtLanding: true });
     expect(harness.arcade.confirmations).toEqual([]);
   });
 });
 
 describe("/health", () => {
-  test("it reports the three capability fields", async () => {
+  test("it reports the two capability fields", async () => {
     const ready = deploymentReadiness(harness.config);
     expect(ready).toEqual({
       status: "ok",
       signin: "configured",
-      gateway: "configured",
       verifier: "configured",
     });
 
     expect(deploymentReadiness(readWebConfig({}))).toEqual({
       status: "degraded",
       signin: "missing",
-      gateway: "missing",
       verifier: "missing",
     });
 
     // Each capability fails on its own variables rather than as one flag.
     const signinOnly = readWebConfig({
       APP_PUBLIC_HOST: new URL(harness.webUrl).host,
+      IDP_ISSUER: harness.idpUrl,
       IDP_CLIENT_ID: "c",
       IDP_CLIENT_SECRET: "s",
       SESSION_SECRET: GOOD_SECRET,
     });
     expect(deploymentReadiness(signinOnly)).toEqual({
-      // One of four configured is still `degraded`: a deployment that can sign
-      // Alice in and then cannot make a tool call is not `ok`, and round 2 of
+      // One of two configured is still `degraded`: a deployment that can sign
+      // Alice in and then cannot finish a grant is not `ok`, and round 2 of
       // this PR's review found exactly that shape reporting itself as fine.
       status: "degraded",
       signin: "configured",
-      gateway: "missing",
       verifier: "missing",
     });
   });
@@ -593,10 +465,10 @@ describe("/health", () => {
     try {
       Object.assign(process.env, {
         APP_PUBLIC_HOST: new URL(harness.webUrl).host,
+        IDP_ISSUER: harness.idpUrl,
         IDP_CLIENT_ID: "c",
         IDP_CLIENT_SECRET: "s",
         SESSION_SECRET: GOOD_SECRET,
-        ARCADE_GATEWAY_ID: "cg-demo-us",
         ARCADE_API_KEY: "k",
         // Pinned rather than left to the ambient environment so this stays a
         // test about identity.
@@ -607,19 +479,16 @@ describe("/health", () => {
       // pinned in `app-test/health-control-plane.test.ts`. Since #5 it carries
       // the loan book's, pinned in `app-test/loans/health.test.ts`. What this
       // test is about is unchanged, and still exact.
-      // Since #6 it carries the identity provider's too, the `identity` field,
-      // and since #33 `user_drift`, the two databases held against each other:
-      // the demo cast on both sides, so no drift.
-      const { policy, fixture_drift, injection_detection, warnings, control_plane, loans, identity, user_drift, ...web } =
+      // Since #6 it carries the identity provider's too, the `identity` field:
+      // whether `IDP_ISSUER`'s discovery document answers and names it.
+      const { policy, fixture_drift, injection_detection, warnings, control_plane, loans, identity, ...web } =
         (await (await GET()).json()) as Record<string, unknown>;
       expect(loans).toMatchObject({ status: "ok" });
-      expect(identity).toMatchObject({ status: "ok", people: 4 });
-      expect(user_drift).toBeNull();
+      expect(identity).toEqual({ status: "ok", issuer: harness.idpUrl });
       expect(web).toEqual({
         status: "ok",
         service: "web",
         signin: "configured",
-        gateway: "configured",
         verifier: "configured",
         panel_stream: "fixture",
         reset: "disabled",
@@ -629,7 +498,7 @@ describe("/health", () => {
         control_plane: { status: "healthy" },
       });
     } finally {
-      for (const key of ["APP_PUBLIC_HOST", "IDP_CLIENT_ID", "IDP_CLIENT_SECRET", "SESSION_SECRET", "ARCADE_GATEWAY_ID", "ARCADE_API_KEY", "GOVERNANCE_STREAM"]) {
+      for (const key of ["APP_PUBLIC_HOST", "IDP_ISSUER", "IDP_CLIENT_ID", "IDP_CLIENT_SECRET", "SESSION_SECRET", "ARCADE_API_KEY", "GOVERNANCE_STREAM"]) {
         if (previous[key] === undefined) delete process.env[key];
         else process.env[key] = previous[key];
       }
@@ -643,8 +512,9 @@ describe("a SESSION_SECRET that is set but too weak", () => {
    * Round 1 of this PR's review, verbatim: with `NODE_ENV=production` and
    * `SESSION_SECRET=x`, the built service reached `Ready`, `/health` answered
    * `{"signin":"configured","gateway":"configured","verifier":"configured"}`
-   * and `GET /api/auth/signin?persona=dana` answered `303`. The cookie that
-   * sign-in would go on to write holds two bearer tokens.
+   * (`gateway` has since gone with the gateway) and `GET
+   * /api/auth/signin?persona=dana` answered `303`. The cookie that sign-in
+   * would go on to write holds bearer tokens.
    *
    * A refusal that only fires on an *absent* value misses the case a human
    * actually produces, and every surface said the deployment was fine. These
@@ -654,7 +524,6 @@ describe("a SESSION_SECRET that is set but too weak", () => {
     APP_PUBLIC_HOST: "cg-web-sa31.example.com",
     IDP_CLIENT_ID: "client-c",
     IDP_CLIENT_SECRET: "client-c-secret",
-    ARCADE_GATEWAY_ID: "cg-demo-us",
     ARCADE_API_KEY: "arcade-key",
   };
 
@@ -722,7 +591,6 @@ describe("a SESSION_SECRET that is set but too weak", () => {
     expect(deploymentReadiness(weak)).toEqual({
       status: "degraded",
       signin: "missing",
-      gateway: "missing",
       verifier: "missing",
     });
 
@@ -731,6 +599,7 @@ describe("a SESSION_SECRET that is set but too weak", () => {
     try {
       Object.assign(process.env, {
         ...FILLED,
+        IDP_ISSUER: harness.idpUrl,
         NODE_ENV: "production",
         SESSION_SECRET: "x",
         GOVERNANCE_STREAM: "fixture",
@@ -743,9 +612,8 @@ describe("a SESSION_SECRET that is set but too weak", () => {
       expect(answer.status).toBe(200);
       // The control plane's fields are pinned elsewhere since #4, the loan
       // book's since #5 and the identity provider's since #6; see above.
-      const { policy, fixture_drift, injection_detection, warnings, control_plane, loans, identity, user_drift, ...web } =
+      const { policy, fixture_drift, injection_detection, warnings, control_plane, loans, identity, ...web } =
         (await answer.json()) as Record<string, unknown>;
-      expect(user_drift).toBeNull();
       expect(loans).toMatchObject({ status: "ok" });
       expect(identity).toMatchObject({ status: "ok" });
       expect({ policy, fixture_drift, injection_detection, warnings, control_plane }).toMatchObject({
@@ -755,23 +623,22 @@ describe("a SESSION_SECRET that is set but too weak", () => {
         status: "degraded",
         service: "web",
         signin: "missing",
-        gateway: "missing",
         verifier: "missing",
         // `fixture` rather than `unconfigured`: the panel is watching something
         // it was told to watch, so it is not what makes this `degraded` — the
-        // four missing capabilities are. Both halves of the status expression
+        // missing capabilities are. Both halves of the status expression
         // are exercised, one at a time.
         panel_stream: "fixture",
         reset: "disabled",
       });
     } finally {
-      restoreEnv(previous, [...Object.keys(FILLED), "NODE_ENV", "SESSION_SECRET", "GOVERNANCE_STREAM"]);
+      restoreEnv(previous, [...Object.keys(FILLED), "IDP_ISSUER", "NODE_ENV", "SESSION_SECRET", "GOVERNANCE_STREAM"]);
     }
   });
 
   test("every identity route answers 503 over HTTP and names the minimum", async () => {
     const weak = readIdentitySurface({ ...FILLED, SESSION_SECRET: "x" });
-    const { gatewayStart, signin, signinCallback, verify } = await import("../auth/handlers.ts");
+    const { signin, signinCallback, verify } = await import("../auth/handlers.ts");
 
     const server = Bun.serve({
       port: 0,
@@ -779,7 +646,6 @@ describe("a SESSION_SECRET that is set but too weak", () => {
         const { pathname } = new URL(request.url);
         if (pathname === "/api/auth/signin") return signin(request, weak);
         if (pathname === "/api/auth/callback") return signinCallback(request, weak);
-        if (pathname === "/api/arcade/start") return gatewayStart(request, weak);
         if (pathname === "/api/arcade/verify") return verify(request, weak);
         return new Response("not found", { status: 404 });
       },
@@ -790,7 +656,6 @@ describe("a SESSION_SECRET that is set but too weak", () => {
       for (const path of [
         "/api/auth/signin?persona=dana",
         "/api/auth/callback?code=x&state=y",
-        "/api/arcade/start",
         "/api/arcade/verify?flow_id=f1",
       ]) {
         const answer = await fetch(`${base}${path}`, { redirect: "manual" });
@@ -820,9 +685,11 @@ describe("an unconfigured deployment", () => {
 
     const signinAnswer = await signin(new Request("https://cg-web-sa31.example.com/api/auth/signin"), bare);
     expect(signinAnswer.status).toBe(503);
-    // `APP_PUBLIC_HOST` since #6, which replaced `IDP_ISSUER`: the issuer is
-    // the app's own origin now.
-    expect(await signinAnswer.text()).toContain("APP_PUBLIC_HOST");
+    // Every missing variable, by name: the app's own host and the identity
+    // provider's issuer are two different things to set.
+    const signinText = await signinAnswer.text();
+    expect(signinText).toContain("APP_PUBLIC_HOST");
+    expect(signinText).toContain("IDP_ISSUER");
 
     const verifyAnswer = await verify(
       new Request("https://cg-web-sa31.example.com/api/arcade/verify?flow_id=x"),
@@ -847,6 +714,7 @@ describe("an unconfigured deployment", () => {
       Object.assign(process.env, {
         NODE_ENV: "production",
         APP_PUBLIC_HOST: new URL(harness.webUrl).host,
+        IDP_ISSUER: harness.idpUrl,
         IDP_CLIENT_ID: "c",
         IDP_CLIENT_SECRET: "s",
         SESSION_SECRET: GOOD_SECRET,
@@ -856,9 +724,9 @@ describe("an unconfigured deployment", () => {
       const { signin } = await import("../auth/handlers.ts");
       const answer = await signin(new Request(`${harness.webUrl}/api/auth/signin?persona=dana`));
       expect(answer.status).toBe(303);
-      expect(answer.headers.get("location")).toContain(`${harness.idpUrl}/oauth2/authorize`);
+      expect(answer.headers.get("location")).toContain(harness.idp.endpoints.authorize);
     } finally {
-      for (const key of ["NODE_ENV", "APP_PUBLIC_HOST", "IDP_CLIENT_ID", "IDP_CLIENT_SECRET", "SESSION_SECRET", "APPROVALS_STORE_TOKEN"]) {
+      for (const key of ["NODE_ENV", "APP_PUBLIC_HOST", "IDP_ISSUER", "IDP_CLIENT_ID", "IDP_CLIENT_SECRET", "SESSION_SECRET", "APPROVALS_STORE_TOKEN"]) {
         if (previous[key] === undefined) delete process.env[key];
         else process.env[key] = previous[key];
       }

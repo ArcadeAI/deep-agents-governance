@@ -168,12 +168,12 @@ describe("running a reset through it", () => {
 
     expect(outcome.ok).toBe(true);
     expect(outcome.detail).toMatch(/audit log cleared/);
-    // The two a presenter would otherwise assume moved. `idp.db` is the one
-    // worth saying out loud (#123): this button signs nobody out, which is why
+    // The two a presenter would otherwise assume moved. The identity provider
+    // is the one worth saying out loud (#123): this button signs nobody out, which is why
     // it is safe between takes — and a presenter who wants the sign-in and
     // authorization flow back from clean needs the other reset, not this one.
     expect(outcome.detail).toMatch(/loans\.db/);
-    expect(outcome.detail).toMatch(/idp\.db/);
+    expect(outcome.detail).toMatch(/identity provider/);
     expect(outcome.detail).toMatch(/nobody was signed out/);
     expect(await auditRows()).toBe(0);
   });
@@ -181,7 +181,7 @@ describe("running a reset through it", () => {
   test("neither mode can reach anything but cg-hooks", async () => {
     // The structural half of the claim above, and the one that survives a
     // rewording: the panel has exactly one address, so there is no path from
-    // either button to idp.db or loans.db at all. #174 adds a third mode that
+    // either button to the identity provider or loans.db at all. #174 adds a third mode that
     // deliberately does reach all three; this pins what the two existing ones
     // are.
     const asked: string[] = [];

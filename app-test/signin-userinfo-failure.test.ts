@@ -1,5 +1,5 @@
 /**
- * What the sign-in callback tells a person when `/oauth2/userinfo` does not
+ * What the sign-in callback tells a person when the userinfo endpoint does not
  * yield an email.
  *
  * #166 is the reason this file exists. Alice could not sign in on the live
@@ -14,37 +14,48 @@
  * So these drive the real handler against a provider that fails in each of
  * the three different ways, and assert on what the page *says*.
  *
- * Since #6 the handler reaches the provider in-process, through
- * `auth/link.ts`, never over the network, so the stand-in is linked
- * there rather than served on a port: the handler's requests to it are the
- * same `Request`s it would send the app's own Better Auth.
+ * The provider is a small issuer served on a port of its own: a discovery
+ * document, a token endpoint and a userinfo endpoint whose answer each test
+ * chooses. The handler finds the last two through the first, as it finds
+ * Okta's.
  */
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
 
 import { readIdentitySurface } from "../lib/config.ts";
 import { signinCallback } from "../auth/handlers.ts";
-import { linkIdentity } from "../auth/link.ts";
+import { forgetDiscovery } from "../auth/discovery.ts";
 import { SIGNIN_COOKIE, writeLeg, type SigninLeg } from "../auth/session.ts";
 
 const SESSION_SECRET = "userinfo-failure-suite-secret-0123456789";
 const STATE = "state-from-this-browser";
 
-/** How the stand-in provider answers `/oauth2/userinfo` for the next request. */
+/** How the stand-in provider answers userinfo for the next request. */
 let userinfoAnswer: { status: number; body: string; contentType?: string } = {
   status: 200,
   body: JSON.stringify({ sub: "alice", email: "alice@bank.example" }),
 };
 
-const idp = {
-  async fetch(request: Request): Promise<Response> {
+const idp: Bun.Server<undefined> = Bun.serve({
+  hostname: "127.0.0.1",
+  port: 0,
+  async fetch(request): Promise<Response> {
     const { pathname } = new URL(request.url);
-    // `advertisedAuthMethod` reads this before every token request.
-    if (pathname === "/identity/health") return Response.json({ oauth: { token_endpoint_auth_method: "client_secret_basic" } });
-    if (pathname === "/oauth2/token") {
+    const issuer: string = `http://127.0.0.1:${idp.port}/oauth2/default`;
+    if (pathname === "/oauth2/default/.well-known/openid-configuration") {
+      return Response.json({
+        issuer,
+        authorization_endpoint: `${issuer}/v1/authorize`,
+        token_endpoint: `${issuer}/v1/token`,
+        userinfo_endpoint: `${issuer}/v1/userinfo`,
+        jwks_uri: `${issuer}/v1/keys`,
+        token_endpoint_auth_methods_supported: ["client_secret_basic"],
+      });
+    }
+    if (pathname === "/oauth2/default/v1/token") {
       await request.text();
       return Response.json({ access_token: "at-alice", token_type: "Bearer", expires_in: 3600 });
     }
-    if (pathname === "/oauth2/userinfo") {
+    if (pathname === "/oauth2/default/v1/userinfo") {
       return new Response(userinfoAnswer.body, {
         status: userinfoAnswer.status,
         headers: { "content-type": userinfoAnswer.contentType ?? "application/json" },
@@ -52,18 +63,19 @@ const idp = {
     }
     return new Response("not found", { status: 404 });
   },
-};
-linkIdentity({ fetch: idp.fetch, failure: () => null });
+});
 
 const config = readIdentitySurface({
   APP_PUBLIC_HOST: "localhost:3999",
+  IDP_ISSUER: `http://127.0.0.1:${idp.port}/oauth2/default`,
   IDP_CLIENT_ID: "client-c",
   IDP_CLIENT_SECRET: "client-c-secret",
   SESSION_SECRET,
 });
 
 afterAll(() => {
-  linkIdentity(undefined);
+  idp.stop(true);
+  forgetDiscovery();
 });
 
 afterEach(() => {
@@ -85,7 +97,7 @@ async function callback(): Promise<Response> {
   );
 }
 
-describe("when /oauth2/userinfo will not name the person", () => {
+describe("when userinfo will not name the person", () => {
   test("a 429 says it is a 429, and does not claim anything about email", async () => {
     userinfoAnswer = { status: 429, body: '{"message":"Too many requests. Please try again later."}' };
 

@@ -1,17 +1,17 @@
 {
   "id": "app-identity",
   "type": "oauth2",
-  "description": "The Loans Approval Limits app's own identity provider (hop 2)",
+  "description": "The Loans Approval Limits app's identity provider (hop 2)",
   "oauth2": {
-    "client_id": "<ARCADE_CLIENT_ID>",
-    "client_secret": "<ARCADE_CLIENT_SECRET>",
+    "client_id": "<IDP_CLIENT_ID>",
+    "client_secret": "<IDP_CLIENT_SECRET>",
     "scope_delimiter": " ",
     "pkce": {
       "enabled": true,
       "code_challenge_method": "S256"
     },
     "authorize_request": {
-      "endpoint": "https://<APP_PUBLIC_HOST>/oauth2/authorize",
+      "endpoint": "<IDP_ISSUER>/v1/authorize",
       "params": {
         "response_type": "code",
         "client_id": "{{client_id}}",
@@ -20,20 +20,18 @@
       }
     },
     "token_request": {
-      "endpoint": "https://<APP_PUBLIC_HOST>/oauth2/token",
+      "endpoint": "<IDP_ISSUER>/v1/token",
       "method": "POST",
       "auth_method": "client_secret_basic",
       "params": {
         "grant_type": "authorization_code",
-        "redirect_uri": "{{redirect_uri}}",
-        "client_id": "{{client_id}}",
-        "client_secret": "{{client_secret}}"
+        "redirect_uri": "{{redirect_uri}}"
       },
       "request_content_type": "application/x-www-form-urlencoded",
       "response_content_type": "application/json"
     },
     "user_info_request": {
-      "endpoint": "https://<APP_PUBLIC_HOST>/oauth2/userinfo",
+      "endpoint": "<IDP_ISSUER>/v1/userinfo",
       "method": "GET",
       "auth_method": "bearer_access_token",
       "response_content_type": "application/json",

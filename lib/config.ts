@@ -18,13 +18,13 @@ import { publicHost } from "./public-host.ts";
 import { sessionSecretProblem } from "../auth/seal.ts";
 
 /**
- * Who the browser is signed in as, and the two OAuth hops that follow from it.
+ * Who the browser is signed in as, and the OAuth hop that follows from it.
  *
- * `DESIGN.md` → **Identity** and **Two hops, two mechanisms**. Everything here
+ * `DESIGN.md` → **Identity**. Everything here
  * is read from the environment and none of it has a development fallback: an
  * identity provider you can reach without configuring one is a fixture that
  * would eventually be mistaken for a login. `/health` reports which of the
- * three capabilities the environment actually configured, so an unset variable
+ * two capabilities the environment actually configured, so an unset variable
  * is visible before somebody discovers it mid-rehearsal.
  *
  * `idpIssuer` and `publicUrl` are **URLs**, not the HOST-form the cross-service
@@ -34,13 +34,13 @@ import { sessionSecretProblem } from "../auth/seal.ts";
  */
 export interface IdentityConfig {
   /**
-   * The identity provider's public origin and OAuth issuer, no trailing slash:
-   * `appOrigin`, since #6 folded `apps/idp` into the app. It was `IDP_ISSUER`.
-   * Only a browser is ever sent here; this server reaches the provider
-   * in-process (`auth/link.ts`).
+   * `IDP_ISSUER`: the identity provider's OAuth issuer, no trailing slash. An
+   * Okta custom authorization server in the workshop
+   * (`https://<org>.okta.com/oauth2/default`). Every endpoint is read from its
+   * discovery document (`auth/discovery.ts`), never spelled here.
    */
   idpIssuer: string;
-  /** Client C: this service's own registration at the IdP, separate from the two Arcade holds. */
+  /** The Okta Web app's client id and secret, shared with the two registrations Arcade holds. */
   idpClientId: string;
   idpClientSecret: string;
   /** What sign-in asks for. `email` is the join key, so it is not optional. */
@@ -49,29 +49,39 @@ export interface IdentityConfig {
   sessionSecret: string;
   /**
    * This app's own public origin, no trailing slash. Every redirect_uri is
-   * built from it. `appOrigin` since #6; it was `PUBLIC_URL`, and it cannot
-   * differ from `idpIssuer` any more — see `appPublicHost`.
+   * built from it. `appOrigin` since #6; it was `PUBLIC_URL`.
    */
   publicUrl: string;
   /**
-   * Whether `APP_PUBLIC_HOST` is set, rather than `idpIssuer` and `publicUrl`
-   * being the localhost fallback. The sign-in and the verifier refuse to run
-   * on the fallback: a deployment that forgot the variable would otherwise
-   * register `http://localhost:3000/...` redirect URIs and name a localhost
-   * issuer, and the failure would land at Arcade, where no hook fires.
+   * Whether `APP_PUBLIC_HOST` is set, rather than `publicUrl` being the
+   * localhost fallback. The sign-in and the verifier refuse to run on the
+   * fallback: a deployment that forgot the variable would otherwise send
+   * `http://localhost:3000/...` redirect URIs, and the failure would land at
+   * Arcade, where no hook fires.
    */
   publicHostConfigured: boolean;
-  /** `ARCADE_GATEWAY_ID` — `cg-demo-us`, the User Source gateway hop 1 authorizes against. */
-  gatewayId: string;
   /**
    * Arcade Cloud, which is a different host from `arcadeApiUrl`.
    *
    * `confirm_user` is `https://cloud.arcade.dev/api/v1/oauth/confirm_user`
    * (measured, spike #75) while tools execute against `api.arcade.dev`. One
    * variable for each, because pointing a test at a stand-in has to move the
-   * verifier's calls without moving the gateway's.
+   * verifier's calls without moving the Engine's.
    */
   cloudUrl: string;
+  /**
+   * `ARCADE_GATEWAY_ID`: the slug of the MCP gateway `bun run setup-arcade
+   * --gateway` registered, or `""`. Optional, and the agent never reads it:
+   * it calls the Engine directly. Set, the home page shows how to connect an
+   * MCP client such as Claude Code to the same tools under the same hooks
+   * (`components/identity/McpClientPanel.tsx`, `docs/modules/03-govern.md`).
+   */
+  gatewayId: string;
+}
+
+/** Where an MCP client connects to the gateway, `<Engine>/mcp/<slug>`, or `null` with no gateway. The same URL `setup-arcade` prints. */
+export function gatewayUrl(config: IdentitySurface): string | null {
+  return config.identity.gatewayId === "" ? null : `${config.arcadeApiUrl}/mcp/${config.identity.gatewayId}`;
 }
 
 export interface WebConfig {
@@ -98,7 +108,7 @@ export interface WebConfig {
   arcadeApiKey: string;
   /** `tool.toolkit` as Arcade files the deployed approvals toolkit. */
   toolkit: string;
-  /** Sign-in, the gateway hop, and the custom verifier route. */
+  /** Sign-in and the custom verifier route. */
   identity: IdentityConfig;
 }
 
@@ -157,7 +167,7 @@ export function readIdentitySurface(
     arcadeApiUrl: trimUrl(env.ARCADE_API_URL) || "https://api.arcade.dev",
     arcadeApiKey: env.ARCADE_API_KEY?.trim() ?? "",
     identity: {
-      idpIssuer: appOrigin(env),
+      idpIssuer: trimUrl(env.IDP_ISSUER),
       idpClientId: env.IDP_CLIENT_ID?.trim() ?? "",
       idpClientSecret: env.IDP_CLIENT_SECRET?.trim() ?? "",
       // `openid` for an ID token, `email` because the address is the join key
@@ -166,8 +176,8 @@ export function readIdentitySurface(
       sessionSecret: env.SESSION_SECRET?.trim() ?? "",
       publicUrl: appOrigin(env),
       publicHostConfigured: !appPublicHostIsFallback(env),
-      gatewayId: env.ARCADE_GATEWAY_ID?.trim() ?? "",
       cloudUrl: trimUrl(env.ARCADE_CLOUD_URL) || "https://cloud.arcade.dev",
+      gatewayId: env.ARCADE_GATEWAY_ID?.trim() ?? "",
     },
   };
 }
@@ -213,11 +223,12 @@ function trimUrl(value: string | undefined): string {
 /**
  * What `/health` reports, and what each route refuses to run without.
  *
- * Three capabilities rather than one flag, because they fail independently and
+ * Two capabilities rather than one flag, because they fail independently and
  * the person reading `/health` is trying to find out which human step is
- * outstanding. Sign-in needs client C; the gateway hop needs a gateway id on
- * top of a signed-in person; and the verifier needs the Arcade project API
- * key, which nothing else here uses. The agent is not one of them: it is the
+ * outstanding. Sign-in needs client C, and the verifier needs the Arcade
+ * project API key, which nothing else here uses. There is no gateway to
+ * configure: the agent calls the Engine directly with the project key, and the
+ * project's hooks govern every call (`DESIGN.md` → Integration). The agent is not one of them: it is the
  * Deep Agent in `agent/`, and its model key lives in its own environment.
  *
  * A control that silently does nothing is worse than no control, and a
@@ -235,11 +246,11 @@ function trimUrl(value: string | undefined): string {
  */
 export interface DeploymentReadiness {
   /**
-   * `degraded` whenever any of the three below is `missing`, `ok` only when
-   * all three are configured.
+   * `degraded` whenever either of the two below is `missing`, `ok` only when
+   * both are configured.
    *
-   * Round 2 of #84's review ran a cg-web with sign-in configured and
-   * `ARCADE_GATEWAY_ID` absent and got `{"status":"ok", … "gateway":"missing"}`.
+   * Round 2 of #84's review ran a cg-web with sign-in configured and one
+   * capability unset and got `{"status":"ok", …}` with `missing` further down.
    * The top-level word is the one anybody actually reads — it is the first
    * field, it is what the other three services answer, and it is what somebody
    * greps for — so a deployment that cannot make a tool call was describing
@@ -254,19 +265,25 @@ export interface DeploymentReadiness {
    */
   status: "ok" | "degraded";
   signin: "configured" | "missing";
-  gateway: "configured" | "missing";
   verifier: "configured" | "missing";
+  /**
+   * Present only with `ARCADE_GATEWAY_ID`, and never `missing`: the gateway
+   * is optional (`setup-arcade --gateway`), for an MCP client, and the agent
+   * does not use it. Without it the field is absent rather than a word that
+   * would read as a fault, and it never counts towards `status`.
+   */
+  gateway?: "configured";
 }
 
 export function deploymentReadiness(config: IdentitySurface): DeploymentReadiness {
   const capabilities = {
     signin: state(signinProblems(config)),
-    gateway: state(gatewayProblems(config)),
     verifier: state(verifierProblems(config)),
   } as const;
   return {
     status: Object.values(capabilities).every((each) => each === "configured") ? "ok" : "degraded",
     ...capabilities,
+    ...(config.identity.gatewayId === "" ? {} : { gateway: "configured" as const }),
   };
 }
 
@@ -280,24 +297,21 @@ function state(problems: string[]): "configured" | "missing" {
  *
  * The same sentences the 503 pages render and the same ones `/health` counts —
  * one source, three surfaces. Round 2's finding was that a visitor saw none of
- * them: the page rendered its ordinary persona buttons and `Gateway token:
- * none`, and the only way to discover that the gateway was unconfigured was to
- * click into a flow and read a 503. A control plane demo whose own UI hides its
+ * them: the page rendered its ordinary persona buttons, and the only way to
+ * discover that a capability was unconfigured was to click into a flow and
+ * read a 503. A control plane demo whose own UI hides its
  * misconfiguration is arguing against itself.
  */
 export interface ConfigurationProblems {
   signin: string[];
-  gateway: string[];
   verifier: string[];
 }
 
 export function configurationProblems(config: IdentitySurface): ConfigurationProblems {
   return {
     signin: signinProblems(config),
-    // The gateway list is a superset of sign-in's by construction, and
-    // repeating five sentences under two headings is how a banner becomes
+    // Repeating a sentence under two headings is how a banner becomes
     // something people stop reading. Show only what sign-in did not already say.
-    gateway: withoutAll(gatewayProblems(config), signinProblems(config)),
     verifier: withoutAll(verifierProblems(config), signinProblems(config)),
   };
 }
@@ -325,18 +339,10 @@ export function signinProblems(config: IdentitySurface): string[] {
   const secret = sessionSecretProblem(identity.sessionSecret);
   return [
     ...(identity.publicHostConfigured ? [] : ["APP_PUBLIC_HOST is not set"]),
+    ...(identity.idpIssuer ? [] : ["IDP_ISSUER is not set"]),
     ...(identity.idpClientId ? [] : ["IDP_CLIENT_ID is not set"]),
     ...(identity.idpClientSecret ? [] : ["IDP_CLIENT_SECRET is not set"]),
     ...(secret ? [secret] : []),
-  ];
-}
-
-/** The gateway hop is driven after sign-in, so it needs everything sign-in needs. */
-export function gatewayProblems(config: IdentitySurface): string[] {
-  return [
-    ...signinProblems(config),
-    ...(config.identity.gatewayId ? [] : ["ARCADE_GATEWAY_ID is not set"]),
-    ...(config.arcadeApiUrl ? [] : ["ARCADE_API_URL is not set"]),
   ];
 }
 
@@ -375,19 +381,17 @@ export function cookiesAreSecure(config: IdentitySurface): boolean {
  * The ngrok host in a real run, and the one Arcade tool secret besides the
  * store token: `mcp/loan_desk/loans.py` and `mcp/loan_desk/approvals.py` read it too. It replaced
  * one host variable per service — the loan API's, the control plane's and the
- * web UI's, three services that are now one app — and the identity module's
- * `IDP_PUBLIC_URL`, the sign-in's `IDP_ISSUER` and the app's `PUBLIC_URL`,
- * which have to be the same origin once the identity provider is part of the
- * app: Better Auth's session cookie, the app's sealed one and the custom
- * verifier all live on it.
+ * web UI's, three services that are now one app — and the app's `PUBLIC_URL`.
+ * The app's sealed session cookie and the custom verifier live on it. The
+ * identity provider does not: it is Okta, at `IDP_ISSUER`.
  *
  * HOST-form like every address here. Unset, it is this process's own port on
  * localhost, which is what a local run without a tunnel wants.
  *
  * **Addressed to the outside world only.** A server-side read of the app's own
  * modules never goes through it: the tunnel would carry the app's own traffic
- * out and back in. Those reads go in-process, or to `CONTROL_PLANE_HOST` and
- * `IDENTITY_HOST`, which are local. `app-test/server-side-readers.test.ts`
+ * out and back in. Those reads go in-process, or to `CONTROL_PLANE_HOST`,
+ * which is local. `app-test/server-side-readers.test.ts`
  * fails if one targets this host.
  */
 export function appPublicHost(env: Record<string, string | undefined> = process.env): string {
@@ -401,7 +405,7 @@ export function appPublicHostIsFallback(env: Record<string, string | undefined> 
 
 /**
  * `APP_PUBLIC_HOST` with its scheme, and no trailing slash: the app's public
- * origin, the identity module's OAuth issuer and the base of every
+ * origin and the base of every
  * `redirect_uri` this app registers. http for localhost and 127.0.0.1, https
  * for everything else (see {@link baseUrl}).
  */

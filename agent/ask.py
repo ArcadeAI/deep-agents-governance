@@ -3,8 +3,9 @@
     uv run --env-file .env python ask.py "Which loan applications are pending?"
     uv run --env-file .env python ask.py --agent https://<deployment> "Approve LN-2291 at $95K"
 
-Authorization code with PKCE against the app's own identity provider, as the app's web
-client, caught on loopback (`127.0.0.1:8765`, which `setup-arcade` allowlists). The ID token
+Authorization code with PKCE against the loan desk's identity provider (`IDP_ISSUER`, Okta),
+as the Okta app, caught on loopback (`127.0.0.1:8765`, which `okta-setup` allowlists). The
+endpoints are the ones the issuer's discovery document names (`oidc.py`). The ID token
 goes straight into the run as `Authorization: Bearer` and is never printed. MDA verifies it
 (`identity.py`), and the agent makes every Arcade call as the email inside it.
 
@@ -25,6 +26,8 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
+from oidc import discover, issuer as configured_issuer
+
 CALLBACK = ("127.0.0.1", 8765)
 REDIRECT = f"http://{CALLBACK[0]}:{CALLBACK[1]}/callback"
 ASSISTANT = "loan-desk"
@@ -36,12 +39,14 @@ def pkce() -> tuple[str, str]:
     return verifier, challenge
 
 
-def authorize_url(issuer: str, client_id: str, challenge: str, state: str) -> str:
-    return f"{issuer}/oauth2/authorize?" + urllib.parse.urlencode({
+def authorize_url(endpoint: str, client_id: str, challenge: str, state: str) -> str:
+    return f"{endpoint}?" + urllib.parse.urlencode({
         "response_type": "code",
         "client_id": client_id,
         "redirect_uri": REDIRECT,
         "scope": "openid email",
+        # The sign-in is the person asking, every time: never a session left in the browser.
+        "prompt": "login",
         "state": state,
         "code_challenge": challenge,
         "code_challenge_method": "S256",
@@ -75,10 +80,10 @@ def catch_code(state: str) -> str:
     return caught["code"]
 
 
-def id_token(issuer: str, client_id: str, client_secret: str, code: str, verifier: str) -> str:
-    basic = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+def id_token(endpoint: str, client_id: str, client_secret: str, code: str, verifier: str) -> str:
+    basic = base64.b64encode(f"{urllib.parse.quote_plus(client_id)}:{urllib.parse.quote_plus(client_secret)}".encode()).decode()
     request = urllib.request.Request(
-        f"{issuer}/oauth2/token",
+        endpoint,
         data=urllib.parse.urlencode({
             "grant_type": "authorization_code",
             "code": code,
@@ -123,18 +128,20 @@ def main() -> None:
     parser.add_argument("--agent", default=os.environ.get("AGENT_URL") or "http://127.0.0.1:2024")
     args = parser.parse_args()
 
-    missing = [name for name in ("LOAN_DESK_ISSUER", "IDP_CLIENT_ID", "IDP_CLIENT_SECRET") if not os.environ.get(name)]
+    missing = [name for name in ("IDP_CLIENT_ID", "IDP_CLIENT_SECRET") if not os.environ.get(name)]
+    if not (os.environ.get("IDP_ISSUER") or os.environ.get("LOAN_DESK_ISSUER")):
+        missing.insert(0, "IDP_ISSUER")
     if missing:
         sys.exit(f"Not set: {', '.join(missing)}. See agent/.env.example.")
-    issuer = os.environ["LOAN_DESK_ISSUER"].rstrip("/")
+    endpoints = discover(configured_issuer())
 
     verifier, challenge = pkce()
     state = secrets.token_urlsafe(16)
-    url = authorize_url(issuer, os.environ["IDP_CLIENT_ID"], challenge, state)
+    url = authorize_url(endpoints["authorization_endpoint"], os.environ["IDP_CLIENT_ID"], challenge, state)
     print(f"Sign in as the person asking: {url}", file=sys.stderr)
     webbrowser.open(url)
     code = catch_code(state)
-    token = id_token(issuer, os.environ["IDP_CLIENT_ID"], os.environ["IDP_CLIENT_SECRET"], code, verifier)
+    token = id_token(endpoints["token_endpoint"], os.environ["IDP_CLIENT_ID"], os.environ["IDP_CLIENT_SECRET"], code, verifier)
 
     print("\n".join(transcript(ask(args.agent.rstrip("/"), token, args.prompt))))
 

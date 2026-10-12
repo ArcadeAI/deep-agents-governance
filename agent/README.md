@@ -1,12 +1,14 @@
 # The loan desk agent
 
-A LangChain Deep Agent that runs on Managed Deep Agents (MDA) and reaches every tool through
-one Arcade gateway. It is a directory, the way MDA wants it:
+A LangChain Deep Agent that runs on Managed Deep Agents (MDA) and calls the Arcade Engine
+directly with the project key, as the signed-in person. There is no gateway. It is a
+directory, the way MDA wants it:
 
 | File | What it is |
 | --- | --- |
 | `agent.py` | The agent: `define_deep_agent` with Arcade's middleware, nothing else. |
-| `identity.py` | Who may call it: an ID token from the app's own identity provider. |
+| `identity.py` | Who may call it: an ID token from the loan desk's identity provider (Okta). |
+| `oidc.py` | The identity provider's endpoints, read from its discovery document. |
 | `instructions.md` | The system prompt. It describes the tools and carries no limits. |
 | `scripted.py` | A model that needs no key, for a first run and for the tests. |
 | `ask.py` | Signs you in to the app and asks the agent a question from a terminal. |
@@ -27,16 +29,17 @@ In another terminal, from this directory:
 uv run --env-file .env python ask.py "Which loan applications are pending?"
 ```
 
-`ask.py` opens the app's sign-in page, catches the redirect on
-`http://127.0.0.1:8765/callback` (which `bun run setup-arcade` allowlists for the app's web
-client), trades the code for an ID token and sends the question with it. It prints each tool
+`ask.py` opens Okta's sign-in page, catches the redirect on
+`http://127.0.0.1:8765/callback` (which `bun run okta-setup` allowlists on the Okta app),
+trades the code for an ID token and sends the question with it. It prints each tool
 call, each tool result and the answer. `--agent <url>` sends it somewhere other than the local
 server; `AGENT_URL` in `.env` does the same.
 
 ## Who the caller is
 
-`identity.py` tells MDA to accept only an ID token the app signed: issuer
-`LOAN_DESK_ISSUER`, keys at `LOAN_DESK_ISSUER/jwks`, audience `IDP_CLIENT_ID`, RS256. The
+`identity.py` tells MDA to accept only an ID token Okta signed for the loan desk: issuer
+`IDP_ISSUER`, keys at the `jwks_uri` its discovery document names, audience `IDP_CLIENT_ID`,
+RS256. (`LOAN_DESK_ISSUER`, the name before Okta, is still read when `IDP_ISSUER` is blank.) The
 token's `email` claim becomes the caller. The middleware reads it from the run and passes it to
 Arcade as the user id on every tool call, so the hooks see the person, never the agent. No
 token, or a token from anywhere else, and MDA answers 401 before the agent runs.
@@ -45,7 +48,15 @@ token, or a token from anywhere else, and MDA answers 401 before the agent runs.
 
 With `MODEL_ID` unset the agent runs `ScriptedModel`: it selects the loan desk's search tool,
 calls `LoanDesk_SearchLoans` for pending requests and answers with what came back. That is
-enough to prove the sign-in, the gateway and the hooks with no model key.
+enough to prove the sign-in and the hooks with no model key.
+
+## Tool Rec is unscoped
+
+With no gateway, Tool Rec searches the whole catalog, not just the loan desk. It may offer
+catalog tools such as Ashby or ClickUp alongside the six LoanDesk tools and Gmail and Slack.
+The project's hooks still govern every call the agent makes, so nothing here relies on
+search to hide a tool: a tool the hooks refuse is refused when it is called, whoever found
+it.
 
 For a real model:
 

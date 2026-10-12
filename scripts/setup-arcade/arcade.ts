@@ -28,9 +28,17 @@
  *   `GET` on the same path, because a verifier that did not take is open
  *   risk 2 (DESIGN.md) and fails where no hook fires.
  *
- * Since #30 two more go through the API, under the org and project
+ * One more is optional, under `--gateway`: an MCP gateway,
+ * `POST /v1/orgs/{org_id}/projects/{project_id}/gateways`
+ * (`schemas.CreateGatewayRequest`), found first by slug in `GET …/gateways`
+ * and read back with `GET …/gateways/{id}`. It authenticates through a User
+ * Source, which only the Coordinator API creates (`coordinator.ts`). The
+ * agent never uses it: it is for an MCP client such as Claude Code, so the
+ * same hooks can be watched from one (`docs/modules/03-govern.md`).
+ *
+ * Since #30 the hooks go through the API too, under the org and project
  * `context.ts` resolves, because the human measured that a project key is
- * answered there (`GET …/plugins` and `GET …/gateways`, 200). Field names are
+ * answered there (`GET …/plugins`, 200). Field names are
  * the live swagger's (`api.arcade.dev/v1/swagger`, fetched on #30); methods
  * are the swagger's too, and unproven until the live run, which is how the
  * secrets' POST turned out wrong (#26):
@@ -41,21 +49,15 @@
  *   (`schemas.PatchPluginRequest`) when it differs: hooks are not the access
  *   model the way the provider is. Read back with `GET …/plugins/{id}` and the
  *   hooks it made, `GET …/hooks?plugin_id=`, which is where a hook's phase and
- *   failure mode are reported. **Created disabled** (#48): `status` is
+ *   failure mode are reported. **Created on**: `status` is
  *   `plugins.PluginStatus` and each endpoint's `plugins.HookPointStatus`, both
- *   `["inactive", "active"]` in the live swagger. Active hooks also filter the
- *   tool list the dashboard's gateway form shows, so the Loans and Approvals
- *   tools could not be picked there while they were on. The hooks are
- *   `PATCH`ed to `active` only once a gateway under the slug exists.
+ *   `["inactive", "active"]` in the live swagger, and hooks found `inactive`
+ *   are `PATCH`ed to `active`. #48 created them disabled because active hooks
+ *   filter the tool list the dashboard's gateway form shows; there is no
+ *   gateway any more, so nothing needs them off.
  *
- * The gateway, since #52: once the Coordinator API (`coordinator.ts`) gives
- * this script the User Source's id, it creates the gateway through it,
- * `POST …/gateways` ({@link gatewayBody}), and reads it back. When the
- * Coordinator call fails, the gateway is only read, never written, as in #48:
- * `GET …/gateways`, to find the slug the gateway form names, and check its
- * `auth_type` and `tool_filter` (`schemas.GatewayResponse`). The project key
- * has no User Source route on this API (`…/user_sources` answered 404 on #7),
- * so without the Coordinator both are dashboard forms (`forms.ts`).
+ * Nothing here registers a User Source or an MCP gateway: the agent calls the
+ * Engine directly with the project key (DESIGN.md → Integration).
  *
  * Nothing here calls the bare `/v1/plugins`, which real Arcade answers 404
  * (#28), and nothing names the header auth type, which is Arcade Headers mode
@@ -66,11 +68,10 @@
  * selects the project (spec `securitySchemes.Bearer`).
  */
 /**
- * The hop-2 provider id, fixed because `mcp/loan_desk/loans.py` reads `OAuth2(id=...)` at
- * import. A literal rather than an import of the identity provider's
- * constant: nothing outside `auth/` imports the provider's internals
- * (`only-identity-mints.test.ts`). `app-test/identity/provider-id.test.ts`
- * fails if this, the provider's and `mcp/loan_desk/loans.py`'s ever disagree.
+ * The hop-2 provider id, fixed because `mcp/loan_desk/loans.py` reads
+ * `OAuth2(id=...)` at import. `app-test/auth-config.test.ts` fails if this,
+ * `auth-config/app-identity-provider.json`'s and `mcp/loan_desk/loans.py`'s
+ * ever disagree.
  */
 export const PROVIDER_ID = "app-identity";
 
@@ -79,33 +80,35 @@ export interface Registration {
   host: string;
   /** `https://<host>`. */
   origin: string;
-  /** The `arcade` OAuth client at the app's identity provider. */
-  arcadeClientId: string;
-  arcadeClientSecret: string;
+  /** The identity provider's endpoints, from `IDP_ISSUER`'s discovery document. */
+  endpoints: { authorize: string; token: string; userinfo: string };
+  /** The OIDC client at the identity provider: `IDP_CLIENT_ID`, the same one the app signs in with. */
+  clientId: string;
+  clientSecret: string;
   approvalsStoreToken: string;
 }
 
 /**
  * The hop-2 provider, in the shape the demo's working `cg-idp` registration
- * was read back in (the custom-verifier spike, against a real Arcade project)
- * with only the host and the id changed: HTTP Basic on the token
- * request, the client credentials also kept as request parameters (DESIGN.md:
- * those parameters stay, and the app accepts both), PKCE S256, and the user id
- * read from userinfo at `$.email`, which is what makes the email the join key.
+ * was read back in (the custom-verifier spike, against a real Arcade project),
+ * pointed at the identity provider's discovered endpoints: HTTP Basic on the
+ * token request and no credentials in the body (Okta refuses a request that
+ * carries both), PKCE S256, and the user id read from userinfo at `$.email`,
+ * which is what makes the email the join key.
  */
 export function providerBody(registration: Registration) {
-  const { origin } = registration;
+  const { endpoints } = registration;
   return {
     id: PROVIDER_ID,
     type: "oauth2",
-    description: "The Loans Approval Limits app's own identity provider (hop 2)",
+    description: "The Loans Approval Limits app's identity provider (hop 2)",
     oauth2: {
-      client_id: registration.arcadeClientId,
-      client_secret: registration.arcadeClientSecret,
+      client_id: registration.clientId,
+      client_secret: registration.clientSecret,
       scope_delimiter: " ",
       pkce: { enabled: true, code_challenge_method: "S256" },
       authorize_request: {
-        endpoint: `${origin}/oauth2/authorize`,
+        endpoint: endpoints.authorize,
         params: {
           response_type: "code",
           client_id: "{{client_id}}",
@@ -114,20 +117,18 @@ export function providerBody(registration: Registration) {
         },
       },
       token_request: {
-        endpoint: `${origin}/oauth2/token`,
+        endpoint: endpoints.token,
         method: "POST",
         auth_method: "client_secret_basic",
         params: {
           grant_type: "authorization_code",
           redirect_uri: "{{redirect_uri}}",
-          client_id: "{{client_id}}",
-          client_secret: "{{client_secret}}",
         },
         request_content_type: "application/x-www-form-urlencoded",
         response_content_type: "application/json",
       },
       user_info_request: {
-        endpoint: `${origin}/oauth2/userinfo`,
+        endpoint: endpoints.userinfo,
         method: "GET",
         auth_method: "bearer_access_token",
         response_content_type: "application/json",
@@ -388,8 +389,8 @@ export interface PluginComparison {
  * difference** for it: a run that turns the hooks on and cannot read `active`
  * back has not turned them on. Each hook's status is held to the same value
  * when Arcade reports it. `null` leaves both statuses out, for a comparison of
- * the configuration alone: which state the hooks are in is the gateway
- * check's to decide, at the end of the run.
+ * the configuration alone: the run then decides from the status whether the
+ * hooks still have to be turned on.
  */
 export function pluginDifferences(plugin: unknown, hooks: unknown[], origin: string, status: HooksStatus | null): PluginComparison {
   const result: PluginComparison = { differences: [], unverified: [] };
@@ -428,141 +429,6 @@ export function unverifiedLine({ path, sent }: { path: string; sent: string }): 
   return `hooks: Arcade doesn't echo ${path} back; it was sent as ${sent} and can't be verified`;
 }
 
-/**
- * Arcade's own Gmail and Slack tools, which the agent uses to tell people about
- * a decision and to ask for an approval. They are Arcade's built-in providers,
- * not part of `mcp/`: nothing is deployed for them, and each person authorizes
- * their own account the first time the agent calls one.
- */
-export const NATIVE_TOOLS = ["Gmail.SendEmail", "Gmail.ListEmails", "Slack.SendMessage"] as const;
-
-/**
- * The tools the agent is given, as a gateway's `tool_filter` names them: `Toolkit.Tool`.
- * The six from the one `LoanDesk` deployment, then Gmail and Slack.
- */
-export function gatewayTools(toolkit: string): string[] {
-  return [
-    ...["SearchLoans", "GetLoan", "ApproveLoan", "DenyLoan"].map((tool) => `${toolkit}.${tool}`),
-    ...["RequestApproval", "Decide"].map((tool) => `${toolkit}.${tool}`),
-    ...NATIVE_TOOLS,
-  ];
-}
-
-/**
- * The Gmail and Slack tools a gateway that already exists lacks, when they are
- * all it lacks: the six loan and approvals tools present, some of the native
- * ones missing. That is a gateway made before the native tools were added, and
- * the one case `setup-arcade` edits a gateway it did not just create: it only
- * ever adds these, and never touches the gateway's authentication. Anything
- * else missing is a warning, as before. Empty when there is nothing to add.
- */
-export function nativeToolsToAdd(gateway: unknown, toolkit: string): string[] {
-  const tools = at(gateway, "tool_filter.allowed_tools");
-  if (!Array.isArray(tools)) return [];
-  const have = new Set((tools as unknown[]).map(String));
-  const deployed = gatewayTools(toolkit).filter((tool) => !(NATIVE_TOOLS as readonly string[]).includes(tool));
-  if (deployed.some((tool) => !have.has(tool))) return [];
-  return NATIVE_TOOLS.filter((tool) => !have.has(tool));
-}
-
-/**
- * `PATCH …/gateways/{id}` adding `add` to the gateway's tool list and keeping
- * every tool it already has. Only `tool_filter` is sent: measured against
- * Arcade on 2026-10-06, a six-tool gateway answered 200 and read back with
- * the added tools and every other field as it was. The caller still treats a
- * refusal as a warning, not a failure.
- */
-export function gatewayToolsPatch(gateway: unknown, add: string[]) {
-  const tools = at(gateway, "tool_filter.allowed_tools");
-  const have = Array.isArray(tools) ? (tools as unknown[]).map(String) : [];
-  return { tool_filter: { allowed_tools: [...new Set([...have, ...add])] } };
-}
-
-/** The authentication hop 1 needs: the app's own sign-in, through the User Source. */
-export const GATEWAY_AUTH_TYPE = "user_source";
-
-/** What checking the gateway the developer made in the dashboard found (#48). */
-export interface GatewayCheck {
-  /** Set when it does not authenticate through a User Source: the hooks are not turned on behind it. */
-  authType: string | null;
-  /** The tool list's differences, each a warning: the hooks are turned on anyway. */
-  tools: string[];
-}
-
-/**
- * A gateway as `GET …/gateways` lists it (`schemas.GatewayResponse`), against
- * the form this run printed. Two kinds of difference, decided by the human on
- * #48: an `auth_type` other than the User Source refuses, because hop 1 is the
- * access model and Headers mode is never allowed; a tool list that is not the
- * nine is a warning, because leaving a live gateway ungoverned over it would be
- * worse. An `auth_type` Arcade leaves out is not the User Source either.
- */
-export function gatewayCheck(gateway: unknown, toolkit: string): GatewayCheck {
-  const authType = at(gateway, "auth_type");
-  const tools = at(gateway, "tool_filter.allowed_tools");
-  const have = Array.isArray(tools) ? [...(tools as unknown[])].map(String).sort() : null;
-  const want = [...gatewayTools(toolkit)].sort();
-  const toolDifferences: string[] = [];
-  if (have === null) {
-    toolDifferences.push(`tool_filter.allowed_tools: Arcade has ${JSON.stringify(tools) ?? "nothing"}, this app needs ${JSON.stringify(want)}`);
-  } else {
-    const missing = want.filter((each) => !have.includes(each));
-    const extra = have.filter((each) => !want.includes(each));
-    if (missing.length > 0) toolDifferences.push(`tool_filter.allowed_tools is missing ${missing.join(", ")}`);
-    if (extra.length > 0) toolDifferences.push(`tool_filter.allowed_tools also has ${extra.join(", ")}, which this app does not use`);
-  }
-  return {
-    authType: authType === GATEWAY_AUTH_TYPE ? null : `auth_type: Arcade has ${JSON.stringify(authType) ?? "nothing"}, this app needs "${GATEWAY_AUTH_TYPE}"`,
-    tools: toolDifferences,
-  };
-}
-
-/**
- * The gateway this script creates itself once it has the User Source's id
- * (#52), as it did before #48 (#30): `POST …/gateways`
- * (`schemas.CreateGatewayRequest`), in the shape the Arcade CLI sends it
- * (`arcade_cli/connect.py` `create_gateway`: `tool_filter.allowed_tools`,
- * qualified `Toolkit.Tool` names), with `auth_type: "user_source"` and the
- * User Source's id. Create-only like the provider, and read back with
- * `GET …/gateways/{id}`.
- */
-export interface GatewaySpec {
-  slug: string;
-  userSourceId: string;
-  toolkit: string;
-}
-
-export function gatewayBody(spec: GatewaySpec) {
-  return {
-    name: "Loans Approval Limits",
-    description: "The loan officer's agent",
-    slug: spec.slug,
-    auth_type: GATEWAY_AUTH_TYPE,
-    user_source_id: spec.userSourceId,
-    tool_filter: { allowed_tools: gatewayTools(spec.toolkit) },
-  };
-}
-
-/** The same form of report as {@link pluginDifferences}, for a gateway read back (`schemas.GatewayResponse`). */
-export function gatewayDifferences(gateway: unknown, spec: GatewaySpec): string[] {
-  const differences: string[] = [];
-  const compare = (path: string, have: unknown, want: unknown) => {
-    if (JSON.stringify(have) !== JSON.stringify(want)) {
-      differences.push(`${path}: Arcade has ${JSON.stringify(have) ?? "nothing"}, this app needs ${JSON.stringify(want)}`);
-    }
-  };
-  compare("slug", at(gateway, "slug"), spec.slug);
-  compare("auth_type", at(gateway, "auth_type"), GATEWAY_AUTH_TYPE);
-  compare("user_source_id", at(gateway, "user_source_id"), spec.userSourceId);
-  const tools = at(gateway, "tool_filter.allowed_tools");
-  compare(
-    "tool_filter.allowed_tools",
-    Array.isArray(tools) ? [...tools].sort() : tools,
-    [...gatewayTools(spec.toolkit)].sort(),
-  );
-  return differences;
-}
-
 /** The `items` of one of Arcade's offset pages (`schemas.OffsetPage-*`). */
 export function pageItems(json: unknown): unknown[] {
   const items = at(json, "items");
@@ -599,4 +465,112 @@ export function isReachabilityError(error: unknown): boolean {
   }
   if (validation) return false;
   return /unreachable|could not (be )?reach|cannot reach|connection refused|failed to connect|timed out|timeout|no such host|dial tcp|health check failed/i.test(error.body);
+}
+
+// --- The optional MCP gateway (`--gateway`) ---------------------------------
+
+/**
+ * Arcade's own Gmail and Slack tools, which the agent uses to tell people about
+ * a decision and to ask for an approval. They are Arcade's built-in providers,
+ * not part of `mcp/`: nothing is deployed for them, and each person authorizes
+ * their own account the first time a tool of theirs is called.
+ */
+export const NATIVE_TOOLS = ["Gmail.SendEmail", "Gmail.ListEmails", "Slack.SendMessage"] as const;
+
+/**
+ * The tools the gateway exposes, as its `tool_filter` names them:
+ * `Toolkit.Tool`. The six from the one `LoanDesk` deployment, then Gmail and
+ * Slack. The same nine the agent selects from when it calls the Engine
+ * directly.
+ */
+export function gatewayTools(toolkit: string): string[] {
+  return [
+    ...["SearchLoans", "GetLoan", "ApproveLoan", "DenyLoan"].map((tool) => `${toolkit}.${tool}`),
+    ...["RequestApproval", "Decide"].map((tool) => `${toolkit}.${tool}`),
+    ...NATIVE_TOOLS,
+  ];
+}
+
+/** The authentication the gateway needs: the person's own Okta sign-in, through the User Source. */
+export const GATEWAY_AUTH_TYPE = "user_source";
+
+/** Where an MCP client connects to the gateway: the Engine's host, `/mcp/<slug>`. */
+export function gatewayUrl(apiUrl: string, slug: string): string {
+  return `${apiUrl.replace(/\/+$/, "")}/mcp/${slug}`;
+}
+
+/**
+ * The gateway `--gateway` creates once it has the User Source's id:
+ * `POST …/gateways` (`schemas.CreateGatewayRequest`), in the shape the Arcade
+ * CLI sends it (`arcade_cli/connect.py` `create_gateway`:
+ * `tool_filter.allowed_tools`, qualified `Toolkit.Tool` names), with
+ * `auth_type: "user_source"` and the User Source's id. Create-only like the
+ * provider, and read back with `GET …/gateways/{id}`.
+ */
+export interface GatewaySpec {
+  slug: string;
+  userSourceId: string;
+  toolkit: string;
+}
+
+export function gatewayBody(spec: GatewaySpec) {
+  return {
+    name: "Loans Approval Limits",
+    description: "The loan officer's agent",
+    slug: spec.slug,
+    auth_type: GATEWAY_AUTH_TYPE,
+    user_source_id: spec.userSourceId,
+    tool_filter: { allowed_tools: gatewayTools(spec.toolkit) },
+  };
+}
+
+/** What checking a gateway that already exists under the slug found. */
+export interface GatewayCheck {
+  /** Set when it does not authenticate through a User Source: the run stops, because the gateway would not sign people in as themselves. */
+  authType: string | null;
+  /** The tool list's differences, each a warning. */
+  tools: string[];
+}
+
+/**
+ * A gateway as `GET …/gateways` lists it (`schemas.GatewayResponse`), against
+ * what this app needs. Two kinds of difference: an `auth_type` other than the
+ * User Source refuses, because Arcade Headers mode would let anyone with the
+ * key act as anyone; a tool list that is not the nine is a warning. An
+ * `auth_type` Arcade leaves out is not the User Source either.
+ */
+export function gatewayCheck(gateway: unknown, toolkit: string): GatewayCheck {
+  const authType = at(gateway, "auth_type");
+  const tools = at(gateway, "tool_filter.allowed_tools");
+  const have = Array.isArray(tools) ? [...(tools as unknown[])].map(String).sort() : null;
+  const want = [...gatewayTools(toolkit)].sort();
+  const toolDifferences: string[] = [];
+  if (have === null) {
+    toolDifferences.push(`tool_filter.allowed_tools: Arcade has ${JSON.stringify(tools) ?? "nothing"}, this app needs ${JSON.stringify(want)}`);
+  } else {
+    const missing = want.filter((each) => !have.includes(each));
+    const extra = have.filter((each) => !want.includes(each));
+    if (missing.length > 0) toolDifferences.push(`tool_filter.allowed_tools is missing ${missing.join(", ")}`);
+    if (extra.length > 0) toolDifferences.push(`tool_filter.allowed_tools also has ${extra.join(", ")}, which this app does not use`);
+  }
+  return {
+    authType: authType === GATEWAY_AUTH_TYPE ? null : `auth_type: Arcade has ${JSON.stringify(authType) ?? "nothing"}, this app needs "${GATEWAY_AUTH_TYPE}"`,
+    tools: toolDifferences,
+  };
+}
+
+/** The same form of report as {@link pluginDifferences}, for a gateway read back (`schemas.GatewayResponse`). */
+export function gatewayDifferences(gateway: unknown, spec: GatewaySpec): string[] {
+  const differences: string[] = [];
+  const compare = (path: string, have: unknown, want: unknown) => {
+    if (JSON.stringify(have) !== JSON.stringify(want)) {
+      differences.push(`${path}: Arcade has ${JSON.stringify(have) ?? "nothing"}, this app needs ${JSON.stringify(want)}`);
+    }
+  };
+  compare("slug", at(gateway, "slug"), spec.slug);
+  compare("auth_type", at(gateway, "auth_type"), GATEWAY_AUTH_TYPE);
+  compare("user_source_id", at(gateway, "user_source_id"), spec.userSourceId);
+  const tools = at(gateway, "tool_filter.allowed_tools");
+  compare("tool_filter.allowed_tools", Array.isArray(tools) ? [...tools].sort() : tools, [...gatewayTools(spec.toolkit)].sort());
+  return differences;
 }

@@ -2,7 +2,8 @@
  * `GET /api/loans` — what the bank's own screens are served, and who they are
  * served as.
  *
- * Nothing is mocked. `apps/idp` is a real subprocess and the sign-in is a real
+ * Nothing in the app is mocked. The identity provider is the harness's OIDC
+ * stand-in, shaped like an Okta authorization server, and the sign-in is a real
  * authorization-code + PKCE flow with a real password typed into a real login
  * form; the loan module is the app's own, in this process, owning a real
  * `loans.db` in a throwaway directory; and the route under test is the deployed
@@ -12,9 +13,11 @@
  * Since #5 the route reads the loan module **in-process** — no loopback HTTP to
  * `/bank/…`, no MCP — so the only request that leaves the process on a read is
  * the module asking the identity provider who the bearer belongs to. A
- * recording proxy sits there, in front of `apps/idp`'s `/oauth2/userinfo`: it
- * writes down the `Authorization` header on every request and forwards it
- * unchanged. That is how the claim **"the read is made with the persona's
+ * recording proxy sits there, in front of the provider: the loan module's
+ * `IDP_ISSUER` is the proxy, whose discovery document is the provider's with
+ * the proxy's origin in it, so the userinfo call the module makes goes through
+ * it. It writes down the `Authorization` header on every request and forwards
+ * it unchanged. That is how the claim **"the read is made with the persona's
  * bearer, not a shared secret"** is measured rather than asserted — the
  * recorded bearer is the one `api/actor.ts` presented to decide who the
  * caller is, and presented again it has to name the person who signed in.
@@ -73,11 +76,13 @@ beforeAll(async () => {
   workspace = join(tmpdir(), `cg-api-loans-${crypto.randomUUID()}`);
   mkdirSync(workspace, { recursive: true });
 
-  const idpHost = new URL(identity.idpUrl).host;
+  const idpOrigin = new URL(identity.idpUrl).origin;
 
   // Transparent, and the only reason it exists is to write down what the loan
   // module sent. It changes nothing about the request: same method, same path,
-  // same headers, same body.
+  // same headers, same body. The one rewrite is the discovery document, which
+  // names the proxy's origin where the provider's was, so the module's
+  // userinfo call comes back through here.
   proxy = Bun.serve({
     port: 0,
     async fetch(request) {
@@ -87,11 +92,14 @@ beforeAll(async () => {
         path: url.pathname,
         authorization: request.headers.get("authorization"),
       });
-      return fetch(`http://${idpHost}${url.pathname}${url.search}`, {
+      const upstream = await fetch(`${idpOrigin}${url.pathname}${url.search}`, {
         method: request.method,
         headers: request.headers,
         ...(request.method === "GET" || request.method === "HEAD" ? {} : { body: await request.text() }),
       });
+      if (!url.pathname.endsWith("/.well-known/openid-configuration")) return upstream;
+      const document = (await upstream.text()).replaceAll(idpOrigin, url.origin);
+      return new Response(document, { status: upstream.status, headers: { "content-type": "application/json" } });
     },
   });
 
@@ -102,15 +110,14 @@ beforeAll(async () => {
   // test configures the environment rather than reaching past the route.
   // Restored afterwards: `bun test` shares one process across files.
   set("SESSION_SECRET", SESSION_SECRET);
-  // The app's origin since #6, which is its identity provider's issuer too.
-  set("APP_PUBLIC_HOST", new URL(identity.idpUrl).host);
+  set("APP_PUBLIC_HOST", new URL(identity.webUrl).host);
   set("IDP_CLIENT_ID", identity.config.identity.idpClientId);
   set("IDP_CLIENT_SECRET", identity.config.identity.idpClientSecret);
   // The loan module opens on the first read, from this environment: its own
   // `loans.db`, and bearers checked at the recording proxy.
   closeLoanModule();
   set("LOANS_DB_PATH", join(workspace, "loans.db"));
-  set("IDENTITY_HOST", `localhost:${proxy.port}`);
+  set("IDP_ISSUER", identity.idpUrl.replace(idpOrigin, `http://localhost:${proxy.port}`));
   // So `decided_by_name` can resolve an address to the name a room reads: a
   // real control plane over its own governance.db, whose subjects are the
   // harness's people, read at CONTROL_PLANE_HOST the way the app reads it
@@ -142,6 +149,10 @@ afterAll(async () => {
 });
 
 const STORE_TOKEN = "api-loans-store-token";
+
+function idpOriginOf(harness: IdentityHarness): string {
+  return new URL(harness.idpUrl).origin;
+}
 
 function startControlPlane(dbPath: string) {
   const config: HooksConfig = {
@@ -186,12 +197,12 @@ function set(key: string, value: string): void {
 /**
  * A real sign-in, and the cookie header a browser would carry afterwards.
  *
- * `stopAt` is hop 1's start: the session exists by then and nothing about the
- * loan book depends on the gateway, which is the point of #157.
+ * It stops on the redirect to the app's landing page: the session exists by
+ * then, and the loan book needs nothing else, which is the point of #157.
  */
 async function signedInCookie(persona: keyof typeof PEOPLE): Promise<string> {
   const browser = new Browser();
-  await signInAs(browser, identity, persona, { stopAt: "/api/arcade/start" });
+  await signInAs(browser, identity, persona, { stopAtLanding: true });
   const jar = [...browser.cookies].filter(([name]) => name.startsWith(SESSION_COOKIE));
   if (jar.length === 0) throw new Error(`signing in as ${persona} left no session cookie`);
   return jar.map(([name, value]) => `${name}=${value}`).join("; ");
@@ -323,8 +334,11 @@ describe("who the read is made as", () => {
     const { status } = await ask(cookie);
     expect(status).toBe(200);
 
-    expect(seen.length).toBeGreaterThan(0);
-    const bearers = new Set(seen.map((request) => request.authorization));
+    // Discovery carries no bearer and is asked once per process; userinfo is
+    // where the bearer goes.
+    const asked = seen.filter((request) => request.path.endsWith("/userinfo"));
+    expect(asked.length).toBeGreaterThan(0);
+    const bearers = new Set(asked.map((request) => request.authorization));
     expect(bearers.size).toBe(1);
     const authorization = [...bearers][0] as string;
     expect(authorization.startsWith("Bearer ")).toBe(true);
@@ -332,7 +346,7 @@ describe("who the read is made as", () => {
     // `api/actor.ts` decides who a caller is by asking exactly
     // this. Asking it the same way is what turns "the persona's bearer" from a
     // claim about our code into a measurement of the IdP's answer.
-    const userinfo = await fetch(`${identity.idpUrl}/oauth2/userinfo`, {
+    const userinfo = await fetch(identity.idp.endpoints.userinfo, {
       headers: { authorization },
     });
     expect(userinfo.status).toBe(200);
@@ -345,7 +359,8 @@ describe("who the read is made as", () => {
    * itself, for the duration of one read: everything this process asked the
    * network for, apart from the test's own request to the route. The one
    * thing allowed out is the module asking the identity provider who the
-   * bearer is, which is the recording proxy's `/oauth2/userinfo`.
+   * bearer is, which is the recording proxy's userinfo (and, the first time,
+   * its discovery document).
    */
   test("a read leaves the process only to ask the identity provider, never to /bank or MCP", async () => {
     const cookie = await signedInCookie("dana");
@@ -375,13 +390,17 @@ describe("who the read is made as", () => {
     // public host — and it is the only other place a read may go. It is not a
     // loan read and carries no loan-book bearer; `readLoanBook` asks it only
     // when something on the book was decided.
+    const viaProxy = (endpoint: string) => endpoint.replace(idpOriginOf(identity), `http://localhost:${proxy.port}`);
+    const discovery = `${identity.idpUrl}/.well-known/openid-configuration`;
     const allowed = new Set([
-      `http://localhost:${proxy.port}/oauth2/userinfo`,
-      `http://${new URL(identity.idpUrl).host}/oauth2/userinfo`,
+      viaProxy(identity.idp.endpoints.userinfo),
+      identity.idp.endpoints.userinfo,
+      viaProxy(discovery),
+      discovery,
       `http://localhost:${plane.server.port}/api/approvals/roster`,
     ]);
     expect(outbound.filter((url) => !allowed.has(url))).toEqual([]);
-    expect(outbound).toContain(`http://localhost:${proxy.port}/oauth2/userinfo`);
+    expect(outbound).toContain(viaProxy(identity.idp.endpoints.userinfo));
     expect(outbound.filter((url) => url.includes("/bank/") || url.includes("/mcp"))).toEqual([]);
   }, 45_000);
 

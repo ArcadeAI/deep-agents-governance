@@ -1,5 +1,5 @@
 /**
- * `bun run setup-arcade <ngrok-host> [--dry-run] [--skip-deploy] [--redeploy] [--gateway <slug>]` (#9, #30, #48, #52)
+ * `bun run setup-arcade <ngrok-host> [--dry-run] [--skip-deploy] [--redeploy] [--gateway[=<slug>]]` (#9, #30, #48, #52)
  *
  * Everything the Arcade side of this template needs, from one command, after
  * the developer has filled in the few required values in `.env`
@@ -12,82 +12,68 @@
  *    context. Then, before anything is written, **one read-only call** under
  *    them with the key, `GET …/plugins`: a 401, 403 or 404 means the key and
  *    the resolved project disagree, and the run stops (#30).
- * 3. **Reads** the hop-2 provider `app-identity` back from Arcade. It is
+ * 3. **Reads the identity provider** from `.env`: `IDP_ISSUER`, `IDP_CLIENT_ID`
+ *    and `IDP_CLIENT_SECRET`, which `bun run okta-setup` writes. One blank stops
+ *    the run, naming that command. The authorize, token and userinfo endpoints
+ *    come from `IDP_ISSUER`'s discovery document, never from a spelled path.
+ * 4. **Reads** the hop-2 provider `app-identity` back from Arcade. It is
  *    create-only (DESIGN.md → "Arcade config is read-only"): if it exists and
  *    differs from what this app needs, the differences are printed and the run
  *    stops, having written nothing.
- * 4. **Mints** the app's three OAuth clients in `idp.db`: `arcade` (hop 2),
- *    `arcade-user-source` (hop 1) and `web` (the app's own sign-in).
  * 5. **Fills in `.env`**, blanks only, never overwriting: `APP_PUBLIC_HOST`,
- *    `SESSION_SECRET`, `BETTER_AUTH_SECRET`, `ARCADE_HOOK_SIGNING_SECRET`, `APPROVALS_STORE_TOKEN`,
- *    `IDP_OAUTH_CLIENTS` and the clients' redirect URIs, `IDP_CLIENT_ID` and
- *    `IDP_CLIENT_SECRET`, `ARCADE_GATEWAY_ID` and `GOVERNANCE_STREAM=hooks`.
- *    One exception (#54): an `IDP_CLIENT_ID` that is not `idp.db`'s web client,
- *    as after `idp.db` was deleted, is rewritten with its secret, before step 3's
- *    comparison can stop the run. That client is the app's own sign-in, and
- *    nothing in Arcade holds it.
+ *    `SESSION_SECRET`, `ARCADE_HOOK_SIGNING_SECRET`, `APPROVALS_STORE_TOKEN`
+ *    and `GOVERNANCE_STREAM=hooks`. Then `ARCADE_PROVIDER_CALLBACK`, the
+ *    callback Arcade made for the provider, kept in step with Arcade;
+ *    `bun run okta-setup` allowlists it on the Okta app, and the run says to
+ *    rerun that whenever it changes.
  * 6. **Registers by API**: the provider, the tool secrets `APP_PUBLIC_HOST`
  *    and `APPROVALS_STORE_TOKEN`, the custom verifier, and the contextual
- *    access hooks (#30), each read back. The hooks are created **disabled**
- *    (#48), because active hooks filter the tool list the dashboard's gateway
- *    form shows.
+ *    access hooks (#30), each read back. The hooks are created **on**, and
+ *    hooks found disabled are turned on and read back: they are what governs
+ *    every tool call, and nothing here needs them off.
  * 7. **Deploys the toolkits**: one `arcade deploy`, in `mcp`, which
  *    carries the loan and approvals tools, streaming its output and
  *    stopping on a failure (#30). A toolkit Arcade already runs is skipped: `GET …/workers/<name>`,
  *    the CLI's own check, answers 404 when it is missing. `--redeploy`
  *    deploys it anyway, and `--skip-deploy` leaves both to the developer.
- * 8. **Registers the User Source and the gateway by API, then turns the hooks
- *    on** (#52), the one-click path, through the Coordinator API
- *    (`setup-arcade/coordinator.ts`, `ARCADE_COORDINATOR_URL`, default
- *    `https://cloud.arcade.dev/api`, never experience.arcade.dev):
- *    - The project's User Sources are listed. One whose issuer is the app's
- *      origin, or whose client is the app's `arcade-user-source`, is held to
- *      the issuer, the client id, the `email` subject claim and the scopes: it
- *      matches and is used, or it differs and the run stops (exit 1), naming
- *      each difference, with no gateway and the hooks as they were.
- *    - With none, the run waits, on a terminal only, for the developer to
- *      start `bun run dev` and the tunnel. On Enter it reads the issuer from
- *      the app's `/.well-known/openid-configuration` through it, byte for
- *      byte, and has Arcade check that issuer (`POST …/user_sources/test_issuer`,
- *      which saves nothing). A failure of either, a 422 from Arcade with its
- *      reason, asks again. Then it creates the User Source, the
- *      `arcade-user-source` secret rotated unless this run minted it.
- *    - The User Source, found or created, is read back by id: active, and
- *      this app's, or the run stops as for one that differs.
- *    - The gateway is created through it (`POST …/gateways`, the nine tools,
- *      `auth_type` `user_source`) and read back; one already under the slug is
- *      held to that User Source, never edited. Then the hooks are `PATCH`ed to
- *      `active` and read back, last. A User Source registered with the gateway
- *      not is said plainly, with the gateway form and the rerun that finishes.
- *    - **The fallback** (#48): a Coordinator call that fails, or answers a
- *      shape this script does not expect (a 401 or a 404 is said to be the
- *      key or the project), an issuer check this Coordinator does not have,
- *      `n` or Ctrl-C at the wait, or stdin that is not a terminal prints one
- *      line naming which, then the #48 flow,
- *      unchanged: `GET …/gateways`, never written, under the slug the gateway
- *      form names. Not there (the first run): the hooks stay disabled, and the
- *      run ends on the User Source form, then the gateway form, then the
- *      command for the second run, and a warning that the gateway runs
- *      ungoverned until that second run. There (the second run): the hooks
- *      are turned on and read back, and a read-back that does not say
- *      `active` fails the run. A gateway whose `auth_type` is not the User
- *      Source stops the run with the hooks as they were; a tool list that is
- *      not the six is printed as warnings, and the hooks are turned on anyway
- *      (the human's call on #48).
+ *
+ * **No User Source and no gateway, unless `--gateway`.** The agent calls the
+ * Arcade Engine directly with the project key, as the person the platform
+ * signed in (`agent/agent.py`, DESIGN.md → Integration), and the project's
+ * hooks govern every one of those calls. So nothing above registers a User
+ * Source or an MCP gateway, and `ARCADE_USER_SOURCE_ID` left in an older
+ * `.env` is ignored with a one-line note.
+ *
+ * 8. **`--gateway`, optional: the User Source and the gateway by API** (#52),
+ *    after the deploys, for an MCP client such as Claude Code to reach the
+ *    same tools under the same hooks (`docs/modules/03-govern.md`). The
+ *    User Source is found by issuer and client in the project, else the
+ *    issuer is checked and it is created, through the Coordinator API
+ *    (`setup-arcade/coordinator.ts`, `ARCADE_COORDINATOR_URL`), and read back
+ *    by id. The gateway is found by slug in `GET …/gateways`, held to that
+ *    User Source and never edited, else created through it with the nine
+ *    tools (`POST …/gateways`) and read back. Then `ARCADE_GATEWAY_ID` is
+ *    written to `.env`, and the app shows how to connect an MCP client. The
+ *    slug is `--gateway=<slug>`, else `.env`'s `ARCADE_GATEWAY_ID`, else
+ *    `loan-desk-<first label of the host>`: slugs are unique across Arcade.
+ *    A Coordinator call that fails, or no org and project, prints the User
+ *    Source and gateway as dashboard forms and exits 1: nothing falls back
+ *    silently, and the hooks are untouched either way. Without the flag, an
+ *    `ARCADE_GATEWAY_ID` already in `.env` is left as it is, with a note.
  *
  * The same command is every run: what Arcade already holds tells them apart,
- * and a rerun of a finished project is a no-op that says so. Rerunning after a
- * failure never turns the hooks on ahead of the gateway.
+ * and a rerun of a finished project is a no-op that says so.
  *
- * With no org and project to be found, the hooks and the gateway are printed as
- * the dashboard forms they were before #30, and the run says why.
+ * With no org and project to be found, the hooks are printed as the dashboard
+ * form they were before #30, and the run says why.
  *
  * `--dry-run` writes nothing and sends nothing: it prints every request a real
  * run would make from the state on disk, in order, with the key and every
  * secret as a placeholder. Sending nothing, it cannot ask Arcade whether the
- * provider exists, so it infers it: `.env`'s `IDP_OAUTH_REDIRECT_URIS_ARCADE`
- * holds the callback Arcade returns when it creates the provider, and `idp.db`
- * holds the clients (#28). Which registration goes which way, and the spec
+ * provider exists, so it infers it: `.env`'s `ARCADE_PROVIDER_CALLBACK` holds
+ * the callback Arcade returns when it creates the provider (#28). Nor does it
+ * read the identity provider's discovery, so the endpoints are placeholders
+ * too. Which registration goes which way, and the spec
  * path of each call, is in `scripts/setup-arcade/arcade.ts`.
  * `app-test/setup-arcade.test.ts` runs this against a local stand-in, with the
  * Arcade CLI faked on `PATH` and its context faked in a throwaway `HOME`. Its
@@ -101,7 +87,9 @@
  * from elsewhere, and writes only to `.env`.
  */
 import { existsSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
+
+import { discover } from "../auth/discovery.ts";
 
 import {
   ArcadeAdmin,
@@ -109,10 +97,9 @@ import {
   arcadeMessage,
   gatewayBody,
   gatewayCheck,
-  gatewayToolsPatch,
-  nativeToolsToAdd,
   gatewayDifferences,
   type GatewaySpec,
+  gatewayUrl,
   healthCheckUrl,
   HOOKS_NAME,
   type HooksStatus,
@@ -133,41 +120,39 @@ import {
   verifierBody,
 } from "./setup-arcade/arcade.ts";
 import { type ArcadeContext, resolveContext } from "./setup-arcade/context.ts";
+import { fillBlanks, MANAGED_KEYS, parseEnv, readEnvFile, replaceValue, shellConflicts, writeEnvFile } from "./setup-arcade/env-file.ts";
 import {
   candidates,
   Coordinator,
   coordinatorUrl,
   failureLine,
   readinessDifferences,
-  USER_SOURCE_CALLBACK,
-  AGENT_SIGNIN_CALLBACK,
-  USER_SOURCE_NAME,
-  USER_SOURCE_SCOPES,
   reported,
+  USER_SOURCE_NAME,
   type UserSource,
   userSourceBody,
   userSourceDifferences,
   type UserSourceSpec,
 } from "./setup-arcade/coordinator.ts";
-import { fillBlanks, MANAGED_KEYS, parseEnv, readEnvFile, replaceValue, shellConflicts, writeEnvFile } from "./setup-arcade/env-file.ts";
-import { gatewayForm, hooksForm, hooksOnCommand, type NextSteps, nextSteps, userSourceForm } from "./setup-arcade/forms.ts";
+import { gatewayForm, hooksForm, nextSteps, userSourceForm } from "./setup-arcade/forms.ts";
 import { serverName } from "./setup-arcade/toolkit.ts";
 
-const CLIENT_KEYS = ["arcade", "arcade-user-source", "web"] as const;
 /**
- * The gateway slug when neither `--gateway` nor `ARCADE_GATEWAY_ID` names one.
+ * The gateway slug when neither `--gateway=<slug>` nor `ARCADE_GATEWAY_ID`
+ * names one.
  *
  * Gateway slugs are unique across Arcade, not per project: a second person
- * running this with the template's old fixed default got a 409 and a stop
- * (measured 2026-10-06, the first time two people set up the same template).
- * So the default is derived from the one value that is already unique per
- * person — their ngrok host — as `loan-desk-<first label>`. `--gateway` still
- * overrides it, and a slug once written to .env is kept on every later run.
+ * running this with a fixed default got a 409 and a stop (measured
+ * 2026-10-06, the first time two people set up the same template). So the
+ * default is derived from the one value that is already unique per person,
+ * their ngrok host, as `loan-desk-<first label>`. A slug once written to
+ * `.env` is kept on every later run.
  */
 function defaultGateway(host: string): string {
   const label = host.split(":")[0]!.split(".")[0]!.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/^-+|-+$/g, "");
   return label === "" ? "loan-desk" : `loan-desk-${label}`.slice(0, 63).replace(/-+$/, "");
 }
+
 /**
  * Where `arcade deploy` runs. One directory: `mcp` is one server,
  * `LoanDesk` (`mcp/loan_desk/app.py`), carrying the loan and approvals tools.
@@ -187,21 +172,25 @@ const argv = process.argv.slice(2);
 const dryRun = argv.includes("--dry-run");
 const skipDeploy = argv.includes("--skip-deploy");
 const redeploy = argv.includes("--redeploy");
-/** The value after a flag that takes one, or `null` when the flag is absent. */
-const valueOf = (flag: string): string | null => (argv.includes(flag) ? (argv[argv.indexOf(flag) + 1] ?? "") : null);
-const gatewaySlug = valueOf("--gateway");
-const valued = new Set(["--gateway"].filter((flag) => argv.includes(flag)).map((flag) => argv.indexOf(flag) + 1));
-const positional = argv.filter((arg, i) => !arg.startsWith("--") && !valued.has(i));
+// `--gateway`, `--gateway=<slug>`, or `--gateway <slug>` when a second bare
+// word follows it: the one option that takes a value, and the value is optional.
+const gatewayAt = argv.findIndex((arg) => arg === "--gateway" || arg.startsWith("--gateway="));
+const withGateway = gatewayAt !== -1;
+const bare = argv.filter((arg) => !arg.startsWith("--"));
+const gatewayValueAt = withGateway && argv[gatewayAt] === "--gateway" && bare.length === 2 && argv[gatewayAt + 1] === bare[1] ? gatewayAt + 1 : -1;
+const gatewayArg: string | null = !withGateway ? null : argv[gatewayAt]!.startsWith("--gateway=") ? argv[gatewayAt]!.slice("--gateway=".length) : gatewayValueAt === -1 ? null : argv[gatewayValueAt]!;
+const positional = argv.filter((arg, index) => !arg.startsWith("--") && index !== gatewayValueAt);
 const FLAGS = new Set(["--dry-run", "--skip-deploy", "--redeploy", "--gateway"]);
 const USAGE =
-  "usage: bun run setup-arcade <ngrok-host> [--dry-run] [--skip-deploy] [--redeploy] [--gateway <slug>]\n" +
-  "  <ngrok-host> is the public host Arcade reaches this app at, e.g. my-app.ngrok.app";
+  "usage: bun run setup-arcade <ngrok-host> [--dry-run] [--skip-deploy] [--redeploy] [--gateway[=<slug>]]\n" +
+  "  <ngrok-host> is the public host Arcade reaches this app at, e.g. my-app.ngrok.app\n" +
+  "  --gateway also registers an MCP gateway, for Claude Code or another MCP client (docs/modules/03-govern.md)";
 
-const unknown = argv.filter((arg) => arg.startsWith("--") && !FLAGS.has(arg));
+const unknown = argv.filter((arg) => arg.startsWith("--") && !FLAGS.has(arg) && !arg.startsWith("--gateway="));
 if (unknown.length > 0) fail(`${unknown.join(", ")}: not an option of this command\n${USAGE}`, 64);
 if (positional.length !== 1) fail(USAGE, 64);
-if (gatewaySlug !== null && !/^[a-z0-9][a-z0-9-]*$/.test(gatewaySlug)) {
-  fail(`--gateway ${gatewaySlug || "(missing)"}: a slug is lowercase letters, digits and hyphens`, 64);
+if (gatewayArg !== null && !/^[a-z0-9][a-z0-9-]*$/.test(gatewayArg)) {
+  fail(`--gateway ${gatewayArg || "(empty)"}: a slug is lowercase letters, digits and hyphens`, 64);
 }
 
 // A pasted URL is accepted and cut down to the host form everything else uses.
@@ -232,8 +221,8 @@ for (const source of [localEnv, fileEnv]) {
   for (const [key, value] of Object.entries(source)) if (process.env[key] === undefined) process.env[key] = value;
 }
 // What the app would see, frozen before this run adds its own values to
-// `process.env` for the identity module below. Used for the settings this run
-// only reads (`ARCADE_API_URL`, `PORT`, `IDP_DB_PATH`, the toolkit names).
+// `process.env`. Used for the settings this run only reads (`ARCADE_API_URL`,
+// `PORT`, the toolkit names).
 const loaded: Record<string, string | undefined> = { ...process.env };
 const effective = (key: string): string => loaded[key]?.trim() ?? "";
 /**
@@ -242,7 +231,7 @@ const effective = (key: string): string => loaded[key]?.trim() ?? "";
  * because the file is what this run writes and what `bun run dev` reads. On
  * the fourth live run the shell still exported an old `.env`, the shell won,
  * and the run reported "nothing to fill" into a fresh `.env`: the app then
- * booted with no BETTER_AUTH_SECRET, and the provider was created with the
+ * booted with no secret of its own, and the provider was created with the
  * shell's old client. `shellConflicts` below refuses that state instead.
  */
 const fromFile = (key: string): string => fileEnv[key]?.trim() ?? "";
@@ -295,34 +284,25 @@ if (onLocal !== "" && onLocal.toLowerCase() !== host) {
 const apiKey = fromFile("ARCADE_API_KEY");
 if (apiKey === "" && !dryRun) fail("ARCADE_API_KEY is blank. Fill it in .env (Arcade dashboard → API keys), then run this again.");
 const apiUrl = (effective("ARCADE_API_URL") || "https://api.arcade.dev").replace(/\/+$/, "");
-const slug = gatewaySlug ?? (fromFile("ARCADE_GATEWAY_ID") || defaultGateway(host));
-const onFileGateway = fileEnv.ARCADE_GATEWAY_ID?.trim() ?? "";
-if (gatewaySlug !== null && onFileGateway !== "" && onFileGateway !== gatewaySlug) {
-  fail(`.env has ARCADE_GATEWAY_ID=${onFileGateway}, and this run was given --gateway ${gatewaySlug}. Blank it in .env to use ${gatewaySlug}.`);
+
+// The gateway's slug, under `--gateway`: the flag's value, else the one `.env`
+// already holds, else one derived from the host. Without the flag the gateway
+// is nobody's business here: one in `.env` is left as it is, and said once.
+const onFileGateway = fromFile("ARCADE_GATEWAY_ID");
+if (gatewayArg !== null && onFileGateway !== "" && onFileGateway !== gatewayArg) {
+  fail(`.env has ARCADE_GATEWAY_ID=${onFileGateway}, and this run was given --gateway ${gatewayArg}. Blank it in .env to use ${gatewayArg}.`);
+}
+const slug = gatewayArg ?? (onFileGateway || defaultGateway(host));
+if (!withGateway && onFileGateway !== "") {
+  out(`  note          ARCADE_GATEWAY_ID=${onFileGateway} is set; this run leaves the gateway as it is (pass --gateway to check or create it)`);
+}
+// What an older `.env` may still hold: the User Source is found by issuer and
+// client now, so its id is read by nothing. Said once, never an error.
+if (effective("ARCADE_USER_SOURCE_ID") !== "") {
+  out("  note          ARCADE_USER_SOURCE_ID is set, and ignored: the User Source is found by its issuer and client, so you can delete it");
 }
 
-// Before #48 a second run created the gateway from a User Source id kept in
-// .env. Since #52 the run finds the User Source itself, through the
-// Coordinator API, and an old .env's id is ignored.
-const RETIRED = "ARCADE_USER_SOURCE_ID";
-if (effective(RETIRED) !== "") {
-  out(`  note          ${RETIRED} is set, and ignored: this command finds the User Source itself, so you can delete it`);
-}
-
-// The Coordinator API, for the User Source (#52). Refused before anything is
-// sent if it names the dashboard's own proxy; the run then falls back to the
-// dashboard forms (#48).
-const coordinatorBase = coordinatorUrl(effective("ARCADE_COORDINATOR_URL"));
-/**
- * Whether the run may pause for the developer before it creates the User
- * Source (#52): only with a terminal on stdin. Otherwise the run falls back to
- * the dashboard forms rather than wait on a pipe nobody writes to.
- * `CG_SETUP_ARCADE_TTY=1` is the test harness's stand-in for a terminal, read
- * from the shell only, never from `.env`.
- */
-const interactive = process.stdin.isTTY === true || shellEnv.CG_SETUP_ARCADE_TTY === "1";
-
-// The org and project the hooks and the gateway are registered in (#30).
+// The org and project the hooks are registered in (#30).
 const resolution = resolveContext(loaded);
 const scope: (ArcadeContext & ProjectScope) | null = resolution.context;
 if (scope !== null) {
@@ -334,22 +314,40 @@ if (scope !== null) {
   }
 } else {
   out(`  arcade        no org and project: ${"why" in resolution ? resolution.why : "unknown"}.`);
-  out("                The hooks and the gateway are printed as dashboard forms instead. Set ARCADE_ORG_ID and");
+  out(`                The hooks${withGateway ? ", the User Source and the gateway" : ""} are printed as ${withGateway ? "dashboard forms" : "a dashboard form"} instead. Set ARCADE_ORG_ID and`);
   out("                ARCADE_PROJECT_ID in .env, or make the project the Arcade CLI's active one, to register them by API.");
 }
-if (scope !== null) {
-  out(`  coordinator   ${coordinatorBase.url ?? `none: ${"why" in coordinatorBase ? coordinatorBase.why : "unknown"}`}`);
-}
-const toolkit = effective("ARCADE_TOOLKIT") || "LoanDesk";
 
-const configuredClients = fromFile("IDP_OAUTH_CLIENTS");
-if (configuredClients !== "") {
-  const listed = configuredClients.split(",").map((each) => each.trim());
-  const missing = CLIENT_KEYS.filter((key) => key !== "arcade" && !listed.includes(key));
-  if (missing.length > 0) {
-    fail(`IDP_OAUTH_CLIENTS=${configuredClients} leaves out ${missing.join(", ")}. Add ${missing.length === 1 ? "it" : "them"}, or blank it.`);
-  }
+// The Coordinator API, for the User Source, only under `--gateway` (#52).
+// Refused before anything is sent when it is the dashboard's own proxy.
+const coordinatorBase = withGateway ? coordinatorUrl(effective("ARCADE_COORDINATOR_URL")) : null;
+const coordinator = coordinatorBase?.url ? new Coordinator(coordinatorBase.url, apiKey, dryRun, out) : null;
+/** The toolkit name as Arcade files the one deployed server: the gateway's tool filter names its tools `LoanDesk.<Tool>`. */
+const toolkit = effective("ARCADE_TOOLKIT") || "LoanDesk";
+if (withGateway) {
+  out(`  gateway       ${slug}  (${gatewayUrl(apiUrl, slug)})`);
+  if (coordinatorBase !== null && coordinatorBase.url === null) out(`  coordinator   none: ${coordinatorBase.why}. The User Source and the gateway are printed as dashboard forms.`);
 }
+
+// The identity provider, as `bun run okta-setup` wrote it. The same client
+// signs people in to the app and is hop 2's provider.
+const idp = {
+  issuer: fromFile("IDP_ISSUER").replace(/\/+$/, ""),
+  clientId: fromFile("IDP_CLIENT_ID"),
+  clientSecret: fromFile("IDP_CLIENT_SECRET"),
+};
+const idpBlank = (["IDP_ISSUER", "IDP_CLIENT_ID", "IDP_CLIENT_SECRET"] as const).filter((key) => fromFile(key) === "");
+if (idpBlank.length > 0 && !dryRun) {
+  fail(
+    `${idpBlank.join(", ")} ${idpBlank.length === 1 ? "is" : "are"} blank in .env. Run \`bun run okta-setup\` first: it makes the Okta app ` +
+      "and writes them (README → Create your Okta org).",
+  );
+}
+if (dryRun) {
+  idp.issuer ||= "<IDP_ISSUER, from bun run okta-setup>";
+  idp.clientId ||= "<IDP_CLIENT_ID, from bun run okta-setup>";
+}
+out(`  identity      ${idp.issuer}, client ${idp.clientId}`);
 
 /** A value this run needs: what the app already has, else a fresh one. */
 function secretFor(key: string): { value: string; generated: boolean } {
@@ -361,35 +359,23 @@ function secretFor(key: string): { value: string; generated: boolean } {
 }
 
 const sessionSecret = secretFor("SESSION_SECRET");
-// The identity provider's own secret (#9). On a public host it refuses the
-// published development one, and it must exist before the clients are minted
-// below: `oauth-client` reads the same configuration the provider boots on.
-const identitySecret = secretFor("BETTER_AUTH_SECRET");
 const hookToken = secretFor("ARCADE_HOOK_SIGNING_SECRET");
 const storeToken = secretFor("APPROVALS_STORE_TOKEN");
 // Optional: the room's copy of every approval request (.env.example).
 const approvalsChannel = effective("SLACK_APPROVALS_CHANNEL") || "";
 
-/** Everything this run writes to `.env`, before the clients are minted. */
+/** Everything this run writes to `.env`, blanks only. */
 const planned: Record<string, string> = {
   APP_PUBLIC_HOST: host,
   SESSION_SECRET: sessionSecret.value,
-  BETTER_AUTH_SECRET: identitySecret.value,
   ARCADE_HOOK_SIGNING_SECRET: hookToken.value,
   APPROVALS_STORE_TOKEN: storeToken.value,
-  IDP_OAUTH_CLIENTS: CLIENT_KEYS.join(","),
-  IDP_OAUTH_REDIRECT_URIS_WEB: `${origin}/api/auth/callback,${AGENT_SIGNIN_CALLBACK}`,
-  IDP_OAUTH_REDIRECT_URIS_ARCADE_USER_SOURCE: USER_SOURCE_CALLBACK,
-  ARCADE_GATEWAY_ID: slug,
   // Arcade calls the hooks from here on, so the panel watches them rather
   // than the fixture replay a blank value means under `next dev`.
   GOVERNANCE_STREAM: "hooks",
 };
-// The identity module reads these from the environment when it mints. The
-// host is always this run's: an `.env.local` naming localhost must not make
-// it mint for another issuer.
 // Every managed variable is `.env`'s value or this run's, whatever .env.local
-// or the shell had.
+// or the shell had, and the host is always this run's.
 for (const key of MANAGED_KEYS) {
   const value = fromFile(key) || planned[key];
   if (value) process.env[key] = value;
@@ -398,51 +384,39 @@ for (const key of MANAGED_KEYS) {
 process.env.APP_PUBLIC_HOST = host;
 
 const admin = new ArcadeAdmin(apiUrl, apiKey, dryRun, out);
-const coordinator = coordinatorBase.url === null ? null : new Coordinator(coordinatorBase.url, apiKey, dryRun, out);
-/** Set once the app answered through the tunnel after this run wrote .env: the steps left then skip starting it (#52). */
-let appConfirmed = false;
+/** Set when this run wrote a new provider callback, which Okta does not allowlist until `okta-setup` runs again. */
+let oktaRerun = false;
 
 /**
- * The forms left for the dashboard, and the steps after them. The last thing
- * every run prints. `registered` is a User Source the run registered or found
- * before the gateway failed (#52): its form is then not left, only the
- * gateway's, and the run exits `code`.
+ * The steps left, and the forms: the hooks' when there was no project to
+ * register them in, and under `--gateway` the User Source's and the gateway's
+ * when the run could not make them by API (`registered` names a User Source
+ * it did make, whose form is then not left). The last thing every run prints.
  */
-function finish(
-  userSource: { clientId: string; clientSecret: string | null },
-  gateway: NextSteps["gateway"],
-  registered: UserSource | null = null,
-  code = 0,
-): never {
+function finish(hooks: "on" | "form", gateway: "created" | "form" | null, code = 0, registered: UserSource | null = null): never {
+  const forms = (hooks === "form" ? 1 : 0) + (gateway === "form" ? (registered === null ? 2 : 1) : 0);
+  if (forms > 0) out(`\n${forms === 1 ? "One dashboard form is" : `${["Two", "Three"][forms - 2]} dashboard forms are`} left${forms > 1 ? ", in the order you fill them in" : ""}:\n`);
+  if (hooks === "form") out(hooksForm({ origin }));
   if (gateway === "form") {
-    out("\nThree dashboard forms are left, in the order you fill them in:\n");
-  } else if (gateway === "needs-gateway" && registered !== null) {
-    out(`\nOne dashboard form is left, the gateway, through the User Source ${registered.id}, unless the next run creates it.\n`);
-  } else if (gateway === "needs-gateway") {
-    out("\nTwo dashboard forms are left, in the order you fill them in: the User Source, then the gateway through it.");
-    out("A project key can create neither, because it cannot read a User Source's id.\n");
-  }
-  if (gateway !== "enabled") {
+    if (hooks === "form") out();
     if (registered === null) {
-      out(userSourceForm({ origin, ...userSource }));
+      out(userSourceForm({ issuer: idp.issuer, clientId: idp.clientId }));
       out();
     }
     out(gatewayForm({ slug, toolkit, ...(registered === null ? {} : { userSourceId: registered.id }) }));
   }
-  if (gateway === "form") {
-    out();
-    out(hooksForm({ origin }));
-  }
   out();
   out(
-    nextSteps({ host, origin, port: effective("PORT") || "3000", gateway, deployed: !skipDeploy, userSourceReady: registered !== null, appRunning: appConfirmed }),
+    nextSteps({
+      host,
+      origin,
+      port: effective("PORT") || "3000",
+      hooks,
+      deployed: !skipDeploy,
+      ...(gateway === null ? {} : { gateway: { slug, apiUrl, state: gateway } }),
+      oktaRerun,
+    }),
   );
-  if (gateway === "needs-gateway") {
-    out(`\nOnce the gateway ${slug} exists, turn the hooks on with the same command:`);
-    out(`  ${hooksOnCommand(host)}`);
-    out(`\nwarning: until then the gateway runs ungoverned. The hooks are disabled, so Arcade calls none of`);
-    out(`${origin}/hooks/access, /hooks/pre and /hooks/post, and every tool call runs unchecked.`);
-  }
   process.exit(code);
 }
 
@@ -461,45 +435,23 @@ function deployLine(dir: string): string {
 
 // --- Dry run: the whole sequence, nothing sent ------------------------------
 
-/** `.env` has the app's own sign-in client, so a real run leaves the `web` client's secret alone. */
-const webConfigured = fromFile("IDP_CLIENT_ID") !== "" && fromFile("IDP_CLIENT_SECRET") !== "";
 if (dryRun) {
   // What a real run would find, read off the disk alone: a dry run sends
-  // nothing, so it cannot ask Arcade (#28). `IDP_OAUTH_REDIRECT_URIS_ARCADE`
-  // is written only from the callback Arcade returns when it creates the
-  // provider, and `idp.db` is where the clients are minted.
-  const idpDb = resolve(cwd, effective("IDP_DB_PATH") || "./idp.db");
-  const clientsOnDisk = existsSync(idpDb);
-  const callbackRecorded = fromFile("IDP_OAUTH_REDIRECT_URIS_ARCADE") !== "";
-  const registered = clientsOnDisk && callbackRecorded;
+  // nothing, so it cannot ask Arcade (#28). `ARCADE_PROVIDER_CALLBACK` is
+  // written only from the callback Arcade returns when it creates the provider.
+  const registered = fromFile("ARCADE_PROVIDER_CALLBACK") !== "";
 
   const keys = Object.keys(planned).filter((key) => fromFile(key) === "");
-  if (!webConfigured) keys.push("IDP_CLIENT_ID", "IDP_CLIENT_SECRET");
-  if (!callbackRecorded) keys.push("IDP_OAUTH_REDIRECT_URIS_ARCADE (with the callback Arcade generates for the provider)");
+  if (!registered) keys.push("ARCADE_PROVIDER_CALLBACK (with the callback Arcade generates for the provider)");
+  if (withGateway && onFileGateway === "") keys.push(`ARCADE_GATEWAY_ID (${slug}, once the gateway exists)`);
   out(
     `\n.env${envExists ? "" : " (created from .env.example)"}: ` +
       (keys.length > 0 ? `would fill ${keys.join(", ")}` : "nothing to fill: every value is already set, and none is overwritten"),
   );
-  if (fromFile("IDP_CLIENT_ID") !== "") {
-    out(
-      clientsOnDisk
-        ? "  and if idp.db's web client is not IDP_CLIENT_ID, would rewrite IDP_CLIENT_ID and IDP_CLIENT_SECRET to it, with a new secret"
-        : "  and would rewrite IDP_CLIENT_ID and IDP_CLIENT_SECRET: with no idp.db, a real run mints a new web client, and .env follows it",
-    );
+  if (idpBlank.length > 0) {
+    out(`  warning       ${idpBlank.join(", ")} ${idpBlank.length === 1 ? "is" : "are"} blank: a real run stops here. Run \`bun run okta-setup\` first.`);
   }
-  if (!clientsOnDisk) {
-    out(`idp.db: would mint the OAuth clients ${CLIENT_KEYS.join(", ")}`);
-    if (callbackRecorded) {
-      out(
-        `  warning       .env records the provider's callback, but there is no ${idpDb}: a real run mints new clients, ` +
-          `and a provider Arcade still holds names the old arcade client, so the run stops at the comparison`,
-      );
-    }
-  } else {
-    const rotated = [...(registered ? [] : ["arcade (the provider is created with it)"]), ...(webConfigured ? [] : ["web (.env has no IDP_CLIENT_ID and IDP_CLIENT_SECRET)"])];
-    out(`idp.db: already holds the OAuth clients; each keeps its id, and a missing one is minted`);
-    out(rotated.length > 0 ? `  a new secret, under the same id, for ${rotated.join(" and ")}` : "  no secret is minted or rotated");
-  }
+  out(`identity: a real run reads ${idp.issuer}/.well-known/openid-configuration for the provider's endpoints`);
 
   out(`\nRequests, in order (${apiUrl}):`);
   if (scope !== null) {
@@ -509,15 +461,19 @@ if (dryRun) {
   const registration: Registration = {
     host,
     origin,
-    arcadeClientId: "<the arcade client id in idp.db>",
-    arcadeClientSecret: clientsOnDisk ? "<a new secret for the arcade client, rotated by this run>" : "<the arcade client secret, minted by this run>",
+    endpoints: {
+      authorize: "<authorization_endpoint from IDP_ISSUER's discovery>",
+      token: "<token_endpoint from IDP_ISSUER's discovery>",
+      userinfo: "<userinfo_endpoint from IDP_ISSUER's discovery>",
+    },
+    clientId: idp.clientId,
+    clientSecret: "<IDP_CLIENT_SECRET from .env>",
     approvalsStoreToken: storeToken.generated ? storeToken.value : "<APPROVALS_STORE_TOKEN from .env>",
   };
   await admin.request("GET", `/v1/admin/auth_providers/${PROVIDER_ID}`);
   if (registered) {
     out("    (expected 200: .env holds the callback Arcade made for this provider. It is compared, a difference stops");
-    out("    the run, and nothing is created. If Arcade answers 404 instead, a real run mints a new secret for the");
-    out("    arcade client and creates the provider with it.)");
+    out("    the run, and nothing is created. If Arcade answers 404 instead, a real run creates the provider.)");
   } else {
     out("    (404: the provider is created below. 200: it is compared, and a difference stops the run.)");
     await admin.request("POST", "/v1/admin/auth_providers", providerBody(registration));
@@ -530,10 +486,10 @@ if (dryRun) {
   await admin.request("GET", "/v1/admin/settings/session_verification");
   if (scope !== null) {
     const token = hookToken.generated ? hookToken.value : "<ARCADE_HOOK_SIGNING_SECRET from .env>";
-    out(`    (the hooks: the list above is searched for ${HOOKS_NAME}. With none, it is created disabled:)`);
-    await admin.request("POST", projectPath(scope, "/plugins"), pluginBody(origin, token, "inactive"));
-    out(`    (one that differs is updated instead, PATCH ${projectPath(scope, "/plugins/<plugin_id>")}, keeping its status, and`);
-    out("    one that matches is left as it is. A created or updated one is read back:)");
+    out(`    (the hooks: the list above is searched for ${HOOKS_NAME}. With none, it is created on:)`);
+    await admin.request("POST", projectPath(scope, "/plugins"), pluginBody(origin, token, "active"));
+    out(`    (one that differs, or is disabled, is updated instead, PATCH ${projectPath(scope, "/plugins/<plugin_id>")}, with`);
+    out("    status \"active\", and one that matches and is on is left as it is. A created or updated one is read back:)");
     await admin.request("GET", projectPath(scope, "/plugins/<plugin_id>"));
     await admin.request("GET", projectPath(scope, "/hooks?plugin_id=<plugin_id>"));
   }
@@ -545,100 +501,45 @@ if (dryRun) {
     }
     out("    (the deploys' check, one per toolkit: 404 deploys it, found skips it; --redeploy deploys both anyway)");
   }
-  if (scope !== null && coordinator !== null) {
-    out(`    (the User Source, through the Coordinator API at ${coordinator.baseUrl}:)`);
-    await coordinator.list(scope);
-    out(`    (searched for the issuer ${origin} and the arcade-user-source client. One that differs stops the run, and`);
-    out("    one that matches is used. With none, the run waits for you to start `bun run dev` and the tunnel. On Enter");
-    out(`    it reads the issuer from ${origin}/.well-known/openid-configuration through the tunnel, and has Arcade check it:)`);
-    const discovered = `<the issuer ${origin}/.well-known/openid-configuration names>`;
-    await coordinator.testIssuer(scope, discovered);
-    out("    (204 creates it. A 422 prints Arcade's reason and asks again:)");
-    await coordinator.create(
-      scope,
-      userSourceBody({
-        issuer: discovered,
-        clientId: "<the arcade-user-source client id in idp.db>",
-        clientSecret: clientsOnDisk ? "<a new secret for the arcade-user-source client, rotated by this run>" : "<its secret, minted by this run>",
-      }),
-    );
-    out("    (then the one found or created is read back by id, and must be active and this app's:)");
-    await coordinator.get(scope, "<user_source_id>");
-  }
-  if (scope !== null) {
-    await admin.request("GET", projectPath(scope, "/gateways?limit=100"));
-    if (coordinator !== null) {
-      out(`    (searched for the gateway ${slug}. With none, it is created through the User Source, and read back:)`);
-      await admin.request(
-        "POST",
-        projectPath(scope, "/gateways"),
-        gatewayBody({ slug, userSourceId: "<the User Source's id>", toolkit }),
-      );
-      await admin.request("GET", projectPath(scope, "/gateways/<gateway_id>"));
-      out("    (then the hooks are turned on, last, and read back, unless they already are:)");
-      await admin.request("PATCH", projectPath(scope, "/plugins/<plugin_id>"), pluginPatch(origin, hookToken.generated ? hookToken.value : "<ARCADE_HOOK_SIGNING_SECRET from .env>", "active"));
-      await admin.request("GET", projectPath(scope, "/plugins/<plugin_id>"));
-      await admin.request("GET", projectPath(scope, "/hooks?plugin_id=<plugin_id>"));
-      out("    (If a Coordinator call fails, if you answer n at the pause, or if stdin is not a terminal, the run says which,");
-      out("    sends none of the User Source or gateway writes above, and falls back to the dashboard forms (#48): the");
-      out(`    gateway ${slug} is only looked for, the hooks stay disabled, and the forms below are left.)`);
-    } else {
-      out(`    (searched for the gateway ${slug}, and never written. Not there, as on the first run: the hooks stay disabled`);
-      out(`    and the forms below are left. There: the hooks are turned on, PATCH ${projectPath(scope, "/plugins/<plugin_id>")}`);
-      out(`    with status "active", and read back, unless they already are.)`);
-    }
-  }
   out(
     skipDeploy
       ? "\nDeploys: skipped (--skip-deploy)."
-      : `\nDeploys, after the hooks and before the gateway check, each stopping the run if it fails${redeploy ? " (--redeploy: both, whatever Arcade already runs)" : ", unless Arcade already runs it"}:`,
+      : `\nDeploys, after the hooks, each stopping the run if it fails${redeploy ? " (--redeploy: both, whatever Arcade already runs)" : ", unless Arcade already runs it"}:`,
   );
   if (!skipDeploy) {
     for (const dir of TOOLKIT_DIRS) out(deployLine(dir));
     out(DEPLOY_SECRETS_NOTE);
   }
-  if (scope !== null && coordinator !== null) {
-    out("\nWith the User Source and the gateway made by API, nothing is left for the dashboard. If the run falls back,");
-    out("it ends on these forms instead:");
+  if (withGateway && scope !== null && coordinator !== null) {
+    out(`\nThe gateway (--gateway), after the deploys. The User Source, through the Coordinator API at ${coordinator.baseUrl}:`);
+    await coordinator.list(scope);
+    out(`    (searched for ${idp.issuer} and the client ${idp.clientId}. One that matches is used; one that differs stops the run.`);
+    out("    With none, Arcade checks the issuer, then it is created, and read back by id:)");
+    await coordinator.testIssuer(scope, idp.issuer);
+    await coordinator.create(scope, userSourceBody({ issuer: idp.issuer, clientId: idp.clientId, clientSecret: "<IDP_CLIENT_SECRET from .env>" }));
+    await coordinator.get(scope, "<user_source_id>");
+    out(`  The gateway (${apiUrl}):`);
+    await admin.request("GET", projectPath(scope, "/gateways?limit=100"));
+    out(`    (searched for the gateway ${slug}. One found is held to the User Source and never edited. With none, it is created through`);
+    out("    the User Source, and read back:)");
+    await admin.request("POST", projectPath(scope, "/gateways"), gatewayBody({ slug, userSourceId: "<the User Source's id>", toolkit }));
+    await admin.request("GET", projectPath(scope, "/gateways/<gateway_id>"));
+    out(`    (then ARCADE_GATEWAY_ID=${slug} is written to .env. A Coordinator call that fails stops the run on the dashboard forms;`);
+    out("    the hooks are not touched either way.)");
   }
-  finish(
-    { clientId: "<the arcade-user-source client id in idp.db>", clientSecret: clientsOnDisk ? null : "<its secret, minted by this run>" },
-    scope === null ? "form" : "needs-gateway",
-  );
+  finish(scope === null ? "form" : "on", !withGateway ? null : scope !== null && coordinator !== null ? "created" : "form");
 }
 
 // --- 2. The provider is read back before anything is written ----------------
 
-/**
- * The identity module's own tool, `bun run oauth-client`, as a subprocess.
- * Only the identity module mints (DESIGN.md → Services;
- * `app-test/identity/only-identity-mints.test.ts`), so this script never
- * imports the provider: it runs the same command a human would, with the
- * environment this run has built, and reads its `--json`.
- */
-interface MintedClient {
-  key: string;
-  client_id: string;
-  client_secret: string | null;
-  created: boolean;
-  redirect_uris: string[];
+// The identity provider's endpoints, from its own discovery document: nothing here spells an Okta path.
+let endpoints: Registration["endpoints"];
+try {
+  const document = await discover(idp.issuer);
+  endpoints = { authorize: document.authorization_endpoint, token: document.token_endpoint, userinfo: document.userinfo_endpoint };
+} catch (error) {
+  fail(`reading ${idp.issuer}/.well-known/openid-configuration failed: ${(error as Error).message}. Is IDP_ISSUER the issuer \`bun run okta-setup\` wrote?`);
 }
-async function oauthClient(...args: string[]): Promise<MintedClient[]> {
-  const run = Bun.spawn(["bun", "--no-env-file", join(import.meta.dir, "identity", "oauth-client.ts"), "--json", ...args], {
-    cwd,
-    env: process.env,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const [stdout, stderr, code] = await Promise.all([new Response(run.stdout).text(), new Response(run.stderr).text(), run.exited]);
-  if (code !== 0) fail(`bun run oauth-client ${args.join(" ")} exited ${code}:\n${stderr}`);
-  const printed = (JSON.parse(stdout) as { clients: MintedClient[] }).clients;
-  // A secret is printed only by the call that minted it, and every later call
-  // lists that client again with none: keep each one this run has seen.
-  for (const each of printed) if (each.client_secret !== null) minted.set(each.key, each.client_secret);
-  return printed.map((each) => ({ ...each, client_secret: minted.get(each.key) ?? null }));
-}
-const minted = new Map<string, string>();
 
 out(`\nArcade (${apiUrl}):`);
 
@@ -667,82 +568,23 @@ if (existingProvider.status !== 200 && existingProvider.status !== 404) {
 }
 const providerExists = existingProvider.status === 200;
 
-// --- 3. The OAuth clients ---------------------------------------------------
-
-let clients = await oauthClient();
-const client = (key: string) => {
-  const found = clients.find((each) => each.key === key);
-  if (!found) fail(`bun run oauth-client printed no ${key} client`);
-  return found;
-};
-
-// `web`: the app's own sign-in client. Nothing in Arcade holds it, so when
-// .env names another client than idp.db's, .env follows idp.db (#54): its
-// IDP_CLIENT_ID and IDP_CLIENT_SECRET are rewritten, the one exception to
-// blanks-only besides the provider's callback. Until #54 this was a warning
-// and exit 0, and the sign-in failed with invalid_client: the state that
-// deleting idp.db and rerunning this command, as the identity module's own
-// advice says, leaves behind. Before the provider is compared, so a provider
-// that still names the deleted idp.db's arcade client, which stops the run,
-// does not also leave the sign-in broken.
-const staleWebClient = fromFile("IDP_CLIENT_ID") !== "" && fromFile("IDP_CLIENT_ID") !== client("web").client_id;
-if (staleWebClient) {
-  const secret = await secretOf("web", true);
-  if (secret === null) fail("bun run oauth-client --client web --rotate printed no secret");
-  const id = client("web").client_id;
-  envText = replaceValue(replaceValue(envText, "IDP_CLIENT_ID", id), "IDP_CLIENT_SECRET", secret);
-  writeEnvFile(envPath, envText);
-  fileEnv.IDP_CLIENT_ID = process.env.IDP_CLIENT_ID = id;
-  fileEnv.IDP_CLIENT_SECRET = process.env.IDP_CLIENT_SECRET = secret;
-  out(`
-.env:`);
-  out(`  rewrote  IDP_CLIENT_ID, IDP_CLIENT_SECRET  (.env named a web client idp.db does not hold; now idp.db's ${id},`);
-  out(`           with a new secret, not shown. It is the app's own sign-in client, and nothing in Arcade holds it.`);
-  out(`           Restart \`bun run dev\` if it is running.)`);
-}
-
 if (providerExists) {
-  const desired = providerBody({ host, origin, arcadeClientId: client("arcade").client_id, arcadeClientSecret: "", approvalsStoreToken: "" });
+  const desired = providerBody({ host, origin, endpoints, clientId: idp.clientId, clientSecret: "", approvalsStoreToken: "" });
   const differences = providerDifferences(existingProvider.json, desired);
   if (differences.length > 0) {
     out(`\nThe provider ${PROVIDER_ID} already exists in this Arcade project, and it is not what this app needs:`);
     for (const line of differences) out(`  - ${line}`);
     fail(
-      `nothing was changed in Arcade${staleWebClient ? "" : " or in .env"}. This command never edits an existing provider (DESIGN.md: ` +
-        `Arcade config is read-only). Correct it in the dashboard, or delete it there and run this again.` +
-        (staleWebClient ? "\n  .env's IDP_CLIENT_ID and IDP_CLIENT_SECRET were rewritten above, so the app's own sign-in works; nothing else in .env changed." : ""),
+      "nothing was changed in Arcade or in .env. This command never edits an existing provider (DESIGN.md: " +
+        "Arcade config is read-only). Correct it in the dashboard, or delete it there and run this again.",
     );
   }
   out(`  the provider ${PROVIDER_ID} is already registered and matches; it is left as it is`);
 }
 
-/** The secret a client needs this run, minting a new one only where nothing registered depends on the old. */
-async function secretOf(key: string, rotate: boolean): Promise<string | null> {
-  const current = client(key);
-  if (current.client_secret !== null) return current.client_secret;
-  if (!rotate) return null;
-  clients = await oauthClient("--client", key, "--rotate");
-  return client(key).client_secret;
-}
-
-// `arcade`: rotated only when the provider is about to be created with it.
-const arcadeSecret = await secretOf("arcade", !providerExists);
-// `web`: its credentials live in .env, so rotating is safe whenever .env has none.
-// Already rewritten above when .env named another client.
-const webSecret = webConfigured || staleWebClient ? null : await secretOf("web", true);
-// `arcade-user-source`: shown when minted now; never rotated behind a User Source that may exist.
-// Rotated only when the Coordinator API shows this project has none for the app, right before one is created with it (#52).
-let userSourceSecret = client("arcade-user-source").client_secret;
-
 // --- 4. .env, blanks only ---------------------------------------------------
 
-const toWrite: Record<string, string> = {};
-for (const [key, value] of Object.entries(planned)) toWrite[key] = value;
-if (webSecret !== null) {
-  toWrite.IDP_CLIENT_ID = client("web").client_id;
-  toWrite.IDP_CLIENT_SECRET = webSecret;
-}
-let filled = fillBlanks(envText, toWrite);
+let filled = fillBlanks(envText, planned);
 writeEnvFile(envPath, filled.text);
 out(`\n.env${envExists ? "" : " (created from .env.example)"}:`);
 out(`  filled   ${filled.written.join(", ") || "(nothing to fill: every value was already set)"}`);
@@ -753,8 +595,9 @@ if (filled.kept.length > 0) out(`  kept     ${filled.kept.join(", ")}  (already 
 const registration: Registration = {
   host,
   origin,
-  arcadeClientId: client("arcade").client_id,
-  arcadeClientSecret: arcadeSecret ?? "",
+  endpoints,
+  clientId: idp.clientId,
+  clientSecret: idp.clientSecret,
   approvalsStoreToken: storeToken.value,
 };
 
@@ -768,7 +611,7 @@ async function step<T>(what: string, run: () => Promise<T>, hint?: (error: unkno
       `${what} failed: ${(error as Error).message}\n` +
         (said ? `Arcade says: ${said}\n` : "") +
         (advice ? `${advice}\n` : "") +
-        `.env and idp.db keep what this run wrote, so running the same command again picks up from here.`,
+        `.env keeps what this run wrote, so running the same command again picks up from here.`,
     );
   }
 }
@@ -779,32 +622,30 @@ if (!providerExists) {
 }
 
 // Arcade generates the provider's callback, one per provider (measured in the
-// custom-verifier spike: `…/oauth/<id>/callback`), and the `arcade` client must
+// custom-verifier spike: `…/oauth/<id>/callback`), and the Okta app must
 // allowlist it exactly.
 //
-// The live provider is the source of truth for IDP_OAUTH_REDIRECT_URIS_ARCADE,
-// the one variable this run replaces rather than only fills (#30). On run 4,
-// app-identity was recreated, so Arcade made a new callback, and `.env` still
-// named the old provider's: the run only warned, Arcade then sent the new one,
-// and the identity provider refused it (invalid_redirect) at hop 2's Authorize.
+// The live provider is the source of truth for ARCADE_PROVIDER_CALLBACK, which
+// this run replaces rather than only fills (#30). On run 4, app-identity was
+// recreated, so Arcade made a new callback, and `.env` still named the old
+// provider's: the identity provider then refused it (invalid_redirect) at hop
+// 2's Authorize. `bun run okta-setup` reads it from `.env` and adds it to the
+// Okta app's redirect URIs, so a changed one is a rerun of that command.
 const callback = (provider as { oauth2?: { redirect_uri?: string } } | null)?.oauth2?.redirect_uri;
-const CALLBACK_KEY = "IDP_OAUTH_REDIRECT_URIS_ARCADE";
+const CALLBACK_KEY = "ARCADE_PROVIDER_CALLBACK";
 const onFileCallback = fromFile(CALLBACK_KEY);
-if (callback && (onFileCallback !== callback || !client("arcade").redirect_uris.includes(callback))) {
-  if (onFileCallback === "") {
-    filled = fillBlanks(filled.text, { [CALLBACK_KEY]: callback });
-  } else if (onFileCallback !== callback) {
-    filled = { ...filled, text: replaceValue(filled.text, CALLBACK_KEY, callback) };
-  }
+if (callback && onFileCallback !== callback) {
+  filled =
+    onFileCallback === "" ? fillBlanks(filled.text, { [CALLBACK_KEY]: callback }) : { ...filled, text: replaceValue(filled.text, CALLBACK_KEY, callback) };
   writeEnvFile(envPath, filled.text);
   process.env[CALLBACK_KEY] = callback;
-  // Brings the client's allowlist in line in place; the id and secret do not change.
-  clients = await oauthClient();
+  oktaRerun = true;
   out(
-    onFileCallback !== "" && onFileCallback !== callback
-      ? `  replaced the provider's callback: ${onFileCallback} -> ${callback}`
-      : `  allowlisted the provider's callback on the arcade client: ${callback}`,
+    onFileCallback !== ""
+      ? `  replaced the provider's callback in .env: ${onFileCallback} -> ${callback}`
+      : `  wrote the provider's callback to .env: ${callback}`,
   );
+  out("  Okta does not allowlist it until you run `bun run okta-setup` again (the steps at the end say how)");
 }
 for (const secret of toolSecrets(host, storeToken.value, approvalsChannel)) {
   const { method, path, body } = secretRequest(secret);
@@ -829,9 +670,6 @@ out(`  custom verifier: ${verifier.verifier_url} (read back)`);
 const objectField = (value: unknown, key: string): unknown =>
   value !== null && typeof value === "object" ? (value as Record<string, unknown>)[key] : undefined;
 
-/** The hooks' plugin id and the status it reads back with; `null` without an org and project. */
-let hooks: { id: string; status: HooksStatus } | null = null;
-
 /** The plugin and its hooks read back, held to `status`: anything else fails the run with `failure`. */
 async function readHooksBack(scope: ProjectScope, id: string, status: HooksStatus, failure: string): Promise<void> {
   const plugin = await step("reading the hooks back", () => admin.expect("GET", projectPath(scope, `/plugins/${encodeURIComponent(id)}`)));
@@ -854,11 +692,12 @@ if (scope === null) {
   const existing = listedPlugins.find((each) => objectField(each, "name") === HOOKS_NAME);
   let id = typeof objectField(existing, "id") === "string" ? (objectField(existing, "id") as string) : "";
   if (existing === undefined) {
-    // Disabled (#48): active hooks hide the Loans and Approvals tools from the
-    // dashboard's gateway form, which the developer fills in after this run.
+    // On from the start: the agent's calls go to the Engine directly, and
+    // these hooks are what governs them. There is no gateway form whose tool
+    // list they would hide (#48's reason for creating them disabled).
     const created = await step(
       "creating the contextual access hooks",
-      () => admin.expect("POST", projectPath(scope, "/plugins"), pluginBody(origin, hookToken.value, "inactive")),
+      () => admin.expect("POST", projectPath(scope, "/plugins"), pluginBody(origin, hookToken.value, "active")),
       (error) =>
         isReachabilityError(error)
           ? `Arcade could not reach ${healthCheckUrl(origin)}: start \`bun run dev\` and the tunnel first.`
@@ -866,79 +705,39 @@ if (scope === null) {
     );
     id = typeof objectField(created, "id") === "string" ? (objectField(created, "id") as string) : "";
     if (id === "") fail(`Arcade created the hooks and answered with no id: ${JSON.stringify(created)}`);
-    out(`  hooks: created ${HOOKS_NAME}, disabled until the gateway exists`);
-    await readHooksBack(scope, id, "inactive", "the hooks did not take");
-    hooks = { id, status: "inactive" };
+    out(`  hooks: created ${HOOKS_NAME}, on`);
+    await readHooksBack(scope, id, "active", "the hooks did not take");
   } else {
-    // Whatever state the hooks are in stays, and only the configuration is
-    // compared: turning them on is the gateway check's, at the end of the run.
     const status: HooksStatus = objectField(existing, "status") === "active" ? "active" : "inactive";
     const { differences, unverified } = pluginDifferences(existing, await hooksOf(scope, id), origin, null);
-    if (differences.length === 0) {
-      out(`  hooks: ${HOOKS_NAME} is already registered and matches; it is left as it is (status ${status})`);
+    if (differences.length === 0 && status === "active") {
+      out(`  hooks: ${HOOKS_NAME} is already registered, matches and is on; it is left as it is`);
       for (const field of unverified) out(`  ${unverifiedLine(field)}`);
     } else {
-      out(`  hooks: ${HOOKS_NAME} is registered and differs from what this app needs, so it is updated:`);
-      for (const line of differences) out(`    - ${line}`);
-      await step("updating the contextual access hooks", () =>
-        admin.expect("PATCH", projectPath(scope, `/plugins/${encodeURIComponent(id)}`), pluginPatch(origin, hookToken.value, status)),
+      if (differences.length > 0) {
+        out(`  hooks: ${HOOKS_NAME} is registered and differs from what this app needs, so it is updated:`);
+        for (const line of differences) out(`    - ${line}`);
+      }
+      if (status !== "active") out(`  hooks: ${HOOKS_NAME} is registered and disabled, so it is turned on`);
+      await step(differences.length > 0 ? "updating the contextual access hooks" : "turning the hooks on", () =>
+        admin.expect("PATCH", projectPath(scope, `/plugins/${encodeURIComponent(id)}`), pluginPatch(origin, hookToken.value, "active")),
       );
-      await readHooksBack(scope, id, status, "the hooks did not take");
+      await readHooksBack(scope, id, "active", status === "active" ? "the hooks did not take" : "the hooks did not turn on");
     }
-    hooks = { id, status };
   }
-}
-
-/**
- * A gateway that exists, brought up to the Gmail and Slack tools: when they are
- * all it lacks (`nativeToolsToAdd`), they are added by `PATCH` and read back.
- * Its authentication is never touched, and nothing is removed. Answers the tool
- * list's differences left to warn about: none once the tools are added, the
- * same ones as before when there was nothing to add or Arcade refused.
- */
-async function addNativeTools(scope: ProjectScope | null, gateway: unknown): Promise<string[]> {
-  const before = gatewayCheck(gateway, toolkit).tools;
-  const add = nativeToolsToAdd(gateway, toolkit);
-  const id = objectField(gateway, "id");
-  if (scope === null || add.length === 0 || typeof id !== "string" || id === "") return before;
-  const path = projectPath(scope, `/gateways/${encodeURIComponent(id)}`);
-  const manually =
-    `add them in the dashboard (disable ${HOOKS_NAME} first, or the gateway form does not list the ${toolkit} tools), ` +
-    `or blank ARCADE_GATEWAY_ID in .env and run this with --gateway <a-new-slug> for a second gateway with all of them`;
-  const patched = await admin.request("PATCH", path, gatewayToolsPatch(gateway, add));
-  if (patched.status < 200 || patched.status >= 300) {
-    const error = new ArcadeError("PATCH", path, patched.status, JSON.stringify(patched.json));
-    const said = arcadeMessage(error);
-    out(`  warning       adding the ${add.length} Gmail and Slack tools to ${slug} failed: ${error.message}${said ? ` (Arcade says: ${said})` : ""}`);
-    out(`  warning       ${manually}`);
-    return before;
-  }
-  const read = await admin.request("GET", path);
-  if (read.status !== 200) {
-    out(`  warning       the Gmail and Slack tools were sent to ${slug}, and reading it back failed: ${new ArcadeError("GET", path, read.status, JSON.stringify(read.json)).message}. Run this again to check.`);
-    return before;
-  }
-  const after = gatewayCheck(read.json, toolkit);
-  if (nativeToolsToAdd(read.json, toolkit).length > 0) {
-    out(`  warning       ${slug} was updated, and Arcade reads back without all the Gmail and Slack tools; ${manually}`);
-    return after.tools;
-  }
-  out(`  gateway: added the ${add.length} Gmail and Slack tools to ${slug}, keeping its other tools and its User Source (read back)`);
-  return after.tools;
 }
 
 // --- 7. The deploys (#30) ---------------------------------------------------
 
 if (skipDeploy) {
-  out("\nDeploys: skipped (--skip-deploy). Deploy the toolkits before the gateway: arcade deploy, in mcp.");
+  out("\nDeploys: skipped (--skip-deploy). Deploy the toolkits yourself: arcade deploy, in mcp.");
 } else {
   out(`\n${DEPLOY_SECRETS_NOTE.trimStart()}`);
   for (const dir of TOOLKIT_DIRS) {
     const where = join(cwd, dir);
     if (!existsSync(where)) fail(`there is no ${dir} under ${cwd} to deploy. Run this from the project's root, or pass --skip-deploy.`);
-    // Already on Arcade: skipped, because a rerun (the second run, which
-    // turns the hooks on) otherwise pays for two full deploys of unchanged code
-    // (#30). The CLI's own check, `server_already_exists`: 404 is missing.
+    // Already on Arcade: skipped, because a rerun otherwise pays for two full
+    // deploys of unchanged code (#30). The CLI's own check, `server_already_exists`: 404 is missing.
     // Arcade's answer carries no version to compare (schemas.WorkerResponse),
     // so a changed toolkit needs --redeploy.
     const name = serverName(where);
@@ -981,199 +780,33 @@ if (skipDeploy) {
   }
 }
 
-// --- 8. The User Source and the gateway by API (#52), else the dashboard forms (#48)
+// --- 8. The User Source and the gateway, under --gateway (#52) --------------
 
-/** The hooks turned on behind a gateway that exists, and read back: the last write of every run that gets there. */
-async function turnHooksOn(scope: ProjectScope, hooks: { id: string; status: HooksStatus }): Promise<void> {
-  if (hooks.status === "active") {
-    out(`  hooks: already on (status active); nothing to do`);
-    return;
-  }
-  await step("turning the hooks on", () =>
-    admin.expect("PATCH", projectPath(scope, `/plugins/${encodeURIComponent(hooks.id)}`), pluginPatch(origin, hookToken.value, "active")),
+/**
+ * The run stops here, under `--gateway`, when the User Source or the gateway
+ * could not be made by API: what failed, then the forms, then the steps.
+ * Nothing registered above is undone, and the hooks are as they were.
+ */
+function gatewayNotRegistered(why: string, registered: UserSource | null = null): never {
+  console.error(`\nsetup-arcade: ${why}`);
+  out(
+    registered === null
+      ? "\nThe User Source and the gateway were not registered by API, so they are the dashboard forms below. Everything above is done."
+      : `\nThe User Source ${registered.id} is registered and the gateway is not, so the gateway is the dashboard form below. Everything above is done.`,
   );
-  await readHooksBack(scope, hooks.id, "active", "the hooks did not turn on");
-  out(`  hooks: on. Arcade now calls /hooks/access, /hooks/pre and /hooks/post for every tool call through ${slug}`);
+  finish("on", "form", 1, registered);
 }
 
 /**
- * The #48 flow, unchanged: the gateway is looked for under the slug and never
- * written. Not there, the hooks stay as they are and the forms are left; there,
- * the hooks are turned on behind it. The fallback whenever the Coordinator
- * path is not available.
+ * The User Source found by issuer or created through the Coordinator API,
+ * read back by id, then the gateway found by slug or created through it,
+ * read back. Create-only, both: one that exists and differs stops the run.
  */
-async function dashboardFlow(scope: ProjectScope, hooks: { id: string; status: HooksStatus }): Promise<NextSteps["gateway"]> {
-  out(`\nThe gateway (${apiUrl}):`);
-  const listed = pageItems(await step("listing the gateways", () => admin.expect("GET", projectPath(scope, "/gateways?limit=100"))));
-  const gateway = listed.find((each) => objectField(each, "slug") === slug);
-  if (gateway === undefined) {
-    out(`  gateway: there is no ${slug} in this project yet; it is the dashboard form below`);
-    out(
-      hooks.status === "active"
-        ? `  hooks: already on, so the dashboard's gateway form will not list the ${toolkit} tools. ` +
-            `Disable ${HOOKS_NAME} in the dashboard before you fill it in, and this command turns them back on after.`
-        : "  hooks: left disabled, so the dashboard's gateway form lists the tools",
-    );
-  } else {
-    const check = gatewayCheck(gateway, toolkit);
-    if (check.authType !== null) {
-      fail(
-        `the gateway ${slug} does not authenticate through the User Source:\n  - ${check.authType}\n` +
-          `The hooks are left ${hooks.status === "active" ? "on" : "disabled"}. Hop 1 is the access model, and this template never runs a ` +
-          "gateway on Arcade Headers or on Arcade accounts. In the dashboard, set its Authentication to Non-Arcade Users → User Source → " +
-          "Loans Approval Limits, or delete it and fill in the gateway form again, then run this again.",
-      );
-    }
-    out(`  gateway: found ${slug}, through a User Source`);
-    const toolWarnings = await addNativeTools(scope, gateway);
-    for (const line of toolWarnings) out(`  warning       ${line}`);
-    if (toolWarnings.length > 0) {
-      out(
-        `  warning       the hooks are turned on anyway. To fix the tool list, disable ${HOOKS_NAME} in the dashboard first: ` +
-          `while it is on, the gateway form does not list the ${toolkit} tools. Then run this again.`,
-      );
-    }
-    await turnHooksOn(scope, hooks);
-    return "enabled";
-  }
-  return "needs-gateway";
-}
-
-/** Why the one-click path stopped short, as the one line the run prints before the #48 flow. */
-type Fallback = { fallback: string };
-
-/**
- * The app's own OIDC discovery through the public host, which Arcade reads at
- * the create (#52): the issuer it names, byte for byte, which is what the
- * create must send, or what is wrong, in one line. Wrong: no answer, not
- * JSON, an issuer that is not the app's origin (an app started before `.env`
- * was written), or a `scopes_supported` without one of the scopes the User
- * Source asks for. `CG_SETUP_ARCADE_ISSUER_URL` is the test harness's
- * stand-in for the tunnel, read from the shell only, never from `.env`.
- */
-async function appDiscovery(): Promise<{ issuer: string } | { problem: string }> {
-  const base = (shellEnv.CG_SETUP_ARCADE_ISSUER_URL?.trim() || origin).replace(/\/+$/, "");
-  const url = `${base}/.well-known/openid-configuration`;
-  let response: Response;
-  try {
-    // ngrok's free-domain warning page is for browsers; this header skips it for anything else.
-    response = await fetch(url, { headers: { accept: "application/json", "ngrok-skip-browser-warning": "1" }, signal: AbortSignal.timeout(10_000) });
-  } catch (error) {
-    return { problem: `GET ${url} failed: ${(error as Error).message}. Is the tunnel up, pointing at the app's port?` };
-  }
-  const raw = await response.text();
-  if (response.status !== 200) {
-    return {
-      problem: `GET ${url} answered ${response.status}${response.status === 503 ? ": the app's sign-in did not start (start `bun run dev` again, so it reads the new .env)" : ""}`,
-    };
-  }
-  let document: { issuer?: unknown; scopes_supported?: unknown } | null;
-  try {
-    document = JSON.parse(raw) as typeof document;
-  } catch {
-    return { problem: `GET ${url} answered 200 with a body that is not JSON: is the tunnel pointing at this app?` };
-  }
-  const issuer = document?.issuer;
-  if (typeof issuer !== "string" || issuer.replace(/\/+$/, "") !== origin) {
-    return {
-      problem: `GET ${url} names the issuer ${JSON.stringify(issuer) ?? "nothing"}, not ${origin}: stop \`bun run dev\` and start it again, so it reads APP_PUBLIC_HOST from .env`,
-    };
-  }
-  const supported = document?.scopes_supported;
-  if (Array.isArray(supported)) {
-    const missing = USER_SOURCE_SCOPES.filter((scope) => !supported.includes(scope));
-    if (missing.length > 0) {
-      return {
-        problem: `GET ${url} does not publish the scope${missing.length > 1 ? "s" : ""} ${missing.join(", ")} in scopes_supported, which the User Source asks for: is an older app still running?`,
-      };
-    }
-  }
-  return { issuer };
-}
-
-/**
- * The one reader of stdin for the whole run, made at the first question: the
- * lines typed so far and not yet answered (typed ahead, or piped), whoever is
- * waiting for the next one, and whether stdin has ended.
- */
-interface Prompt {
-  rl: import("node:readline").Interface;
-  lines: string[];
-  waiting: ((line: string | null) => void) | null;
-  ended: boolean;
-}
-let prompt: Prompt | null = null;
-
-/**
- * One line from the terminal, or `null` for no (`n`), the end of stdin, or
- * Ctrl-C (#52). Ctrl-C is caught for the question alone, so it falls back to
- * the forms instead of leaving the run half-printed. Stdin that is not a
- * terminal does not echo the Enter, so the line break is printed for it.
- */
-async function ask(question: string): Promise<string | null> {
-  if (prompt === null) {
-    const { createInterface } = await import("node:readline");
-    const rl = createInterface({ input: process.stdin, terminal: process.stdin.isTTY === true });
-    const state: Prompt = { rl, lines: [], waiting: null, ended: false };
-    const give = (line: string | null) => {
-      const waiting = state.waiting;
-      state.waiting = null;
-      if (waiting) waiting(line);
-      else if (line !== null) state.lines.push(line);
-    };
-    rl.on("line", (line) => give(line));
-    rl.on("SIGINT", () => give(null));
-    rl.once("close", () => {
-      state.ended = true;
-      give(null);
-    });
-    prompt = state;
-  }
-  const state = prompt;
-  if (state.lines.length === 0 && state.ended) return null;
-  process.stdout.write(question);
-  const answer = await new Promise<string | null>((resolve) => {
-    const queued = state.lines.shift();
-    if (queued !== undefined) return resolve(queued);
-    const interrupted = () => resolve(null);
-    process.once("SIGINT", interrupted);
-    state.waiting = (line) => {
-      process.removeListener("SIGINT", interrupted);
-      resolve(line);
-    };
-  });
-  state.waiting = null;
-  if (process.stdin.isTTY !== true || answer === null) out();
-  return answer === null || /^\s*n(o)?\s*$/i.test(answer) ? null : answer;
-}
-
-/**
- * What is left when the User Source is registered and the gateway is not
- * (#52): said plainly, then the gateway form alone, and exit 1. The hooks are
- * left as they were, so no gateway runs ungoverned by this run's doing.
- */
-function gatewayNotCreated(source: UserSource, createdNow: boolean, hooks: { status: HooksStatus }, why: string): never {
-  console.error(`\nsetup-arcade: the gateway ${slug} was not created: ${why}`);
-  out(`\nThe User Source ${source.id} is registered (${createdNow ? "created by this run" : "it was there already"}), and the gateway is not, so the hooks`);
-  out(`are left ${hooks.status === "active" ? "on" : "disabled"}. What is left: run this same command again, which finds the User Source and creates the`);
-  out("gateway through it, or fill in the gateway form below and then run this command again to turn the hooks on.");
-  finish({ clientId: client("arcade-user-source").client_id, clientSecret: null }, "needs-gateway", source, 1);
-}
-
-/**
- * The one-click path (#52): the User Source found by issuer or created through
- * the Coordinator API, read back by id, then the gateway created through it
- * by API, then the hooks turned on, last, each read back. Anything the
- * Coordinator answers that is not what this script expects returns the one
- * line to print before the #48 flow, having written nothing to Arcade.
- */
-async function oneClick(scope: ProjectScope, hooks: { id: string; status: HooksStatus }): Promise<"enabled" | Fallback> {
-  if (coordinator === null) return { fallback: `coordinator: ${"why" in coordinatorBase ? coordinatorBase.why : "none"}` };
+async function registerGateway(scope: ProjectScope, coordinator: Coordinator): Promise<void> {
   out(`\nThe User Source (${coordinator.baseUrl}):`);
-  const want: UserSourceSpec = { issuer: origin, clientId: client("arcade-user-source").client_id };
+  const want: UserSourceSpec = { issuer: idp.issuer, clientId: idp.clientId };
   const listed = await coordinator.list(scope);
-  if (!listed.ok) return { fallback: failureLine(listed) };
-  const hooksLeft = `the hooks are left ${hooks.status === "active" ? "on" : "disabled"}`;
+  if (!listed.ok) gatewayNotRegistered(failureLine(listed));
 
   let found: UserSource;
   let createdNow = false;
@@ -1186,76 +819,39 @@ async function oneClick(scope: ProjectScope, hooks: { id: string; status: HooksS
     fail(
       `${claimants.length > 1 ? `${claimants.length} User Sources in this project claim this app's issuer or client` : "a User Source in this project claims this app's issuer or client"}, and this command will not pick one or reuse one that differs:\n` +
         `${report}\n` +
-        `Nothing was changed in Arcade: this command never edits a User Source, because it is hop 1, the access model itself. No gateway was created, ` +
-        `and ${hooksLeft}. In the dashboard (your project → User Sources), correct it or delete it, then run this again.`,
+        "Nothing was changed in Arcade: this command never edits a User Source, because it is hop 1, the access model itself. No gateway was created, " +
+        "and everything above is done. In the dashboard (your project → User Sources), correct it or delete it, then run this again.",
     );
   }
   if (claimants.length === 1) {
     found = claimants[0]!;
-    out(`  user source: found ${found.name ?? USER_SOURCE_NAME} (${found.id}), issuer ${origin}, client ${want.clientId}; it matches and is left as it is`);
+    out(`  user source: found ${found.name ?? USER_SOURCE_NAME} (${found.id}), issuer ${want.issuer}, client ${want.clientId}; it matches and is left as it is`);
   } else {
-    out(`  user source: there is none for ${origin} in this project yet. Arcade reads the app's sign-in through the tunnel`);
-    out("  when it creates one, so the app has to be up behind it first.");
-    if (!interactive) {
-      return {
-        fallback: "user source: not created, because stdin is not a terminal, so this run cannot wait for you to start `bun run dev` and the tunnel",
-      };
-    }
-    const port = effective("PORT") || "3000";
-    for (;;) {
-      // The human's wording (#52): the app starts after .env is written, so there is nothing to restart.
-      const answer = await ask(
-        `\n  Now start the app and the tunnel, in two other terminals: bun run dev, and ngrok http --url=${host} ${port}.\n` +
-        `  (Or both in one: bun run up.)\n` +
-          "  Press Enter when both are running (n, or Ctrl-C, ends on the dashboard forms instead): ",
-      );
-      if (answer === null) return { fallback: "user source: not created, at your answer, so none of it is sent" };
-      // The issuer as the app names it, byte for byte: the create compares the two so.
-      const discovery = await appDiscovery();
-      if ("problem" in discovery) {
-        out(`  ${discovery.problem}`);
-        continue;
-      }
-      want.issuer = discovery.issuer;
-      // Arcade's own check, the create's without the save: a 422 is the app or the tunnel not up yet, as Arcade sees it.
-      const checked = await coordinator.testIssuer(scope, discovery.issuer);
-      if (checked.ok) break;
-      if (checked.code === 422) {
-        out(`  Arcade cannot use the issuer ${discovery.issuer} yet: ${checked.msg ?? "(no reason given)"}`);
-        continue;
-      }
+    out(`  user source: there is none for ${want.issuer} in this project yet; Arcade checks the issuer, then it is created`);
+    // Arcade's own check, the create's without the save. It reads the identity provider's discovery, not the app's.
+    const checked = await coordinator.testIssuer(scope, want.issuer);
+    if (!checked.ok) {
       if (checked.code === 404 || checked.code === 405) {
-        return { fallback: `coordinator: ${checked.call} answered ${checked.status}, so this Coordinator cannot check the issuer before the create` };
+        gatewayNotRegistered(`coordinator: ${checked.call} answered ${checked.status}, so this Coordinator cannot check the issuer before the create`);
       }
-      return { fallback: failureLine(checked) };
+      if (checked.code === 422) gatewayNotRegistered(`user source: Arcade cannot use the issuer ${want.issuer}: ${checked.msg ?? "(no reason given)"}`);
+      gatewayNotRegistered(failureLine(checked));
     }
-    prompt?.rl.close();
-    out(`  the app answers for ${want.issuer} through the tunnel, and Arcade can use it`);
-    // The client's secret goes to Arcade in the create, and only there: a
-    // client minted by this run already has one, and an older one is rotated,
-    // which is safe because no User Source in this project uses it.
-    const secret = userSourceSecret ?? (await secretOf("arcade-user-source", true));
-    userSourceSecret = secret;
-    if (secret === null) fail("bun run oauth-client --client arcade-user-source --rotate printed no secret");
-    const created = await coordinator.create(scope, userSourceBody({ issuer: want.issuer, clientId: want.clientId, clientSecret: secret }));
-    if (!created.ok) return { fallback: failureLine(created) };
+    const created = await coordinator.create(scope, userSourceBody({ issuer: want.issuer, clientId: want.clientId, clientSecret: idp.clientSecret }));
+    if (!created.ok) gatewayNotRegistered(failureLine(created));
     found = created.value;
     createdNow = true;
-    appConfirmed = true;
   }
 
   // Read back by id, found or created: the gateway create checks only the id's shape, not that it is there, active and this app's.
   const read = await coordinator.get(scope, found.id);
-  if (!read.ok) {
-    if (!createdNow) return { fallback: failureLine(read) };
-    gatewayNotCreated(found, true, hooks, `reading the User Source back failed: ${failureLine(read)}`);
-  }
+  if (!read.ok) gatewayNotRegistered(`reading the User Source back failed: ${failureLine(read)}`, createdNow ? found : null);
   const source = read.value;
   const differences = [...readinessDifferences(source, found.id), ...userSourceDifferences(source, want)];
   if (differences.length > 0) {
     fail(
       `the User Source ${found.id} ${createdNow ? "did not take" : "is not one a gateway can use"}: Arcade reads back\n${differences.map((line) => `  - ${line}`).join("\n")}\n` +
-        `No gateway was created, and ${hooksLeft}. In the dashboard (your project → User Sources), correct it or delete it, then run this again.`,
+        "No gateway was created, and everything above is done. In the dashboard (your project → User Sources), correct it or delete it, then run this again.",
     );
   }
   out(
@@ -1265,12 +861,12 @@ async function oneClick(scope: ProjectScope, hooks: { id: string; status: HooksS
   );
   out(`  user source: ${reported(source)} (reported, not checked)`);
 
-  // The gateway, through it (#30's create, restored).
+  // The gateway, through it.
   out(`\nThe gateway (${apiUrl}):`);
   const spec: GatewaySpec = { slug, userSourceId: source.id, toolkit };
   const listPath = projectPath(scope, "/gateways?limit=100");
   const listing = await admin.request("GET", listPath);
-  if (listing.status !== 200) gatewayNotCreated(source, createdNow, hooks, new ArcadeError("GET", listPath, listing.status, JSON.stringify(listing.json)).message);
+  if (listing.status !== 200) gatewayNotRegistered(new ArcadeError("GET", listPath, listing.status, JSON.stringify(listing.json)).message, source);
   const existing = pageItems(listing.json).find((each) => objectField(each, "slug") === slug);
   if (existing !== undefined) {
     // Made before, by a run like this one or in the dashboard: held to the User Source, never edited.
@@ -1280,57 +876,62 @@ async function oneClick(scope: ProjectScope, hooks: { id: string; status: HooksS
     if (check.authType !== null || other !== null) {
       fail(
         `the gateway ${slug} does not authenticate through this app's User Source:\n  - ${check.authType ?? other}\n` +
-          `The hooks are left ${hooks.status === "active" ? "on" : "disabled"}. Hop 1 is the access model, and this template never runs a ` +
-          "gateway on Arcade Headers or on Arcade accounts. In the dashboard, set its Authentication to Non-Arcade Users → User Source → " +
-          "Loans Approval Limits, or delete it and run this again.",
+          "Everything above is done. Hop 1 is the access model, and this template never runs a gateway on Arcade Headers or on " +
+          "Arcade accounts. In the dashboard, set its Authentication to Non-Arcade Users → User Source → Loans Approval Limits, " +
+          "or delete it, or blank ARCADE_GATEWAY_ID in .env and run this with --gateway=<another-slug>.",
       );
     }
-    out(`  gateway: found ${slug}, through the User Source ${source.id}`);
-    for (const line of await addNativeTools(scope, existing)) out(`  warning       ${line}`);
+    out(`  gateway: found ${slug}, through the User Source ${source.id}; it is left as it is`);
+    for (const line of check.tools) out(`  warning       ${line}`);
   } else {
     const path = projectPath(scope, "/gateways");
     const created = await admin.request("POST", path, gatewayBody(spec));
     if (created.status === 409) {
-      gatewayNotCreated(source, createdNow, hooks, `Arcade says the slug ${slug} is taken. Blank ARCADE_GATEWAY_ID in .env and run this with --gateway <another-slug>`);
+      gatewayNotRegistered(`Arcade says the slug ${slug} is taken. Blank ARCADE_GATEWAY_ID in .env and run this with --gateway=<another-slug>`, source);
     }
     if (created.status < 200 || created.status >= 300) {
       const error = new ArcadeError("POST", path, created.status, JSON.stringify(created.json));
       const said = arcadeMessage(error);
-      gatewayNotCreated(source, createdNow, hooks, `${error.message}${said ? `\nArcade says: ${said}` : ""}`);
+      gatewayNotRegistered(`${error.message}${said ? `\nArcade says: ${said}` : ""}`, source);
     }
     const id = objectField(created.json, "id");
-    if (typeof id !== "string" || id === "") gatewayNotCreated(source, createdNow, hooks, `Arcade answered with no id: ${JSON.stringify(created.json)}`);
+    if (typeof id !== "string" || id === "") gatewayNotRegistered(`Arcade answered with no id: ${JSON.stringify(created.json)}`, source);
     const readPath = projectPath(scope, `/gateways/${encodeURIComponent(id)}`);
     const readBack = await admin.request("GET", readPath);
     if (readBack.status !== 200) {
       fail(
         `the gateway ${slug} was created (${id}), and reading it back failed: ${new ArcadeError("GET", readPath, readBack.status, JSON.stringify(readBack.json)).message}\n` +
-          `The hooks are left ${hooks.status === "active" ? "on" : "disabled"}. Run this again: it finds the gateway, checks it, and turns the hooks on.`,
+          "Everything above is done. Run this again with --gateway: it finds the gateway and checks it.",
       );
     }
-    const differences = gatewayDifferences(readBack.json, spec);
-    if (differences.length > 0) {
+    const gatewayDiff = gatewayDifferences(readBack.json, spec);
+    if (gatewayDiff.length > 0) {
       fail(
-        `the gateway did not take: Arcade reads back\n${differences.map((line) => `  - ${line}`).join("\n")}\n` +
-          `The hooks are left ${hooks.status === "active" ? "on" : "disabled"}. Correct it in the dashboard, or delete it and run this again.`,
+        `the gateway did not take: Arcade reads back\n${gatewayDiff.map((line) => `  - ${line}`).join("\n")}\n` +
+          "Everything above is done. Correct it in the dashboard, or delete it and run this again with --gateway.",
       );
     }
     out(`  gateway: created ${slug}, through the User Source ${source.id}, with the six ${toolkit} tools and Gmail and Slack (read back)`);
   }
 
-  // The hooks, last: the gateway exists, and is the User Source's.
-  await turnHooksOn(scope, hooks);
-  return "enabled";
+  // The slug, to .env: the app shows the "Connect your MCP client" panel from it.
+  filled = fillBlanks(filled.text, { ARCADE_GATEWAY_ID: slug });
+  writeEnvFile(envPath, filled.text);
+  process.env.ARCADE_GATEWAY_ID = slug;
+  out(`  gateway: ${gatewayUrl(apiUrl, slug)}${filled.written.includes("ARCADE_GATEWAY_ID") ? ", written to .env as ARCADE_GATEWAY_ID" : " (ARCADE_GATEWAY_ID is already in .env)"}`);
 }
 
-let gatewayState: NextSteps["gateway"] = "form";
-if (scope !== null && hooks !== null) {
-  const result = await oneClick(scope, hooks);
-  if (result === "enabled") {
-    gatewayState = "enabled";
+let gatewayState: "created" | "form" | null = null;
+if (withGateway) {
+  if (scope === null) {
+    out("\nThe gateway: no org and project, so the User Source and the gateway are the forms below");
+    gatewayState = "form";
+  } else if (coordinator === null) {
+    gatewayNotRegistered(`coordinator: ${coordinatorBase !== null && "why" in coordinatorBase ? coordinatorBase.why : "none"}`);
   } else {
-    out(`  ${result.fallback}. The rest is the dashboard flow (#48):`);
-    gatewayState = await dashboardFlow(scope, hooks);
+    await registerGateway(scope, coordinator);
+    gatewayState = "created";
   }
 }
-finish({ clientId: client("arcade-user-source").client_id, clientSecret: userSourceSecret }, gatewayState);
+
+finish(scope === null ? "form" : "on", gatewayState);

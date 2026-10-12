@@ -299,7 +299,7 @@ correct `ARCADE_TOOLKIT` in `.env.example` if it differs, and report
 on #35. A policy rule keyed on the wrong string matches nothing, which is
 indistinguishable from a rule that permits.
 
-The toolkit also has to be added to the gateway (#13) before the agent can call
-it, and every persona who can trigger act 2 authorizes Slack once. Rehearse
+The agent reaches it directly through the Engine with the project key, so there
+is no gateway to add it to, and every persona who can trigger act 2 authorizes Slack once. Rehearse
 that authorization; a scope refusal happens upstream of every hook and leaves
 the panel dark.

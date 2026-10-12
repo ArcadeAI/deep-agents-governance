@@ -2,7 +2,7 @@
  * The sealed session cookie: what it protects, and what happens when it grows
  * past what a browser will hold.
  *
- * Two properties the demo rests on. The cookie holds a gateway bearer token, so
+ * Two properties the demo rests on. The cookie holds the IdP's bearer tokens, so
  * **it must be unreadable without `SESSION_SECRET`** — not merely signed, not
  * merely opaque-looking. And two JWTs plus an email exceed the 4KB a browser
  * gives one cookie, so **chunking is the normal case, not an edge**; a browser
@@ -134,15 +134,14 @@ describe("the seal", () => {
 
 describe("chunking past 4KB", () => {
   test("a value longer than the limit becomes several cookies and joins back", async () => {
-    // Two JWT-shaped tokens: what a real gateway response puts in this cookie.
+    // Two JWT-shaped tokens: what a real IdP token response puts in this cookie.
     const session: Session = {
       email: "alice@bank.example",
       signed_in_at: 1_760_000_000_000,
-      gateway: {
+      idp: {
         access_token: `header.${"a".repeat(2600)}.signature`,
         refresh_token: `header.${"r".repeat(2600)}.signature`,
         expires_at: 1_760_000_600_000,
-        client_id: "mcp-client-1",
       },
     };
 
@@ -179,10 +178,9 @@ describe("chunking past 4KB", () => {
       {
         email: "alice@bank.example",
         signed_in_at: 1,
-        gateway: {
+        idp: {
           access_token: "t".repeat(4000),
           expires_at: 2,
-          client_id: "mcp-client-1",
         },
       },
       config(),
@@ -204,7 +202,7 @@ describe("chunking past 4KB", () => {
       {
         email: "alice@bank.example",
         signed_in_at: 1,
-        gateway: { access_token: "t".repeat(7000), expires_at: 2, client_id: "mcp-client-1" },
+        idp: { access_token: "t".repeat(7000), expires_at: 2 },
       },
       config(),
     );
@@ -241,7 +239,7 @@ describe("chunking past 4KB", () => {
       {
         email: "alice@bank.example",
         signed_in_at: 1,
-        gateway: { access_token: "t".repeat(7000), expires_at: 2, client_id: "mcp-client-1" },
+        idp: { access_token: "t".repeat(7000), expires_at: 2 },
       },
       config(),
     );

@@ -7,7 +7,7 @@
  * poll over a real socket, and a real decision written to a real `loans.db` by
  * a different person on a different connection.
  *
- * So: `apps/idp` is a real subprocess, `next dev` serves the actual pages and
+ * So: the identity provider is the OIDC stand-in, `next dev` serves the actual pages and
  * the loan module inside them (since #5; it was `apps/loan-app`, a subprocess
  * of its own), headless Chrome holds the sealed session a real sign-in
  * produced, and the approval is a `POST /bank/loans/:id/approve` made with Charlie's
@@ -38,7 +38,7 @@ import { spawnChild } from "./child.ts";
 import { chunk, chunkName, joinChunks, openSealed, seal } from "../auth/seal.ts";
 import { LOAN_POLL_INTERVAL_MS } from "../lib/loan-context/loans.ts";
 import { SESSION_COOKIE, type Session } from "../auth/session.ts";
-import { appIdentityEnv } from "./app-identity.ts";
+import { appIdentityEnv, stopAppIdentities } from "./app-identity.ts";
 import { Browser, PEOPLE, SESSION_SECRET, signInAs } from "./identity-harness.ts";
 import { seedDemoGovernance } from "./demo-cast.ts";
 
@@ -84,10 +84,10 @@ test.skipIf(chromeResolution.path === null && !REQUIRED)(
       // roster, so the demo cast's subjects go into the file the app opens.
       seedDemoGovernance(join(dir, "governance.db"));
       const web = await serveOnFreePort(async (webPort) => {
-        // The app is its own identity provider since #6: its own throwaway
-        // idp.db, client C minted in it, and APP_PUBLIC_HOST its own origin.
+        // The identity provider is an OIDC stand-in with the demo cast in
+        // it, and APP_PUBLIC_HOST is the app's own origin.
         // Minted per attempt, because the issuer is the origin.
-        const appIdentity = await appIdentityEnv(`http://127.0.0.1:${webPort}`, join(dir, "identity", String(webPort)));
+        const appIdentity = await appIdentityEnv(`http://127.0.0.1:${webPort}`);
         return spawnChild({
           // `--bun`: the app runs on Bun since #4, because the control plane it
           // mounts opens governance.db with bun:sqlite (`scripts/next.ts`).
@@ -103,14 +103,11 @@ test.skipIf(chromeResolution.path === null && !REQUIRED)(
             SESSION_SECRET,
             ...appIdentity.env,
             // The app's loan module: its own `loans.db` in this test's
-            // workspace, and bearers checked at the app's own identity
-            // provider, over its local listener — the default, stated because
-            // the ambient environment may carry another.
+            // workspace; bearers are checked at `appIdentity.env`'s issuer.
             LOANS_DB_PATH: join(dir, "loans.db"),
-            IDENTITY_HOST: `localhost:${webPort}`,
             // So the decision line can name the person rather than the address.
-            // The gateway is not configured on purpose: nothing about the loan
-            // cards depends on hop 1 since #157, and a page that still needed it
+            // No Arcade key or gateway at all: nothing about the loan cards
+            // depends on Arcade since #157, and a page that still needed it
             // would fail here rather than quietly keep working.
           },
           stdout: "pipe",
@@ -141,8 +138,8 @@ test.skipIf(chromeResolution.path === null && !REQUIRED)(
       const debugPort = browser.port;
 
       // Alice's browser, holding the cookie a real sign-in produced — a real
-      // authorization-code flow against the real `apps/idp`, with a real
-      // password, through the real handlers.
+      // authorization-code flow against the OIDC stand-in, with a password,
+      // through the real handlers.
       const alice = await sessionFor({ webUrl: origin }, "dana");
       const cookies = chunk(await seal(alice, SESSION_SECRET)).map((value, index) => ({
         name: chunkName(SESSION_COOKIE, index),
@@ -245,6 +242,7 @@ test.skipIf(chromeResolution.path === null && !REQUIRED)(
       cdp?.close();
       await stopProcess(chrome);
       await stopProcess(next);
+      stopAppIdentities();
       if (profile !== undefined) rmSync(profile, { recursive: true, force: true });
       if (workspace !== undefined) rmSync(workspace, { recursive: true, force: true });
     }
@@ -255,7 +253,7 @@ test.skipIf(chromeResolution.path === null && !REQUIRED)(
 /** A real sign-in, unsealed back into the `Session` a browser would be carrying. */
 async function sessionFor(harness: { webUrl: string }, persona: keyof typeof PEOPLE): Promise<Session> {
   const browser = new Browser();
-  await signInAs(browser, harness, persona, { stopAt: "/api/arcade/start" });
+  await signInAs(browser, harness, persona, { stopAtLanding: true });
   const session = await openSealed<Session>(joinChunks(SESSION_COOKIE, browser.cookies), SESSION_SECRET);
   if (session === null) throw new Error(`signing in as ${persona} left no session`);
   return session;

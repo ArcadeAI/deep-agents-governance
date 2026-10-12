@@ -1,61 +1,43 @@
 /**
- * #123 — what a reset does to a grant a persona is already holding.
+ * #123: what a reset does to a grant a persona is already holding.
  *
- * The decision recorded on #123 is two resets, and this file is the test of
- * that decision rather than of whatever the code happens to do:
+ * The decision recorded on #123 is that **between takes** (`bun run reset`) a
+ * grant a persona already holds **still works afterwards**, so nobody is
+ * signed out and nobody has to authorize again, and the loan book and the
+ * control plane are still put back, so it is a real reset and not a no-op.
  *
- *   - **between takes** (`bun run reset`) a grant a persona already holds
- *     **still works afterwards**, so nobody is signed out and nobody has to
- *     authorize again — and the loan book and the control plane are still put
- *     back, so it is a real reset and not a no-op;
- *   - **`--hard`** invalidates it, **on purpose**, because signing in and
- *     authorizing from clean is the thing that reset exists to make
- *     demonstrable (#174) — and it says so in its own output rather than
- *     leaving it to be discovered at a login page on stage.
+ * With Okta as the identity provider that is structural rather than chosen:
+ * people, sessions and tokens live in Okta, and the reset command holds no
+ * Okta credential. `--hard`, which used to reset the bundled provider and sign
+ * everyone out on purpose (#174), is refused by name, and this file pins that
+ * the refusal leaves the grant alive too.
  *
  * ## What this file does not claim
  *
- * Only the app's identity provider and its loan module are in the loop here
- * (`apps/idp` and `apps/loan-app` until #6 and #5). Whether **Arcade**
- * presents a stale token or raises an authorization card instead is Arcade's
- * decision, it is not measurable without the project credential, and it is not
- * what is being tested: measured live on 2026-09-19, Arcade raises the card
- * and Continue clears it. What these tests pin is our own half — which tokens
- * survive which reset — because that is what `scripts/reset.ts` controls.
+ * Whether **Arcade** presents a stale token or raises an authorization card
+ * instead is Arcade's decision, it is not measurable without the project
+ * credential, and it is not what is being tested. What these tests pin is our
+ * own half: which tokens survive a reset, because that is what
+ * `scripts/reset.ts` controls.
  *
- * ## Why it joins the real IdP to the real loan book
+ * ## A real token
  *
- * `test/reset.test.ts` deliberately does not: it points the loan module at a
- * `/oauth2/userinfo` stand-in, because walking a whole authorize flow to read
- * one loan is `app-test/identity/flow.test.ts`'s job. But a token minted by a
- * stand-in cannot be invalidated when the real IdP is reset, which is the
- * entire subject here. So this file spends the authorize flow once and gets a
- * **real** access token.
- *
- * Every assertion goes through a **write** (`POST /loans/…/approve`). Reads
- * may be answered from `actorFromRequest`'s 60-second memory (#167) and a read
- * that passed after a reset would prove nothing; a write re-introspects at the
- * provider every time, by design, which is exactly the measurement this file
- * needs.
- *
- * ## One app since #6
- *
- * Until #6 these were three services on three ports. The identity provider
- * was the last to fold in, so this boots the real app once (`test/app.ts`):
- * the authorize flow runs at its own `/oauth2/…`, `/login` and `/consent`, the
- * loan module validates the grant at its own `/oauth2/userinfo` over its local
- * listener (`IDENTITY_HOST` unset, the default), and the reset command is
- * handed the one address.
+ * The app signs in through an OIDC stand-in (`test/app.ts`), and the token
+ * here is minted through its whole authorize flow (login form, code, PKCE,
+ * token) under a client of its own, the way Arcade's `app-identity` provider
+ * holds one. Every assertion goes through a **write**
+ * (`POST /loans/…/approve`). Reads may be answered from `actorFromRequest`'s
+ * 60-second memory (#167) and a read that passed after a reset would prove
+ * nothing; a write re-reads userinfo every time, by design.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 // The demo cast as the tests seed it (#33: the app seeds nobody): the
 // fixture's own addresses, the tests' own throwaway password.
-import { DEMO_CAST, seedDemoIdentity, seedDemoSubjects } from "../app-test/demo-cast.ts";
-import { childEnv } from "../app-test/child-env.ts";
+import { DEMO_CAST, seedDemoSubjects } from "../app-test/demo-cast.ts";
+import { Browser } from "../app-test/identity-harness.ts";
+import { pkce } from "../auth/oidc.ts";
 import { spawnChild } from "../app-test/child.ts";
 import { bootApp, type App } from "./app.ts";
 
@@ -63,7 +45,7 @@ const ROOT = join(import.meta.dir, "..");
 const RESET_TOKEN = "reset-grants-token-for-tests";
 const HOOK_SECRET = "reset-grants-hook-secret-for-tests";
 const REDIRECT_URI = "http://127.0.0.1:9/callback";
-const BETTER_AUTH_SECRET = "reset-grants-test-secret-".padEnd(48, "x");
+const CLIENT = { clientId: "0oa-arcade-test", clientSecret: "reset-grants-client-secret", redirectUris: [REDIRECT_URI] };
 const OVER_LIMIT_LOAN = "LN-2291";
 
 const alice = DEMO_CAST.dana;
@@ -71,13 +53,7 @@ const alice = DEMO_CAST.dana;
 let app: App;
 /** The access token Arcade would be holding: minted once, never re-minted. */
 let arcadeToken = "";
-/** The environment the app was booted with, for the credentials script. */
-let appEnv: Record<string, string> = {};
-/** Where the app's `idp.db` is, so the credentials script opens the same one. */
-const data = join(tmpdir(), `cg-grants-${crypto.randomUUID()}`);
 
-/** The three modules, each at its own paths on the one app. */
-const idp = { get baseUrl() { return app.origin; } };
 const hooks = { get baseUrl() { return app.origin; } };
 const loanApp = { get baseUrl() { return `${app.origin}/bank`; } };
 
@@ -101,100 +77,32 @@ async function runResetCommand(args: string[] = []): Promise<{ code: number; out
   return { code, out, err };
 }
 
-/** A cookie jar and manual redirects — `apps/idp/test/flow.test.ts`'s `Browser`. */
-class Browser {
-  private cookies = new Map<string, string>();
-
-  async fetch(url: string, init: RequestInit = {}): Promise<Response> {
-    const headers = new Headers(init.headers);
-    if (this.cookies.size > 0) {
-      headers.set("cookie", [...this.cookies].map(([name, value]) => `${name}=${value}`).join("; "));
-    }
-    const response = await fetch(url, { ...init, headers, redirect: "manual" });
-    for (const cookie of response.headers.getSetCookie()) {
-      const pair = cookie.split(";")[0]!;
-      const eq = pair.indexOf("=");
-      const name = pair.slice(0, eq);
-      const value = pair.slice(eq + 1);
-      if (value === "" || /max-age=0/i.test(cookie)) this.cookies.delete(name);
-      else this.cookies.set(name, value);
-    }
-    return response;
-  }
-
-  submit(url: string, fields: Record<string, string>): Promise<Response> {
-    return this.fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded", accept: "text/html" },
-      body: new URLSearchParams(fields).toString(),
-    });
-  }
-}
-
-/**
- * Alice's hop-2 access token, through the whole flow: authorize → login →
- * consent → code → token. The one thing a stand-in cannot produce.
- */
+/** Alice's hop-2 access token, through the whole flow: authorize, login, code, token. */
 async function authorizeAlice(): Promise<string> {
-  // The client the service made at boot has a hashed secret (#70), so rotate
-  // once to hold one the exchange can use. Arcade's registered client *id* is
-  // unchanged by this, which is the property every reset here asserts.
-  const rotate = Bun.spawnSync(
-    ["bun", join(ROOT, "scripts", "identity", "oauth-client.ts"), "--json", "--rotate"],
-    { env: childEnv({ ...appEnv, APP_PUBLIC_HOST: app.host, NODE_ENV: "test" }) },
+  const { endpoints } = app.identity.standIn;
+  const { verifier, challenge } = await pkce();
+  const authorize = new URL(endpoints.authorize);
+  authorize.search = new URLSearchParams({
+    response_type: "code",
+    client_id: CLIENT.clientId,
+    redirect_uri: REDIRECT_URI,
+    scope: "openid email",
+    state: `state-${crypto.randomUUID()}`,
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+  }).toString();
+  const landed = await new Browser().follow(
+    authorize.toString(),
+    (fields) => ({ ...fields, email: alice.email, password: alice.password }),
+    { stopAt: REDIRECT_URI },
   );
-  expect(rotate.exitCode).toBe(0);
-  const creds = JSON.parse(rotate.stdout.toString()) as { client_id: string; client_secret: string };
-
-  const verifier = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
-  const challenge = Buffer.from(
-    new Bun.CryptoHasher("sha256").update(verifier).digest(),
-  ).toString("base64url");
-
-  const browser = new Browser();
-  const queryOf = (location: string) => new URL(location, idp.baseUrl).search.slice(1);
-
-  let location =
-    (
-      await browser.fetch(
-        `${idp.baseUrl}/oauth2/authorize?` +
-          new URLSearchParams({
-            response_type: "code",
-            client_id: creds.client_id,
-            redirect_uri: REDIRECT_URI,
-            scope: "openid email",
-            state: `state-${crypto.randomUUID()}`,
-            code_challenge: challenge,
-            code_challenge_method: "S256",
-          }),
-      )
-    ).headers.get("location") ?? "";
-
-  if (/\/login(\?|$)/.test(location)) {
-    const login = await browser.submit(`${idp.baseUrl}/login`, {
-      email: alice.email,
-      password: alice.password,
-      oauth_query: queryOf(location),
-    });
-    expect(login.status).toBe(303);
-    location = login.headers.get("location") ?? "";
-  }
-  if (/\/consent\?/.test(location)) {
-    const consent = await browser.submit(`${idp.baseUrl}/consent`, {
-      decision: "allow",
-      oauth_query: queryOf(location),
-    });
-    expect(consent.status).toBe(303);
-    location = consent.headers.get("location") ?? "";
-  }
-
-  const code = new URL(location).searchParams.get("code");
+  const code = new URL(landed.url).searchParams.get("code");
   expect(code).toBeTruthy();
 
-  // HTTP Basic, form-encoded — the shape Arcade sends (#61).
+  // HTTP Basic, form-encoded: the shape Arcade sends (#61).
   const half = (value: string) => new URLSearchParams({ v: value }).toString().slice(2);
-  const basic = `Basic ${Buffer.from(`${half(creds.client_id)}:${half(creds.client_secret)}`).toString("base64")}`;
-  const token = await fetch(`${idp.baseUrl}/oauth2/token`, {
+  const basic = `Basic ${Buffer.from(`${half(CLIENT.clientId)}:${half(CLIENT.clientSecret)}`).toString("base64")}`;
+  const token = await fetch(endpoints.token, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded", authorization: basic },
     body: new URLSearchParams({
@@ -212,7 +120,7 @@ async function authorizeAlice(): Promise<string> {
 
 /**
  * A governed write, made the way the `Loans` toolkit makes it: the persona's
- * bearer and nothing else. A write rather than a read on purpose — see the
+ * bearer and nothing else. A write rather than a read on purpose; see the
  * note at the top of this file.
  */
 function approveAsArcade(): Promise<Response> {
@@ -233,26 +141,17 @@ const loanStatus = async (): Promise<string> =>
   ).status;
 
 beforeAll(async () => {
-  appEnv = {
-    RESET_TOKEN,
-    ARCADE_HOOK_SIGNING_SECRET: HOOK_SECRET,
-    BETTER_AUTH_SECRET,
-    IDP_OAUTH_REDIRECT_URIS: REDIRECT_URI,
-    // The credentials script below opens the same `idp.db` the app does.
-    IDP_DB_PATH: join(data, "idp.db"),
-  };
-  app = await bootApp(appEnv);
-  // Both halves of the demo cast, as `bun run users seed-demo` writes them,
-  // into the files the running app has open.
-  await seedDemoIdentity(appEnv.IDP_DB_PATH!);
+  app = await bootApp({ RESET_TOKEN, ARCADE_HOOK_SIGNING_SECRET: HOOK_SECRET });
+  app.identity.standIn.addClient(CLIENT);
+  // The demo cast's subjects, as `bun run users seed-demo` writes them, into
+  // the file the running app has open. The people are already in the stand-in.
   seedDemoSubjects(app.databases.governance);
 
   arcadeToken = await authorizeAlice();
-}, 120_000);
+}, 240_000);
 
 afterAll(async () => {
   await app?.stop();
-  rmSync(data, { recursive: true, force: true });
 });
 
 describe("a reset between takes leaves every persona's grant alive", () => {
@@ -261,18 +160,16 @@ describe("a reset between takes leaves every persona's grant alive", () => {
     // a failure below means the reset broke it and not that it never worked.
     expect((await approveAsArcade()).status).toBe(200);
 
-    const { code, out, err } = await runResetCommand();
+    const { code, err } = await runResetCommand();
     expect(err).toBe("");
     expect(code).toBe(0);
 
-    // The same token, unchanged, on a write — which always re-resolves at the
-    // provider, so no remembered answer can make this pass.
-    const after = await approveAsArcade();
-    expect(after.status).toBe(200);
+    // The same token, unchanged, on a write, which always re-reads userinfo,
+    // so no remembered answer can make this pass.
+    expect((await approveAsArcade()).status).toBe(200);
   });
 
   test("and it is still a real reset: the loan book and the control plane went back", async () => {
-    // Dirty the book through the grant, then put it back with the soft reset.
     expect((await approveAsArcade()).status).toBe(200);
     expect(await loanStatus()).toBe("approved");
 
@@ -288,38 +185,20 @@ describe("a reset between takes leaves every persona's grant alive", () => {
     expect(health.counts.policy_rules).toBeGreaterThan(0);
   });
 
-  test("it says out loud that it left the IdP alone", async () => {
-    const { out } = await runResetCommand();
-    expect(out).toMatch(/idp\s+SKIPPED/);
-    expect(out).toContain("nobody has to log in or authorize again");
-    expect(out).toContain("--hard");
-    // And no idp line pretending it ran.
-    expect(out).not.toMatch(/\[reset\] idp\s+OK/);
-  });
-
-  test("the people were never touched, so nobody was signed out", async () => {
-    const before = (await (await fetch(`${idp.baseUrl}/identity/health`)).json()) as { people: number };
+  test("the reset never calls the identity provider", async () => {
+    const before = app.identity.standIn.log.length;
     expect((await runResetCommand()).code).toBe(0);
-    const after = (await (await fetch(`${idp.baseUrl}/identity/health`)).json()) as { people: number };
-    expect(after.people).toBe(before.people);
-
-    // The consent is what a re-seed would have deleted, and the grant riding
-    // on it is what would have died. Still there.
-    expect((await approveAsArcade()).status).toBe(200);
-    expect((await runResetCommand()).code).toBe(0);
+    expect(app.identity.standIn.log.slice(before)).toEqual([]);
+    expect(app.identity.standIn.users.size).toBeGreaterThanOrEqual(4);
   });
 });
 
-describe("the panel's Reset button leaves the IdP alone too", () => {
+describe("the panel's Reset button leaves identity alone too", () => {
   test("`demo` mode does not disturb a grant", async () => {
     expect((await approveAsArcade()).status).toBe(200);
-    const before = (await (await fetch(`${idp.baseUrl}/identity/health`)).json()) as { people: number };
 
-    // Exactly the request `lib/governance/control-plane.ts`'s
-    // `runReset` sends for the `demo` mode — one address, one body. Posted
-    // here rather than imported because that module is Next-side code, and
-    // until #3 the root tsconfig had no DOM lib for it; `app-test/control-plane-route.test.ts`
-    // holds the other half, that neither mode has any address but cg-hooks.
+    // Exactly the request `lib/governance/control-plane.ts`'s `runReset` sends
+    // for the `demo` mode: one address, one body.
     const pressed = await fetch(`${hooks.baseUrl}/hooks/admin/reset`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${RESET_TOKEN}` },
@@ -327,80 +206,28 @@ describe("the panel's Reset button leaves the IdP alone too", () => {
     });
     expect(pressed.status).toBe(200);
 
-    // It really did reset the control plane...
     const health = (await (await fetch(`${hooks.baseUrl}/hooks/health`)).json()) as { audit_rows: number };
     expect(health.audit_rows).toBe(0);
-    // ...and left identity entirely alone: same people, same live grant.
-    expect(((await (await fetch(`${idp.baseUrl}/identity/health`)).json()) as { people: number }).people).toBe(
-      before.people,
-    );
     expect((await approveAsArcade()).status).toBe(200);
 
     expect((await runResetCommand()).code).toBe(0);
   });
 });
 
-describe("--hard invalidates it, deliberately, and says so", () => {
-  test("the same token is refused afterwards", async () => {
-    // Alive going in.
+describe("--hard is refused, and the refusal changes nothing", () => {
+  test("nothing runs, and the grant still works", async () => {
     expect((await approveAsArcade()).status).toBe(200);
+    expect(await loanStatus()).toBe("approved");
 
     const { code, out, err } = await runResetCommand(["--hard"]);
-    expect(err).toBe("");
-    expect(code).toBe(0);
-    expect(out).toMatch(/\[reset\] idp\s+OK\s+everyone signed out;.*; people \d+→\d+, OAuth client \S+ unchanged/);
+    expect(code).toBe(78);
+    expect(out).toBe("");
+    expect(err).toContain("Clear User Sessions");
 
-    const refused = await approveAsArcade();
-    expect(refused.status).toBe(401);
-    expect(await refused.json()).toEqual({ error: "The identity provider rejected the token." });
-  });
+    // Refused before anything ran: the book is as it was, and so is the grant.
+    expect(await loanStatus()).toBe("approved");
+    expect((await approveAsArcade()).status).toBe(200);
 
-  test("the IdP's own answer is an OAuth invalid_token, and the loan book drops it", async () => {
-    expect((await runResetCommand(["--hard"])).code).toBe(0);
-
-    // The machine-readable signal exists exactly once, here. Recorded because
-    // #123 turns on where it stops existing.
-    const userinfo = await fetch(`${idp.baseUrl}/oauth2/userinfo`, {
-      headers: { authorization: `Bearer ${arcadeToken}` },
-    });
-    expect(userinfo.status).toBe(401);
-    expect(userinfo.headers.get("www-authenticate")).toContain('error="invalid_token"');
-    expect(await userinfo.json()).toMatchObject({ error: "invalid_token" });
-
-    // And it does not survive the next hop: `apps/loan-app` answers a sentence
-    // with no code, no `WWW-Authenticate` and no status detail, which is why
-    // no re-authorization can be driven from it.
-    const refused = await approveAsArcade();
-    expect(refused.status).toBe(401);
-    expect(refused.headers.get("www-authenticate")).toBeNull();
-    expect(await refused.text()).not.toContain("invalid_token");
-  });
-
-  test("the presenter is told everyone is signed out, and what that costs", async () => {
-    const { out } = await runResetCommand(["--hard"]);
-    expect(out).toContain("Everyone is signed out");
-    expect(out).toContain("authorize, then Continue");
-    // Named as the point of this reset rather than as a malfunction: `--hard`
-    // exists so the auth flow can be shown again (#174).
-    expect(out).toContain("this reset exists to make demonstrable");
-
-    // And it must not send anybody to a dashboard. Live evidence on
-    // 2026-09-19 is that Arcade raises the card by itself and Continue clears
-    // it, so an instruction to go and revoke by hand would describe a failure
-    // that does not happen — the class of lying surface this project has
-    // three of already (#151, #167, #170).
-    expect(out).not.toMatch(/dashboard/i);
-    expect(out).not.toMatch(/revoke/i);
-  });
-
-  test("the OAuth client Arcade is registered against still does not move", async () => {
-    const before = (await (await fetch(`${idp.baseUrl}/identity/health`)).json()) as {
-      oauth: { client_id: string };
-    };
-    expect((await runResetCommand(["--hard"])).code).toBe(0);
-    const after = (await (await fetch(`${idp.baseUrl}/identity/health`)).json()) as {
-      oauth: { client_id: string };
-    };
-    expect(after.oauth.client_id).toBe(before.oauth.client_id);
+    expect((await runResetCommand()).code).toBe(0);
   });
 });

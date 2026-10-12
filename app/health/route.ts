@@ -6,12 +6,15 @@
  * thing a human configures by hand, each fails on its own, and each fails at a
  * point where nothing else on screen would say so.
  *
- * Since #82: `signin`, `gateway` and `verifier` — sign-in, the gateway hop and
- * the custom verifier depend on variables set by hand on the deployment
- * and in the Arcade dashboard, and two of the three fail at a step no hook
- * observes, so an unset one is otherwise discovered mid-rehearsal as "the demo
- * does nothing". They say `configured` or `missing` and never which value is
- * wrong, because the value is a credential in two cases out of three.
+ * Since #82: `signin` and `verifier` — sign-in and the custom verifier depend
+ * on variables set by hand on the deployment and in the Arcade dashboard, and
+ * both fail at a step no hook observes, so an unset one is otherwise
+ * discovered mid-rehearsal as "the demo does nothing". They say `configured`
+ * or `missing` and never which value is wrong, because the value is a
+ * credential. A third, `gateway`, is there only when `ARCADE_GATEWAY_ID` is
+ * set (`setup-arcade --gateway`), always `configured`, and counts for nothing:
+ * the gateway is optional, for an MCP client, and the agent calls the Engine
+ * directly.
  *
  * Since #81: `panel_stream` — `live`, `fixture` or `unconfigured`. The odd one
  * out, because it has three answers rather than two: a panel can be watching
@@ -51,31 +54,21 @@
  * is still at `/bank/health`. `reset` covers `POST /bank/admin/reset` too: the
  * same `RESET_TOKEN` decides it.
  *
- * **Since #6 it is the identity provider's `/health` too**, because Better
- * Auth is part of this app (`auth/provider/`). `identity` is
- * `{ status: "ok", issuer, people }`, or `{ status: "failed", issuer: null,
- * people: null, error }` when the provider did not boot — in production with
- * `BETTER_AUTH_SECRET` unset, say — and a failed provider is `degraded`. It
- * fails closed: every identity route answers 503 and every browser reads as
- * signed out. What `cg-idp`'s `/health` said about its OAuth clients is at
- * `/identity/health`, unchanged; `reset` covers `POST /identity/admin/reset`
- * too.
- *
- * **Since #33 a fresh start has nobody in it.** No persona is seeded on either
- * side, so `identity` is `{ status: "no_users", people: 0, message }` until
- * `bun run users add` or `bun run users seed-demo` adds somebody: degraded,
- * never a crash, and the message names both commands. And `user_drift` holds
- * the two databases against each other (`lib/user-drift.ts`): somebody who can
- * sign in with no subject, or has a subject and cannot sign in, is named by
- * address and makes the response `degraded`. `null` when they agree, or when
- * either module did not boot and its own field already says why.
+ * **Since #6 it reports the identity provider**, which is Okta since the
+ * Better Auth module was removed: the app is an OIDC client of `IDP_ISSUER`.
+ * `identity` is `{ status: "ok", issuer }` when the issuer's discovery
+ * document answers and names it, `{ status: "failed", issuer, error }` when it
+ * does not, and `{ status: "unconfigured", issuer: null }` with no
+ * `IDP_ISSUER`; anything but `ok` is `degraded`. Who can sign in lives in
+ * Okta, which this process has no credential to read, so the comparison of
+ * Okta's people with `governance.db`'s subjects is `bun run users list`'s job,
+ * not this page's.
  */
 import { deploymentReadiness, readIdentitySurface } from "../../lib/config.ts";
 import { bootedControlPlane, controlPlaneFailure } from "../../gate/service/instance.ts";
 import { panelStreamHealth } from "../../lib/governance/stream-url.ts";
-import { identityCapability, identityEmails } from "../../auth/provider/instance.ts";
+import { discover } from "../../auth/discovery.ts";
 import { loanBookHealth } from "../../api/instance.ts";
-import { compareUsers, userDriftWarning } from "../../lib/user-drift.ts";
 
 export const dynamic = "force-dynamic";
 
@@ -87,8 +80,8 @@ export async function GET() {
   const panel_stream = panelStreamHealth(process.env);
   // Read in-process: this process's `loans.db` (#5).
   const loans = loanBookHealth();
-  // Read in-process: this process's `idp.db` and Better Auth (#6).
-  const identity = await identityCapability();
+  // The identity provider's discovery document, cached once it has answered.
+  const identity = await identityHealth();
 
   // The control plane's own report (#4). Read in-process: it is this process's
   // policy cache and this process's `governance.db`.
@@ -101,17 +94,9 @@ export async function GET() {
     warnings,
     ...controlPlane
   } = controlPlaneReport();
-
-  // Who can sign in against who the hooks know (#33). Only when both modules
-  // booted: a failed one is already named, and comparing against an absent
-  // side would call every user drift.
-  const emails = await identityEmails();
-  const subjects = controlPlaneFailure() === null ? bootedControlPlane().plane.subjectIds() : null;
-  const user_drift = emails === null || subjects === null ? null : compareUsers(emails, subjects);
   const allWarnings = [
     ...warnings,
-    ...(identity.status === "no_users" ? [identity.message] : []),
-    ...(user_drift === null ? [] : [userDriftWarning(user_drift)]),
+    ...(identity.status === "failed" ? [`the identity provider did not answer, so nobody can sign in: ${identity.error}`] : []),
   ];
 
   // `status` first, because it is the field anybody actually reads. `ok` only
@@ -126,8 +111,7 @@ export async function GET() {
     panel_stream !== "unconfigured" &&
     controlPlaneStatus === "healthy" &&
     loans.status === "ok" &&
-    identity.status === "ok" &&
-    user_drift === null
+    identity.status === "ok"
       ? "ok"
       : "degraded";
 
@@ -148,11 +132,25 @@ export async function GET() {
     injection_detection,
     loans,
     identity,
-    user_drift,
     reset,
     warnings: allWarnings,
     control_plane: { status: controlPlaneStatus, ...controlPlane },
   });
+}
+
+/** Whether `IDP_ISSUER`'s discovery document answers. Never throws, like everything this endpoint reads. */
+async function identityHealth(): Promise<
+  | { status: "ok"; issuer: string }
+  | { status: "failed"; issuer: string; error: string }
+  | { status: "unconfigured"; issuer: null }
+> {
+  const issuer = (process.env.IDP_ISSUER?.trim() ?? "").replace(/\/+$/, "");
+  if (issuer === "") return { status: "unconfigured", issuer: null };
+  try {
+    return { status: "ok", issuer: (await discover(issuer)).issuer.replace(/\/+$/, "") };
+  } catch (error) {
+    return { status: "failed", issuer, error: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 /**

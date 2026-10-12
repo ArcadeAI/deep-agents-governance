@@ -17,10 +17,10 @@
  *
  * That last part is **followed**, not read off the handlers. `safeNext`
  * returning a path is not the claim; the claim is that a person who opens a
- * link, types a password at `cg-idp`, and comes back can press the button. So
- * this drives the whole chain — `next dev` serves the page, the real
- * `apps/idp` asks for the password, and the same cookie jar arrives back on the
- * approval page with the buttons on it.
+ * link, types a password at the identity provider, and comes back can press
+ * the button. So this drives the whole chain: `next dev` serves the page, the
+ * OIDC stand-in asks for the password as Okta would, and the same cookie jar
+ * arrives back on the approval page with the buttons on it.
  *
  * No browser here on purpose: every hop is a redirect and an HTML form, which
  * the suite's own cookie jar follows, and the thing being proved is a route
@@ -33,7 +33,7 @@ import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { appIdentityEnv } from "./app-identity.ts";
+import { appIdentityEnv, stopAppIdentities } from "./app-identity.ts";
 import { serveOnFreePort, stopProcess } from "./cdp.ts";
 import { spawnChild } from "./child.ts";
 import { Browser, SESSION_SECRET, signInAs } from "./identity-harness.ts";
@@ -41,7 +41,7 @@ import { RILEY, startHarness, type Harness } from "./harness.ts";
 
 const WEB = join(import.meta.dir, "..");
 
-/** The booted app, which is its own identity provider since #6. */
+/** The booted app, and the issuer it signs in through. */
 let identity: { webUrl: string; idpUrl: string };
 let control: Harness;
 const scratch = join(tmpdir(), `cg-approval-signed-out-${crypto.randomUUID()}`);
@@ -51,15 +51,16 @@ let origin: string;
 beforeAll(async () => {
   control = await startHarness();
 
-  // The port is chosen before the app's identity is minted, because its
-  // identity provider has to be told to accept this origin's callback and to
-  // name it as its issuer: Better Auth checks the redirect URI against the
-  // registered list. So both happen inside `serveOnFreePort`, which does them
-  // again on a new port if another process took this one first (#9; CI lost
-  // this race once, on port 44609).
+  // The port is chosen before the app's identity provider starts, because it
+  // has to be told to accept this origin's callback: it checks the redirect
+  // URI against the registered list, as Okta does. So both happen inside
+  // `serveOnFreePort`, which does them again on a new port if another process
+  // took this one first (#9; CI lost this race once, on port 44609).
+  let idpUrl = "";
   const web = await serveOnFreePort(
     async (webPort) => {
-      const appIdentity = await appIdentityEnv(`http://localhost:${webPort}`, join(scratch, String(webPort)));
+      const appIdentity = await appIdentityEnv(`http://localhost:${webPort}`);
+      idpUrl = appIdentity.standIn.issuer;
       return spawnChild({
         // `--bun`: the app runs on Bun since #4, because the control plane it
         // mounts opens governance.db with bun:sqlite (`scripts/next.ts`).
@@ -76,8 +77,8 @@ beforeAll(async () => {
           // loans.db in the repo.
           LOANS_DB_PATH: ":memory:",
           SESSION_SECRET,
-          // The app is its own identity provider since #6: its own throwaway
-          // idp.db, client C minted in it, and APP_PUBLIC_HOST its own origin.
+          // The identity provider is an OIDC stand-in with the demo cast in
+          // it, and APP_PUBLIC_HOST is the app's own origin.
           ...appIdentity.env,
           // The app's server-side reads go to CONTROL_PLANE_HOST (#4), which
           // defaults to the app's own listener; this test's control plane is elsewhere.
@@ -95,12 +96,13 @@ beforeAll(async () => {
   );
   next = web.child;
   origin = `http://localhost:${web.port}`;
-  identity = { webUrl: origin, idpUrl: origin };
+  identity = { webUrl: origin, idpUrl };
 }, 300_000);
 
 afterAll(async () => {
   await stopProcess(next);
   await control?.stop();
+  stopAppIdentities();
   rmSync(scratch, { recursive: true, force: true });
 });
 

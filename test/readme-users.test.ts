@@ -7,7 +7,7 @@
  * policy does not know, a clearance it requires and the line leaves out) reads
  * exactly like one that works until somebody types it. So this reads the
  * commands out of the README, fills in the placeholders, and runs each one
- * against a scratch pair of databases, the way `app-test/users-cli.test.ts`
+ * against a scratch database and a stand-in Okta org, the way `app-test/users-cli.test.ts`
  * runs the command: `--no-env-file` and an allowlisted environment, so nothing
  * from this checkout's `.env` files reaches it.
  *
@@ -21,8 +21,10 @@ import { join } from "node:path";
 
 import { spawnChild } from "../app-test/child.ts";
 import { childEnv } from "../app-test/child-env.ts";
+import { type OidcStandIn, startOidcStandIn } from "../scripts/oidc-stand-in.ts";
 
 const REPO = join(import.meta.dir, "..");
+const TOKEN = `readme-users-${crypto.randomUUID()}`;
 const README = readFileSync(join(REPO, "README.md"), "utf8");
 const DOMAIN_SWAP = readFileSync(join(REPO, "docs", "DOMAIN-SWAP.md"), "utf8");
 /** The FAQ moved out of the README into its own page, one H2 per question (#58). */
@@ -36,8 +38,8 @@ const ACCOUNTS_LINK = `[\`${ACCOUNTS_PAGE}\`](./${ACCOUNTS_PAGE})`;
 const ACCOUNTS_LINK_FROM_DOCS = "[`app-users-and-arcade-accounts.md`](./app-users-and-arcade-accounts.md)";
 const SLACK_PAGE = "https://docs.arcade.dev/en/references/auth-providers/slack";
 
-const ADD_STEP = "7. **Add yourself and an approver**";
-const ASK_STEP = "8. **Run the agent and ask it**";
+const ADD_STEP = "6. **Add yourself and an approver**";
+const ASK_STEP = "7. **Run the agent and ask it**";
 
 const scratch = mkdtempSync(join(tmpdir(), "cg-readme-users-"));
 afterAll(() => rmSync(scratch, { recursive: true, force: true }));
@@ -74,13 +76,13 @@ function flag(argv: string[], name: string): string | undefined {
   return at === -1 ? undefined : argv[at + 1];
 }
 
-/** Whether the loan officer is refused the $95K and the approver may grant it: act 2, as step 7 sets it up. */
+/** Whether the loan officer is refused the $95K and the approver may grant it: act 2, as step 6 sets it up. */
 function coversTheAct(commands: string[][]): boolean {
   const [officer, approver] = commands.map((argv) => Number(flag(argv, "clearance")));
   return officer! < 95_000 && approver! >= 95_000;
 }
 
-/** The README with step 7 moved after step 8, the order in which nobody can sign in. */
+/** The README with step 6 moved after step 7, the order in which nobody can sign in. */
 function addStepAfterAsk(markdown: string): string {
   const start = markdown.indexOf(ADD_STEP);
   const ask = markdown.indexOf(ASK_STEP);
@@ -94,10 +96,10 @@ interface Run {
   stderr: string;
 }
 
-async function users(dir: string, args: string[]): Promise<Run> {
+async function users(dir: string, okta: OidcStandIn, args: string[]): Promise<Run> {
   const child = spawnChild(["bun", "--no-env-file", "scripts/users.ts", ...args], {
     cwd: REPO,
-    env: childEnv({ IDP_DB_PATH: join(dir, "idp.db"), GOVERNANCE_DB_PATH: join(dir, "governance.db") }),
+    env: childEnv({ GOVERNANCE_DB_PATH: join(dir, "governance.db"), OKTA_ORG_URL: okta.url, OKTA_API_TOKEN: TOKEN }),
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -109,16 +111,21 @@ async function users(dir: string, args: string[]): Promise<Run> {
   return { code, stdout, stderr };
 }
 
-/** Runs every command against one fresh pair of databases; the failures, by command. */
+/** Runs every command against a fresh database and an empty stand-in Okta org; the failures, by command. */
 async function runAll(commands: string[][]): Promise<{ failures: string[]; list: string }> {
   const dir = mkdtempSync(join(scratch, "case-"));
-  const failures: string[] = [];
-  for (const [i, argv] of commands.entries()) {
-    const run = await users(dir, filled(argv, i));
-    if (run.code !== 0) failures.push(`users ${argv.join(" ")} exited ${run.code}: ${run.stderr.trim()}`);
+  const okta = await startOidcStandIn({ managementToken: TOKEN });
+  try {
+    const failures: string[] = [];
+    for (const [i, argv] of commands.entries()) {
+      const run = await users(dir, okta, filled(argv, i));
+      if (run.code !== 0) failures.push(`users ${argv.join(" ")} exited ${run.code}: ${run.stderr.trim()}`);
+    }
+    const list = await users(dir, okta, ["list"]);
+    return { failures, list: list.stdout };
+  } finally {
+    okta.stop();
   }
-  const list = await users(dir, ["list"]);
-  return { failures, list: list.stdout };
 }
 
 describe("the README's users commands", () => {
@@ -126,7 +133,7 @@ describe("the README's users commands", () => {
   const quickstartAdds = addCommands(step);
   const tryItOutAdds = addCommands(section(README, "Try it out"));
 
-  test("step 7 adds a loan officer and a VP, right before the app is opened", () => {
+  test("step 6 adds a loan officer and a VP, right before the app is opened", () => {
     expect(step).not.toBe("");
     expect(quickstartAdds.map((argv) => flag(argv, "role"))).toEqual(["loan_officer", "vp_credit"]);
     const quickstart = section(README, "Quickstart 🚀");
@@ -137,7 +144,7 @@ describe("the README's users commands", () => {
     expect(coversTheAct(quickstartAdds)).toBe(true);
   });
 
-  test("step 7 says the approver's email is their Slack one, answers who needs an Arcade account, and offers seed-demo", () => {
+  test("step 6 says the approver's email is their Slack one, answers who needs an Arcade account, and offers seed-demo", () => {
     expect(step).toContain("Use the email the approver's Slack account uses");
     expect(step).toContain(
       "   - Do your app's users need Arcade accounts? With Arcade's built-in Slack app, yes: invite each loan officer to your Arcade project's Members. " +
@@ -207,7 +214,7 @@ describe("the page on who needs an Arcade account", () => {
     expect(accountsPageGaps(readFileSync(path, "utf8"))).toEqual([]);
   });
 
-  test("the README points at it from Prerequisites, step 7 and Further reading, and the FAQ from its answer", () => {
+  test("the README points at it from Prerequisites, step 6 and Further reading, and the FAQ from its answer", () => {
     for (const title of ["Prerequisites", "Quickstart 🚀", "Further reading"]) expect(section(README, title)).toContain(ACCOUNTS_LINK);
     expect(accountsAnswer(FAQ)).toContain(ACCOUNTS_LINK_FROM_DOCS);
   });

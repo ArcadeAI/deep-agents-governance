@@ -63,7 +63,7 @@ export function notConfigured(what: string, problems: string[], headers = new He
     `${what} is not configured`,
     `<p>This deployment cannot do that yet:</p><ul>` +
       problems.map((problem) => `<li>${escapeHtml(problem)}</li>`).join("") +
-      `</ul><p><code>GET /health</code> reports which of <code>signin</code>, <code>gateway</code> and ` +
+      `</ul><p><code>GET /health</code> reports which of <code>signin</code> and ` +
       `<code>verifier</code> this deployment has. <code>.env.example</code> says which values you fill in, and <code>bun run setup-arcade &lt;host&gt;</code> fills in the rest.</p>`,
     503,
     headers,

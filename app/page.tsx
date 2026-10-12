@@ -16,36 +16,39 @@
  *
  * A **server** component, and it does two things a client one could not:
  *
- * 1. It unseals the session here, so the gateway tokens in the cookie never
- *    reach the browser. `SessionChrome` is rendered on this side of the
+ * 1. It unseals the session here, so the tokens in the cookie never reach the
+ *    browser. `SessionChrome` is rendered on this side of the
  *    boundary and handed down as an element, so only what it prints crosses.
  *    Since #176 that element is the session controls in the bank's top chrome
- *    — the gateway token's expiry, and `Sign out` or `Sign in` — rather than a
+ *    — `Sign out` or `Sign in` — rather than a
  *    card of four "Sign in as …" persona buttons below the loan files. One
  *    Chrome profile per persona is the real demo shape, so a switcher read as
  *    the most demo-looking thing on a screen arguing that nothing here is a
  *    mock.
- * 2. It reads the loan book, not from the gateway: `readLoanBook` calls the
+ * 2. It reads the loan book, not through Arcade: `readLoanBook` calls the
  *    loan module in-process with this browser's IdP bearer, so the first paint
  *    is already correct and the cards poll `GET /api/loans` from then on.
- *    `lib/loan-context/loans.ts` has the argument. Loading `/` makes no gateway
+ *    `lib/loan-context/loans.ts` has the argument. Loading `/` makes no Arcade
  *    call and no governed tool call: every MCP call in the demo starts in the
  *    agent, which is what keeps the panel legible.
  *
  * The assistant is not on this page. It is the Deep Agent in `agent/`, on
  * Managed Deep Agents; the bank pane says where to open it, and links there
- * when `AGENT_URL` names a deployment.
+ * when `AGENT_URL` names a deployment. With `ARCADE_GATEWAY_ID` set
+ * (`setup-arcade --gateway`), the same column says how to connect an MCP
+ * client to the gateway: the one optional surface, and the agent ignores it.
  */
 import type { CSSProperties } from "react";
 import { cookies, headers } from "next/headers";
 
-import { configurationProblems, readIdentitySurface } from "../lib/config.ts";
+import { configurationProblems, gatewayUrl, readIdentitySurface } from "../lib/config.ts";
 import { originMismatch } from "../lib/origin.ts";
 import { readSessionFromCookies } from "../auth/session.ts";
 import { readLoanBook } from "../lib/loan-context/read.ts";
 import { ConfigurationBanner } from "../components/identity/ConfigurationBanner.tsx";
 import { OriginBanner } from "../components/identity/OriginBanner.tsx";
 import { SessionChrome } from "../components/identity/SessionChrome.tsx";
+import { McpClientPanel } from "../components/identity/McpClientPanel.tsx";
 import { BankPane } from "../components/bank/BankPane.tsx";
 
 /**
@@ -90,6 +93,7 @@ export default async function Home() {
 
   const problems = configurationProblems(config);
   const mismatch = originMismatch(await headers());
+  const mcpUrl = gatewayUrl(config);
 
   return (
     <>
@@ -110,6 +114,7 @@ export default async function Home() {
         identity={<SessionChrome session={session} problems={problems} />}
         loans={loans}
         agentUrl={process.env.AGENT_URL?.trim() || null}
+        mcpClient={mcpUrl === null ? null : <McpClientPanel url={mcpUrl} />}
       />
       <a href="/panel" style={PANEL_LINK}>
         Control plane ↗

@@ -12,9 +12,9 @@ that basis; the wording is the asset.
 
 ## Identity, not authority
 
-Every tool requires OAuth against our own identity provider, the app's identity
-module (`auth/provider/`, `apps/idp` until #6), registered in Arcade under
-the provider id `app-identity` (`IDP_PROVIDER_ID`; `cg-idp` until #6). The id is
+Every tool requires OAuth against the loan desk's identity provider, Okta
+(`IDP_ISSUER`, the bundled provider until the Okta move), registered in Arcade
+under the provider id `app-identity` (`IDP_PROVIDER_ID`; `cg-idp` until #6). The id is
 fixed: `OAuth2(id=...)` is read at import, so register the provider under
 exactly this string. The tool forwards the
 user's token to the API as a bearer token and the API derives the actor from it.

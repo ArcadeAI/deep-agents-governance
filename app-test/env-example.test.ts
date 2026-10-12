@@ -17,8 +17,6 @@ import { expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { readConfig } from "../auth/provider/config.ts";
-
 const ROOT = join(import.meta.dir, "..");
 const example = readFileSync(join(ROOT, ".env.example"), "utf8");
 
@@ -63,6 +61,7 @@ const code = files.flatMap((file) =>
  */
 const SET_ELSEWHERE: Record<string, string> = {
   NODE_ENV: "set by Next and by the Dockerfile",
+  OKTA_API_TOKEN: "the Okta management token: from the shell only, through `op run`, never a line in .env",
   NEXT_RUNTIME: "set by Next",
   CG_NEXT_DIST_DIR: "set by test harnesses, to run a second `next dev`",
   CG_SHARD_RECORD: "set by CI's test shard runner (scripts/test-shards.ts), for its bun test preload",
@@ -70,38 +69,27 @@ const SET_ELSEWHERE: Record<string, string> = {
   ARCADE_WORK_DIR: "the Arcade CLI's own, naming its config directory; setup-arcade reads the CLI's context where the CLI does",
   ARCADE_CONTEXT: "the Arcade CLI's own, choosing a saved context; setup-arcade honours it as the CLI does",
   HOME: "the shell's, where the Arcade CLI keeps ~/.arcade",
-  CG_SETUP_ARCADE_TTY: "set by setup-arcade's test harness, standing in for a terminal on stdin so the run may pause (#52); read from the shell, never .env",
-  CG_SETUP_ARCADE_ISSUER_URL: "set by setup-arcade's test harness, standing in for the tunnel the run checks the issuer through (#52); read from the shell, never .env",
 };
-
-/** Dynamic names: `IDP_OAUTH_REDIRECT_URIS_<KEY>` for each client key. */
-const DYNAMIC = /^IDP_OAUTH_REDIRECT_URIS_[A-Z_]+$/;
 
 test("every variable .env.example names is read by the code that ships", () => {
   expect(named.length).toBeGreaterThan(20);
   const unread: string[] = [];
   for (const key of named) {
-    if (DYNAMIC.test(key)) continue;
     const hit = code.find(({ line }) => new RegExp(`\\b${key}\\b`).test(line));
     if (hit === undefined) unread.push(key);
   }
   expect(unread).toEqual([]);
 });
 
-test("each IDP_OAUTH_REDIRECT_URIS_<KEY> in .env.example reaches its client", () => {
-  const dynamic = named.filter((key) => DYNAMIC.test(key));
-  expect(dynamic.sort()).toEqual([
-    "IDP_OAUTH_REDIRECT_URIS_ARCADE",
-    "IDP_OAUTH_REDIRECT_URIS_ARCADE_USER_SOURCE",
-    "IDP_OAUTH_REDIRECT_URIS_WEB",
-  ]);
-  const env: Record<string, string> = { IDP_OAUTH_CLIENTS: "arcade,arcade-user-source,web" };
-  for (const key of dynamic) env[key] = `https://${key.toLowerCase()}.example/callback`;
-  const { clients } = readConfig(env);
-  for (const key of dynamic) {
-    const client = clients.find((each) => `IDP_OAUTH_REDIRECT_URIS_${each.key.toUpperCase().replace(/-/g, "_")}` === key);
-    expect(client?.redirectUris, key).toEqual([env[key]!]);
-  }
+// The Okta management token is never a line in the file: it reaches the two
+// commands that need it through `op run`, and nothing writes it to disk.
+test("OKTA_API_TOKEN is named only in a comment, never as a variable", () => {
+  expect(named).not.toContain("OKTA_API_TOKEN");
+  expect(example).toContain("OKTA_API_TOKEN=\"op://");
+});
+
+test("nothing from the bundled identity provider is left in it", () => {
+  expect(example).not.toMatch(/BETTER_AUTH|IDP_OAUTH|IDP_DB_PATH|IDENTITY_HOST|idp\.db/);
 });
 
 test("every variable the code reads is in .env.example or is set by something else", () => {
@@ -117,7 +105,7 @@ test("every variable the code reads is in .env.example or is set by something el
     for (const pattern of patterns) for (const [, key] of line.matchAll(pattern)) if (!reads.has(key!)) reads.set(key!, at);
   }
   // The sweep has to have found the variables it exists for, or it proves nothing.
-  for (const key of ["ARCADE_API_KEY", "APP_PUBLIC_HOST", "SESSION_SECRET", "IDP_OAUTH_CLIENTS", "RESET_TOKEN"]) {
+  for (const key of ["ARCADE_API_KEY", "APP_PUBLIC_HOST", "SESSION_SECRET", "IDP_ISSUER", "RESET_TOKEN"]) {
     expect(reads.has(key), `the sweep found no read of ${key}`).toBe(true);
   }
   const missing = [...reads].filter(([key]) => !named.includes(key) && !(key in SET_ELSEWHERE)).map(([key, at]) => `${key} (${at})`);

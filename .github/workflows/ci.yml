@@ -27,9 +27,8 @@ jobs:
       - name: Install
         run: bun install --frozen-lockfile
 
-      # One install covers every workspace. The identity provider is part of
-      # the app since #6 (auth/provider), so the root install and the
-      # root typecheck reach it; it has no install or typecheck of its own.
+      # One install covers every workspace. The identity provider is Okta,
+      # outside the repo, so there is nothing of it to install or typecheck.
       - name: Typecheck
         run: bun run typecheck
 
@@ -38,11 +37,6 @@ jobs:
       # names the cause and the fix instead of failing as an opaque string diff.
       - name: Hook contract is regenerated from the vendored spec
         run: bun run --cwd gate/schema generate:check
-
-      # idp.db's schema is generated from the installed Better Auth. A stale
-      # file fails `bun test` too, but this names the fix.
-      - name: idp schema is regenerated from the installed Better Auth
-        run: bun run generate:identity-schema:check
 
       # `bun test` and `tsc` never exercise the app's build, and a Next.js
       # build is where most of this service's failures show up. The app is the
@@ -221,22 +215,16 @@ jobs:
           # image that governs nothing. Throwaway here; a deployment sets its
           # own, and neither is ever committed.
           #
-          # Since #6 it is the identity provider too, which refuses to boot
-          # under NODE_ENV=production without a BETTER_AUTH_SECRET, on purpose:
-          # the secret encrypts the ID-token signing key at rest, and a boot
-          # that silently fell back to a known key would be worse than no boot.
-          # The app stays up and reports `identity: failed`, so the step checks
-          # that the identity provider booted as well as the policy. Since #33
-          # a fresh image seeds nobody, so a provider that booted says
-          # `no_users` (never `failed`), and that is what is expected here.
+          # The identity provider is Okta, outside the image, and the smoke
+          # run sets no IDP_ISSUER and calls no network, so `/health` reports
+          # `identity: unconfigured`, and that is what is expected here.
           - service: web
             dockerfile: ./Dockerfile
             smoke_env: >-
               -e ARCADE_HOOK_SIGNING_SECRET=ci-smoke-only-not-a-real-secret
               -e APPROVALS_STORE_TOKEN=ci-smoke-only-not-a-real-token
-              -e BETTER_AUTH_SECRET=ci-smoke-only-not-a-real-secret-0000
             smoke_expect: '"policy":{"status":"ready"'
-            smoke_expect_also: '"identity":{"status":"no_users"'
+            smoke_expect_also: '"identity":{"status":"unconfigured"'
 
     steps:
       - uses: actions/checkout@v4

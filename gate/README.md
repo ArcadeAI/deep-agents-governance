@@ -6,7 +6,7 @@ One command starts it:
 
 That prints every rule the service will enforce, then starts the app, which the
 service is a module of (`gate/service/`, mounted at `/hooks/access`, `/hooks/pre` and
-`/hooks/post`). Arcade calls those three URLs on every tool call through the gateway,
+`/hooks/post`). Arcade calls those three URLs on every tool call in the project,
 and what they answer is decided here, by code in this repo, against rows in a SQLite
 file on your disk. There is no hosted policy store and nothing to sign up for.
 

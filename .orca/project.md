@@ -45,7 +45,7 @@ Desktop on this machine.**
 ## Environment facts that will bite you otherwise
 
 - **One `bun install` at the root.** Every workspace is on zod 4.6.5 (one pinned version).
-  If you see `Cannot find module 'better-auth'`, the install did not run.
+  If you see `Cannot find module 'next'`, the install did not run.
 
 - **The app runs on Bun, and TypeScript stays on `^6`.** The databases use
   `bun:sqlite`, which Node cannot load, so `next dev`, `next build` and the
@@ -116,8 +116,8 @@ Desktop on this machine.**
 
 - **The app never calls itself through the public host.** The app's own
   server-side readers of the control plane use `CONTROL_PLANE_HOST` (default
-  `localhost:$PORT`), and after #6 identity readers use `IDENTITY_HOST` the same
-  way. The public host (`APP_PUBLIC_HOST` after #6) is the ngrok tunnel, for
+  `localhost:$PORT`). The identity provider is Okta, at `IDP_ISSUER`, since
+  2026-10-09. The public host (`APP_PUBLIC_HOST` after #6) is the ngrok tunnel, for
   Arcade only. A test fails if a server-side reader targets it.
 
 - **Ports.** Your worktree owns ten, claimed by `scripts/orca-setup.sh` from
@@ -189,8 +189,8 @@ Gate through the human regardless of slice:
   included), provision, log in, authenticate, use or create credentials, or
   alter Arcade, Render, Slack, Google, ngrok or OAuth configuration. The one narrow
   exception, and only with the driver's say-so: a freshly random,
-  environment-only, never-committed `BETTER_AUTH_SECRET`/`SESSION_SECRET` to
-  boot a **local** throwaway identity instance, killed afterwards with `pgrep` proof.
+  environment-only, never-committed `SESSION_SECRET` to
+  boot a **local** throwaway app instance, killed afterwards with `pgrep` proof.
 - **Never point anything at the stage demo** (`cg-idp-or5b`, `cg-web-sa31`, `cg-loan-app`,
   `cg-hooks` on `onrender.com`) **or its Arcade project.** They are live and belong to the
   other repo. This repo gets its own.
@@ -199,7 +199,8 @@ Gate through the human regardless of slice:
 - **Anything a new user or forker sees first:** the README quickstart, the
   rehearsal runbook, shipped defaults and config templates.
 - **Anything touching identity, authorization or the access model** — the two
-  hops, the User Source gateway hop, the verifier tool hop.
+  hops: the agent's direct Engine call as the signed-in email (no gateway, no User
+  Source), and the verifier tool hop.
 - **The only Python in this project is `tools/`.** A slice once turned the loan
   tools into Python against an explicit constraint and no gate caught it.
 - `docs/PRESENTATION-BRIEF.md` is untracked and excluded on purpose because it
@@ -208,7 +209,10 @@ Gate through the human regardless of slice:
 - The personas are **Alice, Bob, Charlie and Michael at `@megaforce.tech`**.
   `dana`/`sam`/`riley`/`morgan` are internal keys only, and `@bank.example` is
   the local fixture — it must never reach anything audience-facing.
-- **Never Arcade Headers mode**, for any gateway, as an option, fallback or aside.
+- **No gateway.** The agent calls the Engine directly with the project key and the
+  signed-in email as `user_id`. Tool Rec is unscoped, so it may suggest unrelated
+  catalog tools; the hooks govern every call. Never Arcade Headers mode either, as
+  an option, fallback or aside.
 - **The README follows Mastra's exact outline** (see
   `.orca/local/human/mastra-contributing-guide.md`) and is rewritten in its own slice.
   Don't edit it piecemeal.
@@ -219,8 +223,7 @@ Gate through the human regardless of slice:
   the Next.js app, running on Bun: the chat, the control-plane panel, the
   approval pages. Its old service README is `docs/app.md`.
 - `src/mastra/index.ts` — the Studio entry, registering the chat route's own
-  agent. Every gateway bearer comes from `gatewayToken()`
-  (`lib/agent/gateway-token.ts`).
+  agent. (Historical: it no longer exists here, and neither does a gateway bearer.)
 - `gate/service/` — the control plane, served under `/hooks/*`
   (`/hooks/pre`, `/hooks/post`, `/hooks/access`, `/hooks/health` in Arcade's
   enum, the audit log, the event stream). The approvals store is
@@ -228,8 +231,8 @@ Gate through the human regardless of slice:
   fixture.
 - `api/` — the bank, served under `/bank/*`, read in-process by the
   `/loans` board. Knows nothing about governance, and a test enforces that.
-- `apps/idp` — the IdP (Better Auth), a workspace member until #6 folds it into
-  `auth/`. The Loan toolkit's provider id is `app-identity`.
+- `auth/` — sign-in as an OIDC client of Okta (`IDP_ISSUER`); the IdP is Okta
+  since 2026-10-09. The Loan toolkit's provider id is `app-identity`.
 - `gate/engine`, `gate/schema` — policy types and
   evaluation shared by the hooks.
 - `mcp/loan_desk/loans.py`, `mcp/loan_desk/approvals.py` — the Arcade toolkits, Python, `uv`.

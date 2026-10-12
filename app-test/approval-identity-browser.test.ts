@@ -6,9 +6,10 @@
  * > link herself and approves the loan.** It succeeds.
  *
  * Every word of that is driven here and nothing is stood in for except Arcade's
- * transport. `apps/idp` is a real subprocess and Alice's session is the one a
- * real authorization-code flow left behind after a real password was typed into
- * a real login form. `apps/hooks` is a real subprocess answering `/pre` from the
+ * transport and the identity provider, which is the OIDC stand-in Okta's
+ * protocol is measured against. Alice's session is the one a real
+ * authorization-code flow left behind after a password was typed into its
+ * login form. `apps/hooks` is a real subprocess answering `/pre` from the
  * real policy. `next dev` serves the actual page. Headless Chrome opens the
  * link and **presses the button**, which is the part a render test cannot do:
  * the defect was never in what the page displayed, it was in the `user_id` the
@@ -45,7 +46,7 @@ import { browserTarget, Cdp, evaluate, serveOnFreePort, startChrome, stopProcess
 import { spawnChild } from "./child.ts";
 import { chunk, chunkName, joinChunks, openSealed, seal } from "../auth/seal.ts";
 import { SESSION_COOKIE, type Session } from "../auth/session.ts";
-import { appIdentityEnv } from "./app-identity.ts";
+import { appIdentityEnv, stopAppIdentities } from "./app-identity.ts";
 import { Browser, PEOPLE, SESSION_SECRET, signInAs, type PersonaKey } from "./identity-harness.ts";
 import { DANA, HOOK_SECRET, RILEY, startHarness, type Harness } from "./harness.ts";
 
@@ -70,15 +71,15 @@ test.skipIf(chromeResolution.path === null && !REQUIRED)(
 
     try {
       // The real control plane with a stand-in Arcade that works by *calling
-      // the real pre-hook*, and the app as its own real identity provider (#6).
+      // the real pre-hook*, and the app signing in through an OIDC stand-in.
       control = await startHarness();
       const harness = control;
 
       // Each child gets its port inside `serveOnFreePort` / `startChrome`, which
       // start it again on a new one if another process took it first (#9). The
-      // app's identity is minted per attempt: its issuer is the app's origin.
+      // app's identity provider is started per attempt, to allow its callback.
       const web = await serveOnFreePort(async (webPort) => {
-        const appIdentity = await appIdentityEnv(`http://127.0.0.1:${webPort}`, join(scratch, String(webPort)));
+        const appIdentity = await appIdentityEnv(`http://127.0.0.1:${webPort}`);
         return spawnChild({
           // `--bun`: the app runs on Bun since #4, because the control plane it
           // mounts opens governance.db with bun:sqlite (`scripts/next.ts`).
@@ -98,8 +99,8 @@ test.skipIf(chromeResolution.path === null && !REQUIRED)(
             // is indistinguishable from "not signed in", which is exactly the
             // state this test is trying to tell apart from a real identity.
             SESSION_SECRET,
-            // The app is its own identity provider since #6: its own throwaway
-            // idp.db, client C minted in it, and APP_PUBLIC_HOST its own origin.
+            // The identity provider is an OIDC stand-in with the demo cast in
+            // it, and APP_PUBLIC_HOST is the app's own origin.
             ...appIdentity.env,
             // The app's server-side reads go to CONTROL_PLANE_HOST (#4), which
             // defaults to the app's own listener; this test's control plane is elsewhere.
@@ -258,6 +259,7 @@ test.skipIf(chromeResolution.path === null && !REQUIRED)(
       await stopProcess(chrome);
       await stopProcess(next);
       await control?.stop();
+      stopAppIdentities();
       rmSync(scratch, { recursive: true, force: true });
       if (profile !== undefined) rmSync(profile, { recursive: true, force: true });
     }
@@ -271,11 +273,11 @@ test.skipIf(chromeResolution.path === null && !REQUIRED)(
 
 /**
  * A real sign-in, unsealed back into the `Session` a browser would be carrying.
- * Against the booted app itself since #6: it is its own identity provider.
+ * Against the booted app itself, which signs in through its OIDC stand-in.
  */
 async function sessionFor(harness: { webUrl: string }, persona: PersonaKey): Promise<Session> {
   const browser = new Browser();
-  await signInAs(browser, harness, persona, { stopAt: "/api/arcade/start" });
+  await signInAs(browser, harness, persona, { stopAtLanding: true });
   const session = await openSealed<Session>(joinChunks(SESSION_COOKIE, browser.cookies), SESSION_SECRET);
   if (session === null) throw new Error(`signing in as ${persona} left no session`);
   return session;
@@ -284,8 +286,8 @@ async function sessionFor(harness: { webUrl: string }, persona: PersonaKey): Pro
 /**
  * Put this session in the browser, and only this session.
  *
- * Cleared first: one persona per browser is the design (`DESIGN.md` → Gateway
- * token storage), and a leftover chunk from a longer session would join onto a
+ * Cleared first: one persona per browser is the design (`DESIGN.md` → Session
+ * storage), and a leftover chunk from a longer session would join onto a
  * shorter new one and refuse to open — which reads as "not signed in" and would
  * quietly turn the second half of this test into a repeat of the first.
  */

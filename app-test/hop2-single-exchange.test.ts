@@ -97,7 +97,7 @@ function visitedPaths(browser: Browser): string[] {
 describe("the browser ends on this app's Authorized page", () => {
   test("with a session: one hit on next_uri, and the page is cg-web's own", async () => {
     const browser = new Browser();
-    await signInAs(browser, harness, "dana", { stopAt: "/api/arcade/start" });
+    await signInAs(browser, harness, "dana", { stopAtLanding: true });
 
     const flowId = `flow-${crypto.randomUUID()}`;
     const verified = await browser.fetch(`${harness.webUrl}/api/arcade/verify?flow_id=${flowId}`);
@@ -121,7 +121,7 @@ describe("the browser ends on this app's Authorized page", () => {
 
   test("Arcade did offer a continuation, and the browser was not given it", async () => {
     const browser = new Browser();
-    await signInAs(browser, harness, "sam", { stopAt: "/api/arcade/start" });
+    await signInAs(browser, harness, "sam", { stopAtLanding: true });
 
     const flowId = `flow-${crypto.randomUUID()}`;
     const verified = await browser.fetch(`${harness.webUrl}/api/arcade/verify?flow_id=${flowId}`);
@@ -141,7 +141,7 @@ describe("the browser ends on this app's Authorized page", () => {
 
   test("and walking the chain to its end still leaves exactly one hit", async () => {
     const browser = new Browser();
-    await signInAs(browser, harness, "dana", { stopAt: "/api/arcade/start" });
+    await signInAs(browser, harness, "dana", { stopAtLanding: true });
 
     const flowId = `flow-${crypto.randomUUID()}`;
     // The browser does what a browser does: follows every redirect until a page
@@ -198,7 +198,7 @@ describe("the browser ends on this app's Authorized page", () => {
 
   test("a second hit on next_uri would revoke the grant — so the count is load-bearing", async () => {
     const browser = new Browser();
-    await signInAs(browser, harness, "sam", { stopAt: "/api/arcade/start" });
+    await signInAs(browser, harness, "sam", { stopAtLanding: true });
 
     const flowId = `flow-${crypto.randomUUID()}`;
     await browser.fetch(`${harness.webUrl}/api/arcade/verify?flow_id=${flowId}`);
@@ -218,7 +218,7 @@ describe("the browser ends on this app's Authorized page", () => {
   test("a next_uri that ends the chain lands on the same page, not on a blank 200", async () => {
     harness.arcade.nextUriAnswer = "terminal";
     const browser = new Browser();
-    await signInAs(browser, harness, "riley", { stopAt: "/api/arcade/start" });
+    await signInAs(browser, harness, "riley", { stopAtLanding: true });
 
     const flowId = `flow-${crypto.randomUUID()}`;
     const verified = await browser.fetch(`${harness.webUrl}/api/arcade/verify?flow_id=${flowId}`);
@@ -237,7 +237,7 @@ describe("the browser ends on this app's Authorized page", () => {
 describe("the verifier says what next_uri answered", () => {
   test("the status and the continuation are logged, and no value on it is", async () => {
     const browser = new Browser();
-    await signInAs(browser, harness, "dana", { stopAt: "/api/arcade/start" });
+    await signInAs(browser, harness, "dana", { stopAtLanding: true });
 
     const flowId = `flow-${crypto.randomUUID()}`;
     const { lines } = await captureInfo(() =>
@@ -263,7 +263,7 @@ describe("the verifier says what next_uri answered", () => {
   test("a next_uri that ends the chain is logged as such rather than silently", async () => {
     harness.arcade.nextUriAnswer = "terminal";
     const browser = new Browser();
-    await signInAs(browser, harness, "sam", { stopAt: "/api/arcade/start" });
+    await signInAs(browser, harness, "sam", { stopAtLanding: true });
 
     const flowId = `flow-${crypto.randomUUID()}`;
     const { lines } = await captureInfo(() =>

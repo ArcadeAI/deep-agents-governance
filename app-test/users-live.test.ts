@@ -1,40 +1,40 @@
 /**
  * `bun run users` against the real app on a local port (#31, criterion 7):
- * the app under `next dev`, with its own databases, and the command writing
- * those same files while it runs.
+ * the app under `next dev`, with its own `governance.db`, signing in through
+ * the OIDC stand-in in place of Okta, and the command writing that database
+ * and the stand-in's Management API while it runs.
  *
- *   1. a user `users add` created signs in with the password it printed;
+ *   1. a user `users add` created signs in at the identity provider with the
+ *      password it printed;
  *   2. `/hooks/pre` holds them to the clearance they were given;
  *   3. `set-clearance` takes effect with no restart, within a policy poll;
- *   4. `remove` revokes their session and their sign-in, and `/hooks/pre`
- *      then denies them as an identity nobody registered;
+ *   4. `remove` deletes them in the org, which ends their session there and
+ *      their sign-in, and `/hooks/pre` then denies them as an identity nobody
+ *      registered;
  *   5. an address never added is denied the same way;
- *   6. there is still no open sign-up.
+ *   6. the app has no sign-up of its own: people exist because Okta has them.
  *
- * No Arcade: every request is the one Arcade or a browser would make.
+ * No Arcade and no Okta: every request is the one Arcade, Okta or a browser
+ * would make.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { bootApp, type App } from "../test/app.ts";
 import { childEnv } from "./child-env.ts";
 import { spawnChild } from "./child.ts";
+import { TEST_OKTA_TOKEN } from "./demo-cast.ts";
 
 const ROOT = join(import.meta.dir, "..");
 const HOOK_SECRET = `users-live-${crypto.randomUUID()}`;
-const REDIRECT_URI = "http://127.0.0.1:9/callback";
 const POLICY_POLL_MS = 250;
-const EMAIL = "Rowan.Test@Example.com";
+const EMAIL = "Rowan.Quill@Example.com";
 const LOWER = EMAIL.toLowerCase();
 const NOT_REGISTERED = "an administrator must register the identity";
 
 let app: App;
-let data: string;
 let env: Record<string, string>;
 let password = "";
-let clientId = "";
 
 async function users(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
   const child = spawnChild(["bun", "--no-env-file", "scripts/users.ts", ...args], {
@@ -64,59 +64,58 @@ const approve = (userId: string, amount: number) =>
     }),
   }).then((response) => response.json() as Promise<{ code: string; error_message?: string }>);
 
-const signIn = (email: string, secret: string) =>
-  fetch(`${app.origin}/sign-in/email`, {
-    method: "POST",
-    headers: { "content-type": "application/json", origin: app.origin },
-    body: JSON.stringify({ email, password: secret }),
-  });
-
-/** Where the provider sends a browser holding `cookie` that asks to authorize: consent if signed in, login if not. */
-async function authorizeAs(cookie: string): Promise<string> {
+/** The authorize request the app sends a browser with, as a query string. */
+async function authorizeQuery(): Promise<string> {
   const verifier = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
   const challenge = Buffer.from(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier))).toString("base64url");
-  const response = await fetch(
-    `${app.origin}/oauth2/authorize?${new URLSearchParams({
-      response_type: "code",
-      client_id: clientId,
-      redirect_uri: REDIRECT_URI,
-      scope: "openid email",
-      state: "users-live",
-      code_challenge: challenge,
-      code_challenge_method: "S256",
-    })}`,
-    { headers: { cookie }, redirect: "manual" },
-  );
-  expect(response.status).toBe(302);
-  return new URL(response.headers.get("location")!, app.origin).pathname;
+  return new URLSearchParams({
+    response_type: "code",
+    client_id: app.identity.clientId,
+    redirect_uri: `${app.origin}/api/auth/callback`,
+    scope: "openid email",
+    state: "users-live",
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+  }).toString();
+}
+
+/** Sign in at the identity provider's login form. A 302 back to the app is a success; the cookie is the IdP session. */
+async function signIn(email: string, secret: string): Promise<{ status: number; cookie: string }> {
+  const response = await fetch(app.identity.standIn.endpoints.authorize, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ request: await authorizeQuery(), email, password: secret }),
+    redirect: "manual",
+  });
+  const cookie = response.headers
+    .getSetCookie()
+    .map((raw) => raw.split(";")[0]!)
+    .join("; ");
+  return { status: response.status, cookie };
+}
+
+/** Where the IdP sends a browser holding `cookie`: back to the app if its session is live, the login form if not. */
+async function authorizeAs(cookie: string): Promise<"app" | "login"> {
+  const response = await fetch(`${app.identity.standIn.endpoints.authorize}?${await authorizeQuery()}`, {
+    headers: { cookie },
+    redirect: "manual",
+  });
+  if (response.status === 302 && response.headers.get("location")!.startsWith(`${app.origin}/api/auth/callback?code=`)) return "app";
+  expect(response.status).toBe(200);
+  return "login";
 }
 
 beforeAll(async () => {
-  data = mkdtempSync(join(tmpdir(), "cg-users-live-"));
+  app = await bootApp({ ARCADE_HOOK_SIGNING_SECRET: HOOK_SECRET, POLICY_POLL_MS: String(POLICY_POLL_MS) }, { cast: false });
   env = {
-    GOVERNANCE_DB_PATH: join(data, "governance.db"),
-    IDP_DB_PATH: join(data, "idp.db"),
-    IDP_OAUTH_REDIRECT_URIS: REDIRECT_URI,
-    ARCADE_HOOK_SIGNING_SECRET: HOOK_SECRET,
-    POLICY_POLL_MS: String(POLICY_POLL_MS),
+    GOVERNANCE_DB_PATH: app.databases.governance,
+    OKTA_ORG_URL: app.identity.standIn.url,
+    OKTA_API_TOKEN: TEST_OKTA_TOKEN,
   };
-  app = await bootApp(env);
-  env = { ...env, APP_PUBLIC_HOST: app.host };
-
-  const client = spawnChild(["bun", "--no-env-file", "scripts/identity/oauth-client.ts", "--json"], {
-    cwd: ROOT,
-    env: childEnv({ ...env, NODE_ENV: "test" }),
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const [out, code] = await Promise.all([new Response(client.stdout).text(), client.exited]);
-  if (code !== 0) throw new Error(`oauth-client exited ${code}`);
-  clientId = (JSON.parse(out) as { client_id: string }).client_id;
 }, 240_000);
 
 afterAll(async () => {
   await app?.stop();
-  if (data) rmSync(data, { recursive: true, force: true });
 });
 
 describe("bun run users, against the running app", () => {
@@ -126,23 +125,24 @@ describe("bun run users, against the running app", () => {
     const added = await users(["add", EMAIL, "--name", "Rowan", "--role", "loan_officer", "--clearance", "50000"]);
     password = added.stdout.match(/^ {2}password {3}(\S+)$/m)![1]!;
 
-    const wrong = await signIn(LOWER, `${password}x`);
-    expect(wrong.status).toBe(401);
+    expect((await signIn(LOWER, `${password}x`)).status).toBe(401);
 
-    const response = await signIn(EMAIL, password);
-    expect(response.status).toBe(200);
-    expect(((await response.json()) as { user: { email: string } }).user.email).toBe(LOWER);
-    cookie = response.headers
-      .getSetCookie()
-      .map((raw) => raw.split(";")[0]!)
-      .join("; ");
-    expect(cookie).toContain("session_token=");
-    // The session is live: authorize goes on to consent rather than back to the login page.
-    expect(await authorizeAs(cookie)).toBe("/consent");
+    const signedIn = await signIn(EMAIL, password);
+    expect(signedIn.status).toBe(302);
+    cookie = signedIn.cookie;
+    expect(cookie).toContain("standin_sid=");
+    // The session is live: authorize goes straight back to the app.
+    expect(await authorizeAs(cookie)).toBe("app");
   });
 
   test("/hooks/pre holds them to their clearance", async () => {
-    const over = await approve(LOWER, 60_000);
+    // The subject is new, so it is there once a policy poll has seen it.
+    let over = await approve(LOWER, 60_000);
+    const started = performance.now();
+    while (over.error_message?.includes(NOT_REGISTERED) && performance.now() - started < 10 * POLICY_POLL_MS) {
+      await Bun.sleep(25);
+      over = await approve(LOWER, 60_000);
+    }
     expect(over.code).toBe("CHECK_FAILED");
     expect(over.error_message).toContain("exceeds your approval authority of 50000");
     expect(await approve(LOWER, 50_000)).toEqual({ code: "OK" });
@@ -167,9 +167,9 @@ describe("bun run users, against the running app", () => {
 
   test("a removed user loses their session and their sign-in, and /hooks/pre denies them", async () => {
     const removed = await users(["remove", LOWER]);
-    expect(removed.stdout).toMatch(/[1-9]\d* session\(s\)/);
+    expect(removed.stdout).toContain("deactivated and deleted in Okta");
 
-    expect(await authorizeAs(cookie)).toBe("/login");
+    expect(await authorizeAs(cookie)).toBe("login");
     expect((await signIn(LOWER, password)).status).toBe(401);
 
     let answer = await approve(LOWER, 1);
@@ -188,13 +188,15 @@ describe("bun run users, against the running app", () => {
     expect(answer.error_message).toContain(NOT_REGISTERED);
   });
 
-  test("there is still no open sign-up", async () => {
-    const response = await fetch(`${app.origin}/sign-up/email`, {
-      method: "POST",
-      headers: { "content-type": "application/json", origin: app.origin },
-      body: JSON.stringify({ email: "walk.in@example.com", password: "walk-in-password", name: "Walk In" }),
-    });
-    expect(response.status).toBe(404);
-    expect((await signIn("walk.in@example.com", "walk-in-password")).status).toBe(401);
+  test("the app has no sign-up of its own", async () => {
+    for (const path of ["/sign-up/email", "/api/auth/sign-up/email"]) {
+      const response = await fetch(`${app.origin}${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: app.origin },
+        body: JSON.stringify({ email: "walk.in@example.com", password: "Walk-In-Pass-1", name: "Walk In" }),
+      });
+      expect(response.status).toBe(404);
+    }
+    expect((await signIn("walk.in@example.com", "Walk-In-Pass-1")).status).toBe(401);
   });
 });

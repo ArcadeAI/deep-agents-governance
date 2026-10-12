@@ -55,6 +55,7 @@ import { DANA, SESSION_SECRET, startAgentHarness, type AgentHarness } from "./ag
 import { browserRequired, missingBrowserMessage, resolveChrome } from "./chrome.ts";
 import { browserTarget, Cdp, evaluate, serveOnFreePort, startChrome, stopProcess, waitFor } from "./cdp.ts";
 import { freePort, spawnChild } from "./child.ts";
+import { answerDiscovery } from "./oidc-discovery.ts";
 
 const WEB = join(import.meta.dir, "..");
 const chromeResolution = resolveChrome();
@@ -204,17 +205,17 @@ async function measureHome(options: {
   hooksHost?: string;
   /**
    * The identity provider the app's loan module presents bearers to
-   * (`IDENTITY_HOST`), HOST-form. The loan book is in the app since #5, so
+   * (`IDP_ISSUER`), a URL. The loan book is in the app since #5, so
    * this is the one address its answer depends on; until #5 the option was the
    * loan API's own address.
    *
    * Defaults to a port this process bound and released, so the module cannot
    * say who the bearer is and the loan book comes back `unavailable` — the
    * state the default always produced. It may **not** default to the
-   * worktree's own `IDENTITY_HOST`: that is whatever `.env.local` says, and
+   * worktree's own `IDP_ISSUER`: that is whatever `.env.local` says, and
    * the page would then depend on what else happens to be running.
    */
-  loanIdpHost?: string;
+  loanIdpIssuer?: string;
   /** Run once per page load, after the client tree has settled. */
   afterLoad?: (cdp: Cdp) => Promise<void>;
 }): Promise<Measured> {
@@ -225,7 +226,7 @@ async function measureHome(options: {
   let profile: string | undefined;
   try {
     const agents = (harness = await startAgentHarness());
-    const loanIdpHost = options.loanIdpHost ?? `localhost:${freePort()}`;
+    const loanIdpIssuer = options.loanIdpIssuer ?? `http://localhost:${freePort()}/oauth2/default`;
     const environment = (webPort: number): Record<string, string> => {
       const env: Record<string, string> = {
         ...(process.env as Record<string, string>),
@@ -236,25 +237,21 @@ async function measureHome(options: {
         GOVERNANCE_DB_PATH: ":memory:",
         ARCADE_API_URL: agents.gateway.url,
         ARCADE_API_KEY: "arcade-key-for-full-screen-browser",
-        ARCADE_GATEWAY_ID: "cg-demo-us",
         ARCADE_TOOLKIT: "LoanDesk",
         SESSION_SECRET,
-        // The session below is sealed by hand, so nothing here signs in: the
-        // identity provider is the app's own since #6, and it gets a throwaway
-        // idp.db rather than `./idp.db`, which is the developer's.
-        IDP_DB_PATH: ":memory:",
+        // The session below is sealed by hand, so nothing here signs in.
         IDP_CLIENT_ID: "web",
         IDP_CLIENT_SECRET: "not-used-by-this-test",
         APPROVALS_STORE_TOKEN: "store-token-for-agent-tests",
         // A throwaway loan book: it may not default to `./loans.db`, which is
         // the developer's own.
         LOANS_DB_PATH: ":memory:",
-        IDENTITY_HOST: loanIdpHost,
+        IDP_ISSUER: loanIdpIssuer,
       };
-      // The app's origin since #6 — its issuer and every redirect_uri — and the
-      // panel's stream host. A case with a control plane of its own points it
-      // there, which is the one thing that case is about; nothing in it signs
-      // in, so the issuer naming that host is never followed.
+      // The app's origin since #6 (every redirect_uri) and the panel's stream
+      // host. A case with a control plane of its own points it there, which is
+      // the one thing that case is about; nothing in it signs in, so the
+      // redirect naming that host is never followed.
       env["APP_PUBLIC_HOST"] = options.hooksHost ?? `127.0.0.1:${webPort}`;
       // Server-side reads of the control plane go here since #4.
       if (options.hooksHost !== undefined) env["CONTROL_PLANE_HOST"] = options.hooksHost;
@@ -294,21 +291,16 @@ async function measureHome(options: {
     chrome = browser.child;
     const debugPort = browser.port;
 
-    // A real post-#157 browser: the gateway bearer for hop 1, and the IdP
-    // access token the bank's own screens are read with. Before #176 this
-    // fixture carried only the first, which is the shape of a cookie sealed
-    // before #157 shipped — so every page load in this file went down
+    // A real browser: the IdP access token the bank's own screens are read
+    // with. Before #176 this fixture carried only a hop-1 gateway bearer (hop 1
+    // has since gone), which is the shape of a cookie sealed before #157
+    // shipped — so every page load in this file went down
     // `readLoanBook`'s "carries no loan-system token" branch and the served
     // page was, unremarked, in exactly the self-contradicting state #176 is
     // about. It is measured deliberately below instead.
     const session = {
       email: DANA,
       signed_in_at: Date.now(),
-      gateway: {
-        access_token: harness.gateway.issueToken(DANA),
-        expires_at: Date.now() + 3_600_000,
-        client_id: "full-screen-browser",
-      },
       idp: {
         access_token: "idp-token-for-full-screen-browser",
         expires_at: Date.now() + 3_600_000,
@@ -528,16 +520,17 @@ test.skipIf(chromeResolution.path === null && !REQUIRED)(
     if (chromeResolution.path === null) throw new Error(missingBrowserMessage(chromeResolution));
 
     // The identity provider the loan module asks, refusing every bearer the
-    // way `apps/idp` refuses one it did not issue.
+    // way Okta refuses one it did not issue. Its discovery document still
+    // answers: the refusal is about the token, not the provider.
     const refusing = Bun.serve({
       port: 0,
-      fetch: () => new Response("invalid_token", { status: 401 }),
+      fetch: (request) => answerDiscovery(request) ?? new Response("invalid_token", { status: 401 }),
     });
 
     try {
       const measured = await measureHome({
         governanceStream: null,
-        loanIdpHost: `localhost:${refusing.port}`,
+        loanIdpIssuer: `http://localhost:${refusing.port}`,
       });
 
       // The chrome. Not "Signed in as" anywhere on the document — the line the

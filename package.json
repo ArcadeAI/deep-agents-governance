@@ -5,8 +5,7 @@
   "workspaces": [
     "gate/engine",
     "gate/schema",
-    "api",
-    "auth/provider"
+    "api"
   ],
   "scripts": {
     "dev": "bun scripts/next.ts dev",
@@ -15,13 +14,9 @@
     "up": "bun scripts/up.ts",
     "dev:idp-stub": "bun scripts/dev-idp.ts",
     "loans": "bun scripts/loans.ts",
-    "identity": "bun scripts/identity.ts",
-    "oauth-client": "bun scripts/identity/oauth-client.ts",
     "setup-arcade": "bun --no-env-file scripts/setup-arcade.ts",
-    "identity:reset": "bun scripts/identity/reset.ts",
+    "okta-setup": "bun --no-env-file scripts/okta-setup.ts",
     "users": "bun scripts/users.ts",
-    "generate:identity-schema": "bun scripts/identity/generate-schema.ts",
-    "generate:identity-schema:check": "bun scripts/identity/generate-schema.ts --check",
     "arcade-stand-in": "bun scripts/arcade-stand-in.ts",
     "gateway-stand-in": "bun scripts/gateway-stand-in.ts",
     "build": "bun --bun next build && bun run --filter '*' build",
@@ -30,19 +25,17 @@
     "reset": "bun scripts/reset.ts"
   },
   "//": [
-    "The root manifest is the app's since #3: the Next.js app that was apps/web lives at the repo root, and the workspaces are packages/*, api and auth/provider, the services having all been folded in (#4, #5, #6). `--filter '*'` in `build` and `typecheck` matches the workspaces and never the root, so neither recurses. There is no `test` script: at the root `bun test` runs every group in the repo, and a script scoped to one of them would read as the whole suite. The app's group is `bun test ./app-test/`.",
+    "The root manifest is the app's since #3: the Next.js app that was apps/web lives at the repo root, and the workspaces are packages/* and api, the services having all been folded in (#4, #5, #6). `--filter '*'` in `build` and `typecheck` matches the workspaces and never the root, so neither recurses. There is no `test` script: at the root `bun test` runs every group in the repo, and a script scoped to one of them would read as the whole suite. The app's group is `bun test ./app-test/`.",
     "The app runs on Bun, not Node, since #4: `build` is `bun --bun next build`, and `dev` and `start` pass `--bun` in `scripts/next.ts`. The control plane in `gate/service/` opens `governance.db` with `bun:sqlite`, and since #5 the loan module in `api/` opens `loans.db` the same way; Node cannot load it, and `next`'s bin is `#!/usr/bin/env node`, which plain `bun run` honours. Measured on #4: under Node the build fails collecting page data and the route answers 500.",
     "`dev` and `start` go through `scripts/next.ts` so that PORT comes from the root `.env.local`, the way it does for the three Bun services from theirs. `next dev --port ${PORT:-3000}` did not: the shell expanded it before anything read the file, and the service bound 3000 in a worktree that owns 4410. See #50 and the comment at the top of that script; `app-test/dev-port.test.ts` fails if the shell-expanded form comes back. `dev:web` is the name the app ran under before #3, kept as an alias.",
     "zod is pinned to one exact 4.x version, repo-wide, by the override below. The old 3.x pin (#28) guarded an Arcade TypeScript SDK this repo never depended on. One version everywhere is the point: two zods in one process disagree about instanceof.",
-    "Better Auth is the app's own dependency since #6: `apps/idp` is the identity module, `auth/provider/`, served by the app on its port and opening `idp.db` with `bun:sqlite`. Pinned exactly, at 1.7.5 with a fresh `idp.db` schema (DESIGN.md → Services): `auth/provider/replay-tolerance.ts` and `authorization-code.ts` quote the plugin's internals by version, and a range would let them drift from what they cite. `bun run identity` puts the module on a port of its own (scripts/identity.ts), for tests; `oauth-client`, `identity:reset` and `generate:identity-schema` are the scripts that were `apps/idp`'s. `app-test/identity/only-identity-mints.test.ts` fails if any other module imports its signing keys or its token issuance.",
-    "dev:idp-stub is the laptop-only identity stand-in, at scripts/dev-idp.ts since #5 folded apps/loan-app (it lived in apps/loan-app/scripts before). It binds IDENTITY_HOST's port, not PORT — the root .env.local's PORT is the app's. See #56 and the comment at the top of scripts/dev-idp.ts; app-test/loans/dev-idp-port.test.ts fails if it goes back to PORT.",
+    "The identity provider is Okta (or any OIDC issuer), not a dependency: the app is an OIDC client of IDP_ISSUER and finds every endpoint through its discovery document (auth/discovery.ts). `okta-setup` creates the Okta app and writes IDP_ISSUER, IDP_CLIENT_ID and IDP_CLIENT_SECRET to .env; it runs with --no-env-file, like setup-arcade, and reads OKTA_API_TOKEN only from `op run`. The bundled Better Auth provider, idp.db and its scripts are gone.",
+    "dev:idp-stub is the laptop-only identity stand-in, at scripts/dev-idp.ts since #5 folded apps/loan-app (it lived in apps/loan-app/scripts before). It binds the port in IDP_ISSUER, not PORT — the root .env.local's PORT is the app's. See #56 and the comment at the top of scripts/dev-idp.ts; app-test/loans/dev-idp-port.test.ts fails if it goes back to PORT.",
     "api is a workspace member for its manifest's `cg.governed` flag, which `gate/schema`'s sweep reads to exempt it; `bun run loans` puts the module on a port of its own (scripts/loans.ts), for tests and for anyone who wants the loan API without Next."
   ],
   "dependencies": {
-    "@better-auth/oauth-provider": "1.7.5",
     "@cg/governance-core": "workspace:*",
     "@cg/policy-schema": "workspace:*",
-    "better-auth": "1.7.5",
     "next": "^16.3.6",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",

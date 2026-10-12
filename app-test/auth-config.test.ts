@@ -6,45 +6,42 @@
  * is held to the builder that sends it.
  */
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { gatewayBody, pluginBody, providerBody, verifierBody } from "../scripts/setup-arcade/arcade.ts";
 import { userSourceBody } from "../scripts/setup-arcade/coordinator.ts";
-import { serverName } from "../scripts/setup-arcade/toolkit.ts";
 
 const REPO = join(import.meta.dir, "..");
 const HOST = "<APP_PUBLIC_HOST>";
 const ORIGIN = `https://${HOST}`;
-
-/** `loan_desk` as Arcade prefixes its tools: `LoanDesk` (`mcp/loan_desk/app.py`). */
-const TOOLKIT = serverName(join(REPO, "mcp"))!
-  .split("_")
-  .map((word) => word[0]!.toUpperCase() + word.slice(1))
-  .join("");
+/**
+ * The identity provider's endpoints, in Okta's shape under `<IDP_ISSUER>`.
+ * Another provider's come from its discovery document.
+ */
+const ISSUER = "<IDP_ISSUER>";
+const ENDPOINTS = {
+  authorize: `${ISSUER}/v1/authorize`,
+  token: `${ISSUER}/v1/token`,
+  userinfo: `${ISSUER}/v1/userinfo`,
+};
 
 const read = (name: string) => JSON.parse(readFileSync(join(REPO, "auth-config", name), "utf8"));
 
 const EXPECTED: Record<string, unknown> = {
-  "user-source.json": userSourceBody({
-    issuer: ORIGIN,
-    clientId: "<ARCADE_USER_SOURCE_CLIENT_ID>",
-    clientSecret: "<ARCADE_USER_SOURCE_CLIENT_SECRET>",
-  }),
   "app-identity-provider.json": providerBody({
     host: HOST,
     origin: ORIGIN,
-    arcadeClientId: "<ARCADE_CLIENT_ID>",
-    arcadeClientSecret: "<ARCADE_CLIENT_SECRET>",
+    endpoints: ENDPOINTS,
+    clientId: "<IDP_CLIENT_ID>",
+    clientSecret: "<IDP_CLIENT_SECRET>",
     approvalsStoreToken: "",
   }),
   "custom-verifier.json": verifierBody(ORIGIN),
   "hooks-plugin.json": pluginBody(ORIGIN, "<ARCADE_HOOK_SIGNING_SECRET>", "active"),
-  "gateway.json": gatewayBody({
-    slug: "<ARCADE_GATEWAY_ID>",
-    userSourceId: "<USER_SOURCE_ID>",
-    toolkit: TOOLKIT,
-  }),
+  // The optional pair `setup-arcade --gateway` sends: the User Source, then the gateway through it.
+  "user-source.json": userSourceBody({ issuer: ISSUER, clientId: "<IDP_CLIENT_ID>", clientSecret: "<IDP_CLIENT_SECRET>" }),
+  "gateway.json": gatewayBody({ slug: "<ARCADE_GATEWAY_ID>", userSourceId: "<USER_SOURCE_ID>", toolkit: "LoanDesk" }),
 };
 
 describe("auth-config/", () => {
@@ -59,10 +56,27 @@ describe("auth-config/", () => {
     for (const name of Object.keys(EXPECTED)) expect(readme).toContain(`\`${name}\``);
   });
 
+  test("the folder holds exactly those files", () => {
+    // The agent calls the Engine directly with the project key: the User
+    // Source and the gateway are the optional `--gateway` pair, and the README
+    // says so. Anything else here would have a dashboard user create something
+    // the app never uses.
+    const files = readdirSync(join(REPO, "auth-config")).filter((name) => name.endsWith(".json"));
+    expect(files.sort()).toEqual(Object.keys(EXPECTED).sort());
+  });
+
   test("no file holds a value of its own where a placeholder belongs", () => {
     for (const name of Object.keys(EXPECTED)) {
       const text = readFileSync(join(REPO, "auth-config", name), "utf8");
       expect(text).not.toMatch(/ngrok|localhost|127\.0\.0\.1/);
     }
+  });
+
+  test("the README marks the User Source and the gateway optional, and the agent needs neither", () => {
+    const readme = readFileSync(join(REPO, "auth-config", "README.md"), "utf8");
+    expect(readme).toMatch(/`user-source\.json` \| Optional, with `--gateway`/);
+    expect(readme).toMatch(/`gateway\.json` \| Optional, with `--gateway`/);
+    expect(readme).toContain("The agent needs no User Source and no MCP gateway.");
+    expect(read("gateway.json").auth_type).toBe("user_source");
   });
 });

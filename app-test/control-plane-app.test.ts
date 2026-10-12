@@ -26,7 +26,8 @@ import { HealthResponse } from "@cg/policy-schema";
 
 import { serveOnFreePort, stopProcess, type Booted } from "./cdp.ts";
 import { spawnChild } from "./child.ts";
-import { seedDemoGovernance, seedDemoIdentity } from "./demo-cast.ts";
+import { appIdentityEnv, stopAppIdentities } from "./app-identity.ts";
+import { seedDemoGovernance } from "./demo-cast.ts";
 import { loanFixture } from "./control-plane/loan-fixture.ts";
 import { openEventStream } from "./control-plane/sse-reader.ts";
 
@@ -50,6 +51,7 @@ async function bootApp(env: Record<string, string> = {}): Promise<App> {
   const cleanup = () => {
     rmSync(data, { recursive: true, force: true });
     for (const distDir of distDirs) rmSync(join(ROOT, distDir), { recursive: true, force: true });
+    stopAppIdentities();
   };
   // The port is chosen inside `serveOnFreePort`, which starts the app again on
   // a new one if another process took it first (#9); each attempt gets its own
@@ -61,11 +63,12 @@ async function bootApp(env: Record<string, string> = {}): Promise<App> {
         const dir = join(data, String(port));
         mkdirSync(dir);
         // A first boot seeds nobody (#33): the demo cast this file acts as goes
-        // into both files first, the way `bun run users seed-demo` writes it.
+        // into `governance.db` first, and into the identity provider (an OIDC
+        // stand-in), the way `bun run users seed-demo` writes them.
         seedDemoGovernance(join(dir, "governance.db"), {
           toolkit: env.ARCADE_TOOLKIT ?? process.env.ARCADE_TOOLKIT?.trim() ?? "LoanDesk",
         });
-        await seedDemoIdentity(join(dir, "idp.db"));
+        const identity = await appIdentityEnv(`http://127.0.0.1:${port}`);
         const distDir = `.next/cg-test-${port}`;
         distDirs.push(distDir);
         return spawnChild(["bun", "scripts/next.ts", "dev"], {
@@ -78,11 +81,13 @@ async function bootApp(env: Record<string, string> = {}): Promise<App> {
             // The app holds the loan book too since #5; this one's, not a loans.db
             // in the repo.
             LOANS_DB_PATH: join(dir, "loans.db"),
-            // And the identity provider since #6: not a `./idp.db` in the repo.
-            IDP_DB_PATH: join(dir, "idp.db"),
-            APP_PUBLIC_HOST: `127.0.0.1:${port}`,
+            // Not the developer's Okta org: a stand-in of this run's own.
+            ...identity.env,
             GOVERNANCE_STREAM: "hooks",
             NEXT_TELEMETRY_DISABLED: "1",
+            // Not the developer's gateway either: `setup-arcade --gateway` writes
+            // ARCADE_GATEWAY_ID to .env, and /health must read the same here.
+            ARCADE_GATEWAY_ID: "",
             ...env,
           },
           stdout: "pipe",
@@ -241,8 +246,8 @@ describe("the control plane, on the app's own port", () => {
     const body = (await response.json()) as Record<string, unknown>;
     expect(HealthResponse.safeParse(body).success).toBe(true);
     expect(HealthResponse.shape.status.unwrap().options).toEqual(["healthy", "degraded", "unhealthy"]);
-    // 19 rows seeded: 4 subjects, 6 catalogue, 6 policy, 2 output, plus the version row.
-    expect(body).toMatchObject({ status: "healthy", service: "hooks", policy: { status: "ready", revision: 19 } });
+    // 20 rows seeded: 4 subjects, 7 catalogue (Gmail.SendEmail since 8377f4a), 6 policy, 2 output, plus the version row.
+    expect(body).toMatchObject({ status: "healthy", service: "hooks", policy: { status: "ready", revision: 20 } });
   }, 60_000);
 
   test("the app's own /health keeps DESIGN.md's ok|degraded, which Arcade's enum does not have", async () => {
@@ -277,7 +282,7 @@ describe("the control plane, on the app's own port", () => {
     expect(body).toMatchObject({
       service: "web",
       panel_stream: "live",
-      policy: { status: "ready", revision: 19 },
+      policy: { status: "ready", revision: 20 },
       fixture_drift: null,
       // The six patterns over the loan book.
       injection_detection: { state: "armed", patterns: 6 },
@@ -285,7 +290,9 @@ describe("the control plane, on the app's own port", () => {
       control_plane: { status: "healthy", service: "hooks", failure_mode: "fail-closed" },
     });
     expect(body.warnings).toBeArray();
-    for (const key of ["signin", "gateway", "verifier"]) expect(body).toHaveProperty(key);
+    for (const key of ["signin", "verifier"]) expect(body).toHaveProperty(key);
+    // No gateway field without ARCADE_GATEWAY_ID: the gateway is optional, for an MCP client.
+    expect(body).not.toHaveProperty("gateway");
   }, 60_000);
 
   test("the panel's strip reads it back as a healthy control plane", async () => {
@@ -293,7 +300,7 @@ describe("the control plane, on the app's own port", () => {
     expect(await response.json()).toMatchObject({
       reachable: true,
       status: "healthy",
-      policy: { status: "ready", revision: 19, error: null },
+      policy: { status: "ready", revision: 20, error: null },
       fixture_drift: null,
     });
   }, 60_000);

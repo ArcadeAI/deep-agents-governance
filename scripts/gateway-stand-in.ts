@@ -1093,7 +1093,7 @@ function authorizationChallenge(authorizationUrl: string): string {
  * and nothing was listening where anybody was calling.
  *
  * That is #56's bug exactly, and this is #56's fix:
- * `scripts/dev-idp.ts` reads the port out of `IDENTITY_HOST` —
+ * `scripts/dev-idp.ts` reads the port out of `IDP_ISSUER` —
  * the address the loan API already asks for — so the two agree by construction.
  * `ARCADE_API_URL` is the same kind of value here: it is where the app is
  * told to reach Arcade, so binding it leaves no second number to keep in step.
@@ -1146,7 +1146,8 @@ if (import.meta.main) {
     process.exit(78);
   }
 
-  const gatewayId = env.ARCADE_GATEWAY_ID?.trim() || "cg-demo-us";
+  // A fixture path, not a registered gateway: the app no longer has one to name.
+  const gatewayId = "cg-demo-us";
   const hooksHost = env.APP_PUBLIC_HOST?.trim() || "localhost:3000";
   // Both toolkits always — the agent has to be able to see
   // `LoanDesk_RequestApproval`, because the pre-hook's remediation sentence

@@ -17,9 +17,8 @@
  * port — never a literal and never a guess.
  *
  * Unlike the app, it refuses to start when the loan book will not open: there
- * is nothing else in this process to keep serving. An `IDENTITY_HOST`
- * nothing can reach exits 78 (sysexits' EX_CONFIG) before the database is
- * opened and before the port is bound, the way `cg-loan-app` always did.
+ * is nothing else in this process to keep serving. Bearers are validated at
+ * the userinfo endpoint `IDP_ISSUER`'s discovery document names.
  */
 import { openLoanBook } from "../api/db.ts";
 import { loanModuleConfig } from "../api/instance.ts";
@@ -27,9 +26,9 @@ import { orExitConfig } from "../api/public-host.ts";
 import { createLoanModule, MOUNT, mountedFetch, SERVICE } from "../api/server.ts";
 import { RESET_PATH } from "../api/reset.ts";
 
-const { dbPath, resetToken, idpHost } = orExitConfig(SERVICE, () => loanModuleConfig());
+const { dbPath, resetToken, idpIssuer } = orExitConfig(SERVICE, () => loanModuleConfig());
 
-const loans = createLoanModule({ db: openLoanBook(dbPath), idpHost, resetToken });
+const loans = createLoanModule({ db: openLoanBook(dbPath), idpIssuer, resetToken });
 
 const server = Bun.serve({
   port: Number(process.env.PORT ?? 8082),
@@ -39,7 +38,7 @@ const server = Bun.serve({
 
 console.log(
   `[${SERVICE}] listening on :${server.port} — ${loans.health().loans} loans in ${dbPath}, ` +
-    `tokens validated against ${idpHost}, served under ${MOUNT}`,
+    `tokens validated against ${idpIssuer}, served under ${MOUNT}`,
 );
 console.log(
   resetToken.length > 0

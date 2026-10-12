@@ -21,10 +21,8 @@ import { GET } from "../../app/health/route.ts";
 import fixture from "../../api/fixtures/loans.json" with { type: "json" };
 import { closeLoanModule } from "../../api/instance.ts";
 import { bootTestControlPlane } from "../control-plane-instance.ts";
-import { openTestIdentity } from "../identity-instance.ts";
 
 bootTestControlPlane();
-await openTestIdentity();
 
 const scratch = mkdtempSync(join(tmpdir(), "cg-loans-health-"));
 const previous = process.env.LOANS_DB_PATH;

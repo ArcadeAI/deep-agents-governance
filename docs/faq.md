@@ -24,7 +24,7 @@ Arcade's stock Slack provider issues a delegated user token, so the DM arrives u
 
 ## Why two OAuth hops?
 
-Because Arcade establishes who you are at two separate points. Hop 1, the MCP client reaching the gateway, is answered by a User Source whose issuer is the app's own sign-in; hop 2, the loan tool calling the loan API as the signed-in person, is answered by the `app-identity` provider and a custom verifier. A spike measured that hop 1's identity does not carry into hop 2, and without the custom verifier Arcade sends the user to its own account login, which requires an Arcade account that is a project member. The mechanisms are in [Two OAuth hops, two mechanisms](./architecture.md#two-oauth-hops-two-mechanisms).
+Because Arcade establishes who you are at two separate points. Hop 1, the agent reaching Arcade, is answered by the project key and the email from the Okta ID token the agent verified, with no gateway between them; hop 2, the loan tool calling the loan API as the signed-in person, is answered by the `app-identity` provider and a custom verifier. A spike measured that hop 1's identity does not carry into hop 2 (when hop 1 was still a User Source gateway), and without the custom verifier Arcade sends the user to its own account login, which requires an Arcade account that is a project member. The mechanisms are in [Two OAuth hops, two mechanisms](./architecture.md#two-oauth-hops-two-mechanisms).
 
 ## Can the control plane see an OAuth misconfiguration?
 
@@ -36,7 +36,7 @@ With Arcade's built-in Slack app, the default, each loan officer who requests an
 
 ## Why does it need a public host when it runs on my machine?
 
-Because Arcade Cloud makes the calls. Arcade calls the hooks, the deployed loans toolkit calls the loan API, and both OAuth hops reach the app's sign-in and verifier endpoints, all on `APP_PUBLIC_HOST`. One ngrok domain carries all of them, and a fixed domain keeps that host the same across restarts, which matters because `bun run setup-arcade` registers it with Arcade. If you host the image instead, as [Deploying](./deploying.md) describes, `APP_PUBLIC_HOST` is the deployment's own host.
+Because Arcade Cloud makes the calls. Arcade calls the hooks, the deployed loans toolkit calls the loan API, and hop 2 reaches the app's custom verifier, all on `APP_PUBLIC_HOST`. The sign-in itself is at Okta. One ngrok domain carries all of them, and a fixed domain keeps that host the same across restarts, which matters because `bun run setup-arcade` registers it with Arcade. If you host the image instead, as [Deploying](./deploying.md) describes, `APP_PUBLIC_HOST` is the deployment's own host.
 
 ## Why Bun?
 

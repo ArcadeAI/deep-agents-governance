@@ -1,6 +1,6 @@
 /**
- * The Arcade org and project `bun run setup-arcade` registers the hooks and
- * the gateway in (#30).
+ * The Arcade org and project `bun run setup-arcade` registers the hooks in
+ * (#30).
  *
  * Both live only under `/v1/orgs/{org_id}/projects/{project_id}/…`, and no
  * route tells a project key its own org or project (#28). The human measured
@@ -21,8 +21,8 @@
  *    holds the CLI's OAuth tokens: nothing here keeps, prints or passes on any
  *    other field.
  *
- * With neither, the hooks and the gateway fall back to the dashboard forms, and
- * the run says why.
+ * With neither, the hooks fall back to the dashboard form, and the run says
+ * why.
  */
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";

@@ -9,6 +9,8 @@ from langchain_core.messages import HumanMessage, ToolMessage
 
 import agent as loan_desk
 import identity as loan_desk_identity
+import oidc
+from conftest import DISCOVERY, ISSUER, discovery_requests
 from langchain_arcade import ArcadeMiddleware, SelectedTool, StaticProvider
 from scripted import SELECT, TOOL, ScriptedModel
 
@@ -42,22 +44,49 @@ class TestWiring:
         assert config["name"] == "loan-desk"
         assert [type(m) for m in config["middleware"]] == [ArcadeMiddleware]
 
-    def test_selection_is_scoped_to_the_gateway(self) -> None:
-        assert loan_desk.provider._gateway_id == "gw-test"
+    def test_selection_is_not_scoped_to_a_gateway_even_when_one_is_left_in_the_env(self) -> None:
+        # conftest sets ARCADE_GATEWAY_ID the way an older .env would; the provider ignores it.
+        assert loan_desk.provider._gateway_id is None
 
     def test_the_model_is_scripted_without_model_id(self) -> None:
         assert isinstance(loan_desk.agent.config["model"], ScriptedModel)
 
 
 class TestIdentity:
-    def test_callers_are_verified_against_the_apps_own_keys(self) -> None:
+    def test_callers_are_verified_against_the_keys_the_issuers_discovery_names(self) -> None:
         (provider,) = loan_desk_identity.identity.config["ingress"]["http"]["providers"]
-        assert provider["issuer"] == "https://bank.example"
-        assert provider["jwks"] == "https://bank.example/jwks"
-        assert provider["audience"] == "web-client-test"
-        # The IdP pins RS256 (auth/provider/auth.ts); EdDSA would fail at verification.
+        # IDP_ISSUER, its trailing slash dropped, and the key set from its discovery document.
+        assert provider["issuer"] == ISSUER
+        assert provider["jwks"] == f"{ISSUER}/v1/keys"
+        assert provider["audience"] == "0oa-okta-app-test"
+        # Okta signs ID tokens with RS256; EdDSA would fail at verification.
         assert provider["algorithms"] == ["RS256"]
         assert provider["claims"]["user"] == "email"
+
+    def test_loan_desk_issuer_is_still_read_when_idp_issuer_is_blank(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("IDP_ISSUER", "")
+        monkeypatch.setenv("LOAN_DESK_ISSUER", "https://older.example/")
+        assert oidc.issuer() == "https://older.example"
+        monkeypatch.setenv("IDP_ISSUER", f"{ISSUER}/")
+        assert oidc.issuer() == ISSUER
+
+    def test_no_issuer_stops_by_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("IDP_ISSUER", "")
+        monkeypatch.delenv("LOAN_DESK_ISSUER", raising=False)
+        with pytest.raises(RuntimeError, match="IDP_ISSUER is not set"):
+            oidc.issuer()
+
+    def test_discovery_is_read_once_and_must_name_its_own_issuer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        oidc.discover.cache_clear()
+        before = len(discovery_requests)
+        oidc.discover(ISSUER)
+        oidc.discover(ISSUER)
+        assert len(discovery_requests) - before == 1
+        oidc.discover.cache_clear()
+        monkeypatch.setitem(DISCOVERY, "issuer", "https://somebody-else.example")
+        with pytest.raises(RuntimeError, match="names the issuer 'https://somebody-else.example'"):
+            oidc.discover(ISSUER)
+        oidc.discover.cache_clear()
 
     def test_a_missing_value_stops_the_import_by_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("IDP_CLIENT_ID")
@@ -92,11 +121,12 @@ class TestAsk:
 
         import ask
 
-        url = ask.authorize_url("https://bank.example", "web-client-test", "challenge", "state-1")
+        url = ask.authorize_url(DISCOVERY["authorization_endpoint"], "0oa-okta-app-test", "challenge", "state-1")
         query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
-        assert url.startswith("https://bank.example/oauth2/authorize?")
+        assert url.startswith(f"{ISSUER}/v1/authorize?")
         assert query["redirect_uri"] == ["http://127.0.0.1:8765/callback"]
         assert query["code_challenge_method"] == ["S256"]
+        assert query["prompt"] == ["login"]
         # identity.py reads the caller from the `email` claim, so the scope has to ask for it.
         assert query["scope"] == ["openid email"]
 

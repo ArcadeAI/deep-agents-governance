@@ -4,9 +4,8 @@
  *
  * `.orca/project.md` has the measurement behind it (#5): a stub that inherited
  * a host variable from an exported `.env.local` listened on the wrong port and
- * failed a review. With the identity provider in the app since #6 the list of
- * variables that change what a child does is longer again — `APP_PUBLIC_HOST`,
- * `IDENTITY_HOST`, every `*_DB_PATH`, `BETTER_AUTH_SECRET` — so a child gets
+ * failed a review. The list of variables that change what a child does is
+ * long — `APP_PUBLIC_HOST`, every `IDP_*`, every `*_DB_PATH`, `SESSION_SECRET` — so a child gets
  * what it needs to run at all, and everything else from the test that spawns
  * it, by name.
  */

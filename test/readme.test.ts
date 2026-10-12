@@ -128,50 +128,38 @@ function boldTitles(markdown: string): number[] {
 }
 
 /**
- * The fallback's steps (#48), from step 5, in the one order the dashboard
- * allows (#28, #30, #48): Arcade reads the User Source's issuer through the
- * tunnel, so the form comes after it; the gateway authenticates through the
- * User Source, so its form comes next; and its form lists the Loans and
- * Approvals tools only while the hooks are disabled, so the second
- * `setup-arcade` run that turns them on comes last. Since #52 they are the
- * fallback of step 4's one run. `setup-arcade`'s "Then:" list is held to the
- * same order in `app-test/setup-arcade.test.ts`.
+ * The Quickstart from step 5 on, in the one order that works: the app first,
+ * then the tunnel that reaches it, then opening the app through the tunnel.
+ * There is no User Source or gateway form between them: the agent calls the
+ * Engine directly with the project key, and `--gateway` is an optional aside
+ * in step 4, not a step. `setup-arcade`'s "Then:"
+ * list is held to the same order in `app-test/setup-arcade.test.ts`.
  */
 const QUICKSTART_ORDER: Array<[string, RegExp]> = [
-  ["start the app", /Run `bun run dev`/],
+  ["start the app", /run `bun run dev`/i],
   ["start the tunnel", /`ngrok http --url=/],
-  ["the User Source form", /fill in the User Source form/i],
-  ["the gateway form", /fill in the gateway form/i],
-  ["the hooks, by the second run", /Run `bun run setup-arcade <APP_PUBLIC_HOST>` again/],
   ["open the app", /Open `https:\/\/<APP_PUBLIC_HOST>`/],
 ];
 
-/** Where the fallback's steps start: the step that starts the app, if it is not running, and then fills in both forms. */
-const FORMS_STEP = "5. **If it fell back: create the User Source and the gateway**";
-const HOOKS_STEP = "6. **If it fell back: turn the hooks on**";
 const REGISTER_STEP = "4. **Register the app with Arcade**";
+/** Where the app and the tunnel start. */
+const START_STEP = "5. **Start the app and the tunnel**";
 
 /**
- * Step 4, the one run (#52), in the order the human set on #52: the script
- * first, which tells you when to start the app and the tunnel; its first-run
- * work, the deploys last; then the app and the tunnel, and Enter; then the User
- * Source, the gateway through it, and the hooks on, last.
+ * Step 4, the one run: the script, the hooks registered on, the deploys after
+ * them, and a second run that changes nothing.
  */
 const ONE_CLICK_ORDER: Array<[string, RegExp]> = [
-  ["the script, first", /Run `bun run setup-arcade <APP_PUBLIC_HOST>` first, before the app and the tunnel: it tells you when to start them/],
+  ["the script", /Run `bun run setup-arcade <APP_PUBLIC_HOST>`\./],
+  ["the hooks, on", /contextual access hooks through Arcade's API, with the hooks on/],
   ["the deploys", /Then it runs `arcade deploy`/],
-  ["start the app", /Run `bun run dev`/],
-  ["start the tunnel", /run the ngrok command `bun run dev` printed/],
-  ["Enter", /Press Enter when both are running/],
-  ["the User Source", /it creates the User Source through Arcade's Coordinator API/],
-  ["the gateway through it", /and the gateway through it/],
-  ["the hooks on, last", /Last, it turns the hooks on/],
+  ["the rerun", /Run it again, and it says everything is already in place/],
 ];
 
 /** Step 4's text, from its title to step 5's. */
 function registerStep(markdown: string): string {
   const quickstart = section(markdown, "Quickstart 🚀");
-  return quickstart.slice(quickstart.indexOf(REGISTER_STEP), quickstart.indexOf(FORMS_STEP));
+  return quickstart.slice(quickstart.indexOf(REGISTER_STEP), quickstart.indexOf(START_STEP));
 }
 
 /**
@@ -184,9 +172,9 @@ function registerStep(markdown: string): string {
 const CLI_SETUP: Array<[string, RegExp]> = [
   ["install the CLI", /`uv tool install arcade-mcp`/],
   ["log in", /`arcade login`/],
-  ["create a project", /Create a project for this template in the Arcade dashboard/],
+  ["use the default project", /Use the default project Arcade made when you signed up/],
+  ["another project, if you want one", /`arcade project set <project_id>`/],
   ["an API key in that project", /Create an API key in that project and set `ARCADE_API_KEY`/],
-  ["make it the active project", /`arcade project set <project_id>`/],
   ["check it", /`arcade whoami` shows that org and project/],
 ];
 
@@ -213,7 +201,7 @@ function portsTiedToVariables(markdown: string): number[] {
 /** The steps in the order the Quickstart's remainder first names them, or the ones it never does. */
 function quickstartOrder(markdown: string): string[] {
   const quickstart = section(markdown, "Quickstart 🚀");
-  const rest = quickstart.slice(Math.max(0, quickstart.indexOf(FORMS_STEP)));
+  const rest = quickstart.slice(Math.max(0, quickstart.indexOf(START_STEP)));
   const found = QUICKSTART_ORDER.map(([name, pattern]) => ({ name, at: rest.search(pattern) }));
   const missing = found.filter(({ at }) => at === -1).map(({ name }) => `missing: ${name}`);
   return missing.length > 0 ? missing : found.sort((a, b) => a.at - b.at).map(({ name }) => name);
@@ -259,7 +247,7 @@ describe("README.md follows the template's outline", () => {
     expect(quickstart).not.toContain("create-mastra");
   });
 
-  test("the Quickstart's last steps run in the order the dashboard allows: tunnel, User Source, gateway, the hooks run, the app", () => {
+  test("the Quickstart's last steps run in the one order that works: the app, the tunnel, then opening it", () => {
     expect(quickstartOrder(README)).toEqual(QUICKSTART_ORDER.map(([name]) => name));
   });
 
@@ -271,50 +259,46 @@ describe("README.md follows the template's outline", () => {
     expect(quickstart).not.toContain("bun run studio");
   });
 
-  test("step 4 is the one run: the script first, it waits for the app and the tunnel, then the User Source, the gateway and the hooks on, last (#52)", () => {
+  test("step 4 is the one run: the hooks registered on, the deploys, and the gateway only as the optional --gateway", () => {
     const register = registerStep(README);
     expect(inOrder(register, ONE_CLICK_ORDER)).toEqual(ONE_CLICK_ORDER.map(([name]) => name));
     expect(register).toContain("the contextual access hooks through Arcade's API");
     expect(register).toContain("it runs `arcade deploy` once, in `mcp`");
-    expect(register).toContain("It creates the hooks disabled, and turns them on last.");
-    expect(register).toContain("with exactly the four Loans tools, the two Approvals tools and Arcade's Gmail and Slack tools, never Arcade Headers");
-    expect(register).toContain("Run it again, and it says everything is already in place.");
-    // The mismatch stops, and every fallback trigger is named, with what it prints.
-    expect(register).toContain("If a User Source for this app already exists and differs, it names each difference and stops before the gateway");
-    expect(register).toContain("If a Coordinator call fails, if you answer `n` or press Ctrl-C at the wait, or if stdin is not a terminal");
-    expect(register).toContain("printing the User Source form, then the gateway form, then the command for step 6, and a warning that the gateway runs ungoverned until step 6");
-    // The hooks form is the no-login fallback's alone.
-    expect(section(README, "Quickstart 🚀")).not.toMatch(/fill in the contextual access hooks form/i);
+    expect(register).toContain("The agent needs no User Source and no MCP gateway");
+    expect(register).toContain("add `--gateway`");
+    expect(register).toContain("[`docs/modules/03-govern.md`](./docs/modules/03-govern.md#take-it-home-the-same-governance-from-an-mcp-client)");
+    expect(register).toContain("the agent ignores the variable");
+    // What Arcade cannot reach is named, with the step that fixes it.
+    expect(register).toContain("If Arcade cannot reach the app's hooks health check");
+    expect(register).toContain("start the app and the tunnel as in step 5, then run it again");
+    // No wait, no Coordinator and no dashboard fallback is left to describe.
+    expect(register).not.toMatch(/Coordinator|Press Enter|fell back|disabled/);
+    expect(section(README, "Quickstart 🚀")).not.toMatch(/fill in the .* form/i);
   });
 
-  test("steps 5 and 6 are #48's dashboard steps, as step 4's fallback: both forms, then the second run", () => {
+  test("the Quickstart's steps are the gateway-free ones, with no step that registers a gateway", () => {
     const quickstart = section(README, "Quickstart 🚀");
     const titles = [...quickstart.matchAll(/^(\d+)\. \*\*(.+)\*\*$/gm)].map(([, n, title]) => `${n}. ${title}`);
-    expect(titles.slice(3, 6)).toEqual([
+    expect(titles.slice(3)).toEqual([
       "4. Register the app with Arcade",
-      "5. If it fell back: create the User Source and the gateway",
-      "6. If it fell back: turn the hooks on",
+      "5. Start the app and the tunnel",
+      "6. Add yourself and an approver",
+      "7. Run the agent and ask it",
     ]);
-    const forms = quickstart.slice(quickstart.indexOf(FORMS_STEP), quickstart.indexOf(HOOKS_STEP));
-    expect(forms).toContain("never Arcade Headers");
-    expect(forms).toContain("exactly the four Loans tools, the two Approvals tools and Arcade's Gmail and Slack tools");
-    const second = quickstart.slice(quickstart.indexOf(HOOKS_STEP), quickstart.indexOf("7. **"));
-    expect(second).toContain("turns the hooks on and reads them back, and fails unless Arcade reports them active");
-    expect(second).toContain("leaves the hooks disabled");
-    expect(second).toContain("it says the hooks are already on");
-    // No step asks for a User Source id, which a project key cannot read.
-    expect(quickstart).not.toMatch(/us_|User Source's page|--user-source/);
+    // No step asks for a User Source id, a gateway id or a gateway consent.
+    expect(quickstart).not.toMatch(/us_|User Source's page|--user-source|gateway id|Authorize the gateway/);
   });
 
-  test("Prerequisites sets up the Arcade CLI in order, each step with its command", () => {
+  test("Prerequisites sets up the Arcade CLI in order, on the default project, each step with its command", () => {
     const prerequisites = section(README, "Prerequisites");
     expect(inOrder(prerequisites, CLI_SETUP)).toEqual(CLI_SETUP.map(([name]) => name));
-    expect(prerequisites).toContain("run `arcade org set <org_id>` first, because switching org resets the active project");
+    expect(prerequisites).toContain("There is no CLI or API to create a project");
+    expect(prerequisites).toContain("after `arcade org set <org_id>` if you have more than one org");
   });
 
   test("the Quickstart warns about ngrok's page on a free domain, once, where the app is first opened", () => {
     const quickstart = section(README, "Quickstart 🚀");
-    const open = quickstart.slice(quickstart.indexOf("8. **Run the agent and ask it**"));
+    const open = quickstart.slice(quickstart.indexOf("7. **Run the agent and ask it**"));
     expect(open).toContain("The first time a browser opens a free ngrok domain, ngrok shows its own warning page first: click **Visit Site**.");
     expect(open).toContain("Arcade's own calls to the app never see that page.");
     expect(README.match(/Visit Site/g)).toHaveLength(1);
@@ -396,14 +380,14 @@ const MOVED: Array<{ page: string; headings: string[]; facts: string[] }> = [
     page: "docs/configuration.md",
     headings: ["Configuration and readiness", "Resetting the demo"],
     facts: [
-      "A fresh clone with nothing filled in answers `degraded` and names `signin`, `gateway` and `verifier` as `missing`.",
+      "A fresh clone with nothing filled in answers `degraded` and names `signin` and `verifier` as `missing`.",
       "To use a different project, set `ARCADE_ORG_ID` and `ARCADE_PROJECT_ID` in `.env`.",
-      "**`BETTER_AUTH_SECRET` is written by `setup-arcade`.**",
-      "**Changing `BETTER_AUTH_SECRET` is a rotation.**",
+      "**`identity` is Okta.**",
+      "**Rotating the Okta client secret.**",
       "so a taken port is an error rather than a silent move to 3001 that the tunnel would not follow",
       "**Never drive the demo from an Arcade Org Admin account.**",
-      "`bun run reset --hard` also resets the identity provider's sessions, tokens and consents, and keeps every account.",
-      "Neither deletes a user.",
+      "There is no `bun run reset --hard` any more",
+      "It deletes no user.",
       "With it unset, every reset route answers 404 and `/health` reports `reset: disabled`.",
       "**A reset is not a re-registration.**",
     ],
@@ -435,10 +419,10 @@ const MOVED: Array<{ page: string; headings: string[]; facts: string[] }> = [
     headings: ["Deploying"],
     facts: [
       "build the root `Dockerfile`",
-      "without `ARCADE_HOOK_SIGNING_SECRET`, `APPROVALS_STORE_TOKEN` and `BETTER_AUTH_SECRET` the app still starts, but the control plane and the identity provider refuse to",
-      "**One persistent disk holds all three databases.**",
+      "without `ARCADE_HOOK_SIGNING_SECRET` and `APPROVALS_STORE_TOKEN` the app still starts, but the control plane refuses to",
+      "**One persistent disk holds both databases.**",
       "**A redeploy is not a reset.**",
-      "**The disk holds the OAuth clients Arcade is registered against.**",
+      "**People live in Okta, their roles on the disk.**",
     ],
   },
 ];
@@ -532,7 +516,7 @@ describe("each check bites on a planted violation", () => {
     ]);
   });
 
-  test("a Quickstart with the hooks run before the gateway form, the gateway before the User Source, or the form before the tunnel, or no form", () => {
+  test("a Quickstart that opens the app before the tunnel, starts the tunnel before the app, or never starts it", () => {
     const order = QUICKSTART_ORDER.map(([name]) => name);
     const moveBefore = (moving: RegExp, before: RegExp) => {
       const lines = README.split("\n");
@@ -540,17 +524,13 @@ describe("each check bites on a planted violation", () => {
       lines.splice(lines.findIndex((each) => before.test(each)), 0, line!);
       return lines.join("\n");
     };
-    expect(quickstartOrder(moveBefore(/Run `bun run setup-arcade <APP_PUBLIC_HOST>` again/, /fill in the gateway form/i))).not.toEqual(order);
-    expect(quickstartOrder(moveBefore(/fill in the gateway form/i, /fill in the User Source form/i))).not.toEqual(order);
-    const early = README.split("\n");
-    const form = early.findIndex((line) => /fill in the User Source form/i.test(line));
-    const [moved] = early.splice(form, 1);
-    expect(quickstartOrder(early.join("\n"))).toEqual(["missing: the User Source form"]);
-    early.splice(early.findIndex((line) => /`ngrok http --url=/.test(line)), 0, moved!);
-    expect(quickstartOrder(early.join("\n"))).not.toEqual(order);
+    expect(quickstartOrder(moveBefore(/Open `https:\/\/<APP_PUBLIC_HOST>`/, /`ngrok http --url=/))).not.toEqual(order);
+    expect(quickstartOrder(moveBefore(/`ngrok http --url=/, /run `bun run dev`\. It prints/))).not.toEqual(order);
+    const noTunnel = README.split("\n").filter((line) => !/`ngrok http --url=/.test(line)).join("\n");
+    expect(quickstartOrder(noTunnel)).toEqual(["missing: start the tunnel"]);
   });
 
-  test("a step 4 with the app started before the script, or the hooks on before the gateway (#52)", () => {
+  test("a step 4 with the deploys before the script, or the hooks not on", () => {
     const order = ONE_CLICK_ORDER.map(([name]) => name);
     const register = registerStep(README);
     const sentences = (text: string) => text.split(/(?<=\.) /);
@@ -560,9 +540,8 @@ describe("each check bites on a planted violation", () => {
       parts.splice(parts.findIndex((each) => before.test(each)), 0, part!);
       return parts.join(" ");
     };
-    expect(inOrder(moveBefore(register, /Run `bun run dev`/, /Run `bun run setup-arcade <APP_PUBLIC_HOST>` first/), ONE_CLICK_ORDER)).not.toEqual(order);
-    expect(inOrder(moveBefore(register, /Last, it turns the hooks on/, /it creates the User Source through/), ONE_CLICK_ORDER)).not.toEqual(order);
-    expect(inOrder(register.replace("Press Enter when both are running", "Then carry on"), ONE_CLICK_ORDER)).toContain("missing: Enter");
+    expect(inOrder(moveBefore(register, /Then it runs `arcade deploy`/, /Run `bun run setup-arcade <APP_PUBLIC_HOST>`\./), ONE_CLICK_ORDER)).not.toEqual(order);
+    expect(inOrder(register.replace(", with the hooks on", ""), ONE_CLICK_ORDER)).toContain("missing: the hooks, on");
   });
 
   test("a Prerequisites whose CLI steps are out of order, or missing one", () => {

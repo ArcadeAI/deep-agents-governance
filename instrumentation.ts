@@ -15,17 +15,15 @@
  * on `/health` and in every `/bank/…` route's 503 (`api/instance.ts`).
  * It never comes up empty.
  *
- * It boots the identity module (#6): `idp.db` is opened (seeded from the
- * fixture when it is empty), Better Auth is built over it, the replay guard is
- * installed and the OAuth clients are reconciled, before the first request. A
- * provider that will not boot — `BETTER_AUTH_SECRET` unset in production, a
- * disk written by another schema — is reported here, loudly, and then on
- * `/health` and in every identity route's 503, and every browser reads as
- * signed out until it does (`auth/provider/instance.ts`).
+ * It reads the identity provider's discovery document: `IDP_ISSUER` is an
+ * Okta authorization server, and the app is an ordinary OIDC client of it. An
+ * issuer that does not answer is reported here, loudly, and then on `/health`;
+ * the read is not kept when it fails, so sign-in recovers when the provider
+ * does, with no restart (`auth/discovery.ts`).
  *
- * Only in the server runtime: the control plane, the loan module and the
- * identity module open `governance.db`, `loans.db` and `idp.db` with
- * `bun:sqlite`, which is why the app runs on Bun (`scripts/next.ts`).
+ * Only in the server runtime: the control plane and the loan module open
+ * `governance.db` and `loans.db` with `bun:sqlite`, which is why the app runs
+ * on Bun (`scripts/next.ts`).
  */
 export async function register(): Promise<void> {
   if (process.env.NEXT_RUNTIME !== "nodejs") return;
@@ -37,6 +35,12 @@ export async function register(): Promise<void> {
   controlPlaneFailure();
   const { loanModuleFailure } = await import("./api/instance.ts");
   loanModuleFailure();
-  const { identityProviderFailure } = await import("./auth/provider/instance.ts");
-  await identityProviderFailure();
+  const issuer = process.env.IDP_ISSUER?.trim() ?? "";
+  if (issuer !== "") {
+    const { discover } = await import("./auth/discovery.ts");
+    await discover(issuer).then(
+      (document) => console.log(`[identity] signing in through ${document.issuer}`),
+      (error: unknown) => console.error(`[identity] ${error instanceof Error ? error.message : String(error)}: sign-in fails until it answers`),
+    );
+  }
 }

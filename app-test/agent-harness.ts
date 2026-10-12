@@ -10,8 +10,8 @@
  *   $95K prompt produces a denial, not an approval, in the loan database" is a
  *   claim about a row that either exists or does not.
  * - **The identity provider is the repo's own dev stub**, a subprocess of
- *   `scripts/dev-idp.ts`. It answers `/oauth2/userinfo` for
- *   `dev:<email>` tokens, which is how the loan API derives the actor from a
+ *   `scripts/dev-idp.ts`, an OIDC stand-in laid out like Okta's `default`
+ *   authorization server. Its userinfo answers `dev:<email>` tokens, which is how the loan API derives the actor from a
  *   bearer rather than from a parameter — the real code path, with a fixture
  *   issuer behind it.
  * - **The gateway is a stand-in**, `scripts/gateway-stand-in.ts`, and it is the
@@ -49,7 +49,7 @@ export const APPROVALS_TOOLKIT = TOOLKIT;
 /**
  * What the dev IdP stub accepts as a bearer: `dev:<email>`.
  *
- * `scripts/dev-idp.ts` answers `/oauth2/userinfo` for these, so a
+ * `scripts/dev-idp.ts` answers userinfo for these, so a
  * token of this shape is how a test gets a bearer the loan book will derive an
  * actor from — the real code path in `api/actor.ts`, with a
  * fixture issuer behind it. Named here rather than spelled at each call site
@@ -133,8 +133,8 @@ export interface AgentHarness {
    * process, and here they are two processes on one SQLite file.
    */
   loansDbPath: string;
-  /** The dev IdP's HOST-form address, which the loan module validates bearers against. */
-  idpHost: string;
+  /** The dev IdP's issuer (`IDP_ISSUER`), which the loan module validates bearers against. */
+  idpIssuer: string;
   /**
    * Take the loan book away, for the one test that needs a tool to fail for a
    * reason no hook had anything to do with.
@@ -180,7 +180,7 @@ export async function startAgentHarness(
   const workspace = join(tmpdir(), `cg-agent-${crypto.randomUUID()}`);
   mkdirSync(workspace, { recursive: true });
 
-  // The stub IdP binds the port named in IDENTITY_HOST, not PORT — see the
+  // The stub IdP binds the port named in IDP_ISSUER, not PORT — see the
   // comment at the top of that script. So the port is chosen here and handed to
   // both it and the loan API, which is what makes them agree.
   //
@@ -192,13 +192,13 @@ export async function startAgentHarness(
       spawnChild({
         cmd: ["bun", join(REPO_ROOT, "scripts", "dev-idp.ts")],
         cwd: REPO_ROOT,
-        env: { ...process.env, IDENTITY_HOST: `localhost:${port}`, NODE_ENV: "test" },
+        env: { ...process.env, IDP_ISSUER: `http://localhost:${port}/oauth2/default`, NODE_ENV: "test" },
         stdout: "pipe",
         stderr: "pipe",
       }),
     { ready: async (port, output) => output().includes(`listening on :${port}`), timeoutMs: 20_000 },
   );
-  const idpHost = `localhost:${idpPort}`;
+  const idpIssuer = `http://localhost:${idpPort}/oauth2/default`;
 
   // A first boot seeds nobody (#33): the demo cast goes into the file first,
   // under the toolkit names this control plane is about to be given.
@@ -239,7 +239,7 @@ export async function startAgentHarness(
       ...process.env,
       PORT: "0",
       LOANS_DB_PATH: join(workspace, "loans.db"),
-      IDENTITY_HOST: idpHost,
+      IDP_ISSUER: idpIssuer,
       NODE_ENV: "test",
     },
     stdout: "pipe",
@@ -275,7 +275,6 @@ export async function startAgentHarness(
   const config = readIdentitySurface({
     ARCADE_API_URL: gateway.url,
     ARCADE_API_KEY: "arcade-key-for-agent-tests",
-    ARCADE_GATEWAY_ID: GATEWAY_ID,
     ARCADE_TOOLKIT: LOAN_TOOLKIT,
     SESSION_SECRET,
     APP_PUBLIC_HOST: "localhost:1",
@@ -290,7 +289,7 @@ export async function startAgentHarness(
     loanAppHost,
     governanceDbPath: join(workspace, "governance.db"),
     loansDbPath: join(workspace, "loans.db"),
-    idpHost,
+    idpIssuer,
     calls,
     lists,
     tokenFor: (email) => gateway.issueToken(email),
