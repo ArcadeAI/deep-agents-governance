@@ -74,7 +74,7 @@ export interface IdentityConfig {
    * --gateway` registered, or `""`. Optional, and the agent never reads it:
    * it calls the Engine directly. Set, the home page shows how to connect an
    * MCP client such as Claude Code to the same tools under the same hooks
-   * (`components/identity/McpClientPanel.tsx`, `docs/modules/05-mcp-client.md`).
+   * (`components/identity/McpClientPanel.tsx`, `docs/modules/03-govern.md`).
    */
   gatewayId: string;
 }

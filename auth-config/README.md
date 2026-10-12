@@ -23,7 +23,7 @@ each person authorizes them the first time the agent uses them.
 The agent needs no User Source and no MCP gateway. It calls the Arcade Engine directly
 with the project API key and the signed-in person's email as `user_id` (`agent/agent.py`),
 and the hooks govern every call it makes. The last two files are for the optional MCP
-client path (`docs/modules/05-mcp-client.md`): `bun run setup-arcade <host> --gateway`
+client path (`docs/modules/03-govern.md`): `bun run setup-arcade <host> --gateway`
 sends them, the User Source through the Coordinator API at `cloud.arcade.dev` and the
 gateway through the Engine's admin API, and writes the slug to `.env` as
 `ARCADE_GATEWAY_ID`. Without the flag, nothing reads or creates either.

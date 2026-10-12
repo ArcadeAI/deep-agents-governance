@@ -34,7 +34,7 @@
  * and read back with `GET …/gateways/{id}`. It authenticates through a User
  * Source, which only the Coordinator API creates (`coordinator.ts`). The
  * agent never uses it: it is for an MCP client such as Claude Code, so the
- * same hooks can be watched from one (`docs/modules/05-mcp-client.md`).
+ * same hooks can be watched from one (`docs/modules/03-govern.md`).
  *
  * Since #30 the hooks go through the API too, under the org and project
  * `context.ts` resolves, because the human measured that a project key is

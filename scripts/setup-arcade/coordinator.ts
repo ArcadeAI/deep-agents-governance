@@ -36,7 +36,7 @@
  * call, and the run stops and prints the dashboard forms (`forms.ts`). Nothing
  * here runs without `--gateway`: the agent calls the Engine directly, and the
  * User Source exists only so an MCP client can sign in as the person
- * (`docs/modules/05-mcp-client.md`).
+ * (`docs/modules/03-govern.md`).
  */
 import type { ProjectScope } from "./arcade.ts";
 

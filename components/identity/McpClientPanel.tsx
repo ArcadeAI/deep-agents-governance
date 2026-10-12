@@ -9,7 +9,7 @@
  * nothing. The URL is the one `setup-arcade` printed (`lib/config.ts`
  * `gatewayUrl`), and signing in happens in the client (`/mcp` in Claude
  * Code), at Okta, through Arcade's User Source: the person is themselves
- * there too, and the hooks see the same email. `docs/modules/05-mcp-client.md`
+ * there too, and the hooks see the same email. `docs/modules/03-govern.md`
  * walks through it.
  *
  * A server component with no state: nothing here reads the session or the

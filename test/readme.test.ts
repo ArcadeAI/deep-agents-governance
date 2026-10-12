@@ -266,7 +266,7 @@ describe("README.md follows the template's outline", () => {
     expect(register).toContain("it runs `arcade deploy` once, in `mcp`");
     expect(register).toContain("The agent needs no User Source and no MCP gateway");
     expect(register).toContain("add `--gateway`");
-    expect(register).toContain("[`docs/modules/05-mcp-client.md`](./docs/modules/05-mcp-client.md)");
+    expect(register).toContain("[`docs/modules/03-govern.md`](./docs/modules/03-govern.md#take-it-home-the-same-governance-from-an-mcp-client)");
     expect(register).toContain("the agent ignores the variable");
     // What Arcade cannot reach is named, with the step that fixes it.
     expect(register).toContain("If Arcade cannot reach the app's hooks health check");

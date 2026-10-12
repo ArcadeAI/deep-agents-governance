@@ -46,7 +46,7 @@
  *
  * 8. **`--gateway`, optional: the User Source and the gateway by API** (#52),
  *    after the deploys, for an MCP client such as Claude Code to reach the
- *    same tools under the same hooks (`docs/modules/05-mcp-client.md`). The
+ *    same tools under the same hooks (`docs/modules/03-govern.md`). The
  *    User Source is found by issuer and client in the project, else the
  *    issuer is checked and it is created, through the Coordinator API
  *    (`setup-arcade/coordinator.ts`, `ARCADE_COORDINATOR_URL`), and read back
@@ -184,7 +184,7 @@ const FLAGS = new Set(["--dry-run", "--skip-deploy", "--redeploy", "--gateway"])
 const USAGE =
   "usage: bun run setup-arcade <ngrok-host> [--dry-run] [--skip-deploy] [--redeploy] [--gateway[=<slug>]]\n" +
   "  <ngrok-host> is the public host Arcade reaches this app at, e.g. my-app.ngrok.app\n" +
-  "  --gateway also registers an MCP gateway, for Claude Code or another MCP client (docs/modules/05-mcp-client.md)";
+  "  --gateway also registers an MCP gateway, for Claude Code or another MCP client (docs/modules/03-govern.md)";
 
 const unknown = argv.filter((arg) => arg.startsWith("--") && !FLAGS.has(arg) && !arg.startsWith("--gateway="));
 if (unknown.length > 0) fail(`${unknown.join(", ")}: not an option of this command\n${USAGE}`, 64);

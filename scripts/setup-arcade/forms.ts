@@ -21,7 +21,7 @@
  *
  * Without `--gateway` neither is printed: the agent calls the Engine directly
  * with the project key (DESIGN.md → Integration), and the gateway is only for
- * an MCP client (`docs/modules/05-mcp-client.md`).
+ * an MCP client (`docs/modules/03-govern.md`).
  */
 import { gatewayUrl, healthCheckUrl, HOOKS_NAME, HOOK_POINTS } from "./arcade.ts";
 
@@ -160,7 +160,7 @@ export function nextSteps({ host, origin, port, hooks, deployed, gateway, appRun
 
 /**
  * The one step the gateway adds: connect an MCP client to it. Claude Code is
- * the one the module walks through (`docs/modules/05-mcp-client.md`); `/mcp`
+ * the one its Take it home section walks through (`docs/modules/03-govern.md`); `/mcp`
  * there signs in at Okta through the User Source, and from then on every call
  * passes the same hooks the agent's do.
  */
