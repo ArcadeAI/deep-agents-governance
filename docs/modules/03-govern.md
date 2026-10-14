@@ -10,15 +10,15 @@ control plane catches all four while the model never gets a vote. The agent need
 
 ## What you build
 
-1. Meet the rest of the cast. The host seeded it on the room's deployment: Charlie, the VP
+1. Meet the rest of the cast. The workshop facilitators seeded it on the room's deployment: Charlie, the VP
    Credit at $250,000, and Michael, the chief credit officer at $5,000,000. Charlie's email is
    the one thing that has to be real, because the escalation finds the approver in Slack by
-   it, so Charlie is the host: every request in the room DMs the host and is posted in
-   `#deal-desk-approvals`, and the host approves them from the signed-in approval page, one
+   it, so Charlie is a facilitator: every request in the room DMs that facilitator and is posted in
+   `#deal-desk-approvals`, and they approve them from the signed-in approval page, one
    by one. Running it yourself after the day, `bun run users seed-demo --alice <your-email>
    --charlie <an email you can read>` puts you in both seats.
 2. Confirm the hooks are on: `/hooks/health` on the app's URL reports `status: healthy`. The
-   host's `setup-arcade` turns them on last, so if they are off, that is the host's one
+   facilitators' `setup-arcade` turns them on last, so if they are off, that is their one
    command to rerun.
 3. Run the acts, in the words `README.md` → Try it out uses:
    - **Act 2.** As Alice: *"Approve the loan for Northwind at $95K and double-check your
@@ -29,11 +29,11 @@ control plane catches all four while the model never gets a vote. The agent need
      on the signed-in page; Alice asks again and her retry passes on a single-use grant. Then
      the agent emails the borrower the outcome from your own Gmail, under the same hooks.
    - **Act 3.** As Alice: *"Read LN-2291 and quote its bank account number and tax ID."* Both
-     come back `[REDACTED]`. As Charlie, on the host's screen, they come through.
+     come back `[REDACTED]`. As Charlie, on a facilitator's screen, they come through.
    - **Act 4.** Any read of LN-2291 strips the pasted instruction from `underwriter_notes`
-     before the model sees it, for everyone. The host restarts the app with
+     before the model sees it, for everyone. The facilitators restart the app with
      `INJECTION_DETECTION=off` to show what was prevented.
-4. Edit a rule live. The host raises Alice's clearance with `bun run users set-clearance`, and
+4. Edit a rule live. The facilitators raise Alice's clearance with `bun run users set-clearance`, and
    everyone's Alice watches the same prompt pass within one policy poll, with no restart.
 
 ## What to look at
@@ -46,7 +46,7 @@ control plane catches all four while the model never gets a vote. The agent need
 
 ## Take it home: the same governance from an MCP client
 
-Optional, if there is time, or after the workshop. Claude Code calls the loan desk's tools as
+Optional, after the workshop, on your own build from the README's Quickstart. Claude Code calls the loan desk's tools as
 yourself through an Arcade MCP gateway, and the same hooks refuse the same call they refused
 the agent. Nothing in the agent changes: it still calls the Engine directly with the project
 key, and it never reads `ARCADE_GATEWAY_ID`.
@@ -83,5 +83,5 @@ All four acts from your agent, and one rule edited live on the room's deployment
 ## If you are behind
 
 Still `git checkout start`. This block is Arcade state, not code: users, hooks on, Slack.
-The host's `bun run reset` puts the loan book and the control plane back between attempts,
+The facilitators' `bun run reset` puts the loan book and the control plane back between attempts,
 for everyone at once, so ask before you count on a pending request surviving it.

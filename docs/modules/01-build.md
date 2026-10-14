@@ -8,7 +8,7 @@ as yourself and read the tool calls it made, and a copy of it deployed on Manage
 
 ## What you build
 
-1. Set up the agent: `cd agent`, `cp .env.example .env`, fill it in from the host's handout
+1. Set up the agent: `cd agent`, `cp .env.example .env`, fill it in from the facilitators' handout
    ([`00-setup.md`](./00-setup.md)) and your LangSmith key, then `uv sync`.
 2. Serve it locally: `uv run mda dev .`.
 3. Ask it, from a second terminal in `agent`:

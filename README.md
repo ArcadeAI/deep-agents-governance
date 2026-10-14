@@ -1,5 +1,7 @@
 # Deep Agents Loan Desk with Arcade
 
+> **Attending the workshop?** Start at [`docs/modules/00-setup.md`](./docs/modules/00-setup.md). The Quickstart below is for running the whole thing yourself, after the day.
+
 A loan officer asks a LangChain Deep Agent, in plain language, to approve a $95K loan for a second bakery location. The agent searches the loan book, reads the request and calls the approval tool as her. Arcade sends that call to this app's control plane before it runs, and the control plane refuses it: $95K is over her $50K approval authority. The refusal tells the agent how to escalate, the request reaches the one approver with enough authority in Slack, and once he approves, her retry goes through and the agent emails the borrower the outcome from her own Gmail. You get a decision the model could not talk its way around, with an audit row for every step on a live panel.
 
 The agent runs on LangChain's Managed Deep Agents and calls Arcade's Engine directly, with the project API key and the signed-in person's email, with no MCP gateway in between. Its tools are the loan desk's own MCP server, backed by the loan REST API in `api/`, and Arcade's built-in Gmail and Slack. Arcade's tool recommendations are not scoped to those, so it may suggest an unrelated catalog tool, and the hooks govern every call whichever tool it is. The wire and the screen are the loan desk's: `LoanDesk_ApproveLoan`, `LN-2291`, loan officer, credit analyst, VP Credit, chief credit officer.
@@ -9,12 +11,6 @@ The agent runs on LangChain's Managed Deep Agents and calls Arcade's Engine dire
 An agent that writes to a real business system needs limits the model cannot reason around. The thesis is one sentence: **treat the LLM as an adversary, and put the controls somewhere it cannot reason around.**
 
 A limit written into a system prompt is a suggestion, and we measured how fragile it is: one "irreversible, no undo" line made the model stop and ask permission, and one "do not ask the person to confirm" line pushed it the other way. So the agent's instructions carry no limits at all, and every control lives outside the model, in hooks Arcade calls on every tool call, keyed on who is signed in. The model never gets a vote.
-
-## Demo
-
-<!-- TODO: REPLACE THIS PLACEHOLDER WITH THE CLOUDINARY DEMO VIDEO URL -->
-
-<video controls width="640" height="360" src="CLOUDINARY_DEMO_VIDEO_URL_REQUIRED"></video>
 
 ## Prerequisites
 
