@@ -15,6 +15,11 @@ loan clearance is shared while the mailbox the agent sends from is yours. Arcade
 binds that grant to the Arcade account that opens the link, so the address must be the one
 your Arcade account uses, invited to the project.
 
+The sign-in is kept, as the ID token, in `~/.cache/loan-desk-ask/` until it expires (an
+hour, at Okta's default), so the browser opens once per hour, not once per question. The
+file is this user's only (mode 0600) and still never printed. `--sign-in` throws it away and
+signs in again, which is how you become Bob and then Alice again.
+
 `--agent` defaults to `mda dev`'s local server. Standard library only.
 """
 
@@ -31,6 +36,8 @@ import sys
 import urllib.parse
 import urllib.request
 import webbrowser
+from datetime import datetime
+from pathlib import Path
 
 from oidc import discover, issuer as configured_issuer
 
@@ -102,6 +109,33 @@ def id_token(endpoint: str, client_id: str, client_secret: str, code: str, verif
         return json.load(response)["id_token"]
 
 
+def claims(token: str) -> dict:
+    """The ID token's payload, read and not verified: enough to know who and until when."""
+    payload = token.split(".")[1]
+    return json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+
+
+def session_path(issuer: str, client_id: str) -> Path:
+    base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "loan-desk-ask"
+    return base / (hashlib.sha256(f"{issuer}\n{client_id}".encode()).hexdigest()[:16] + ".json")
+
+
+def saved_session(path: Path, now: float, margin: int = 60) -> str | None:
+    """The kept ID token when it is still good for `margin` seconds, else None."""
+    try:
+        token = json.loads(path.read_text())["id_token"]
+        return token if claims(token).get("exp", 0) - now > margin else None
+    except (OSError, ValueError, KeyError, IndexError):
+        return None
+
+
+def keep_session(path: Path, token: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch(mode=0o600, exist_ok=True)
+    path.chmod(0o600)
+    path.write_text(json.dumps({"id_token": token}))
+
+
 CONNECTED_APPS_USER_KEY = "connected_apps_user"
 
 
@@ -150,6 +184,11 @@ def main() -> None:
         default=os.environ.get("CONNECTED_APPS_USER") or None,
         help="your own address for Gmail and Slack, when the Okta sign-in is a shared persona",
     )
+    parser.add_argument(
+        "--sign-in",
+        action="store_true",
+        help="forget the kept sign-in and sign in again, as somebody else or the same person",
+    )
     args = parser.parse_args()
     if args.connected_apps_user and "@" not in args.connected_apps_user:
         sys.exit(f"--as takes an email address, not {args.connected_apps_user!r}.")
@@ -159,15 +198,22 @@ def main() -> None:
         missing.insert(0, "IDP_ISSUER")
     if missing:
         sys.exit(f"Not set: {', '.join(missing)}. See agent/.env.example.")
-    endpoints = discover(configured_issuer())
-
-    verifier, challenge = pkce()
-    state = secrets.token_urlsafe(16)
-    url = authorize_url(endpoints["authorization_endpoint"], os.environ["IDP_CLIENT_ID"], challenge, state)
-    print(f"Sign in as the person asking: {url}", file=sys.stderr)
-    webbrowser.open(url)
-    code = catch_code(state)
-    token = id_token(endpoints["token_endpoint"], os.environ["IDP_CLIENT_ID"], os.environ["IDP_CLIENT_SECRET"], code, verifier)
+    issuer = configured_issuer()
+    kept = session_path(issuer, os.environ["IDP_CLIENT_ID"])
+    token = None if args.sign_in else saved_session(kept, datetime.now().timestamp())
+    if token is None:
+        endpoints = discover(issuer)
+        verifier, challenge = pkce()
+        state = secrets.token_urlsafe(16)
+        url = authorize_url(endpoints["authorization_endpoint"], os.environ["IDP_CLIENT_ID"], challenge, state)
+        print(f"Sign in as the person asking: {url}", file=sys.stderr)
+        webbrowser.open(url)
+        code = catch_code(state)
+        token = id_token(endpoints["token_endpoint"], os.environ["IDP_CLIENT_ID"], os.environ["IDP_CLIENT_SECRET"], code, verifier)
+        keep_session(kept, token)
+    who = claims(token)
+    until = datetime.fromtimestamp(who.get("exp", 0)).strftime("%H:%M")
+    print(f"Asking as {who.get('email', '?')}, signed in until {until}. --sign-in to be somebody else.", file=sys.stderr)
 
     print("\n".join(transcript(ask(args.agent.rstrip("/"), token, args.prompt, args.connected_apps_user))))
 

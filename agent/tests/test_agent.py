@@ -200,6 +200,35 @@ class TestAsk:
         # identity.py reads the caller from the `email` claim, so the scope has to ask for it.
         assert query["scope"] == ["openid email"]
 
+    def test_a_kept_sign_in_is_reused_until_it_expires_and_only_by_its_owner(self, tmp_path) -> None:
+        import base64
+        import json
+        import stat
+
+        import ask
+
+        def jwt(exp: int) -> str:
+            payload = base64.urlsafe_b64encode(json.dumps({"email": "alice@acme.com", "exp": exp}).encode()).rstrip(b"=")
+            return "eyJhbGciOiJub25lIn0." + payload.decode() + ".sig"
+
+        path = tmp_path / "session.json"
+        assert ask.saved_session(path, now=1000.0) is None  # nothing kept yet
+        ask.keep_session(path, jwt(exp=5000))
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert ask.claims(ask.saved_session(path, now=1000.0))["email"] == "alice@acme.com"
+        assert ask.saved_session(path, now=4970.0) is None  # inside the minute before expiry
+        path.write_text("not json")
+        assert ask.saved_session(path, now=1000.0) is None  # a damaged file means sign in again
+
+    def test_the_session_file_is_one_per_issuer_and_app(self, tmp_path, monkeypatch) -> None:
+        import ask
+
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        one = ask.session_path("https://a.okta.com/oauth2/default", "0oa-one")
+        assert one.parent == tmp_path / "loan-desk-ask"
+        assert one != ask.session_path("https://a.okta.com/oauth2/default", "0oa-two")
+        assert one == ask.session_path("https://a.okta.com/oauth2/default", "0oa-one")
+
     def test_the_run_carries_the_own_address_only_when_given(self) -> None:
         import ask
 

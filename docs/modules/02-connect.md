@@ -42,7 +42,8 @@ at all.
    sign-in with Alice's. Run `ask.py`, sign in as Bob and ask him to approve the loan.
    `LoanDesk_ApproveLoan` is not in his tool list. Nothing was refused; the tool was never
    offered. That is the access hook, the first of the four acts, and the rest are the next
-   block. Every `ask.py` run asks for a sign-in, so being Alice again is the next run.
+   block. `ask.py` keeps a sign-in for an hour, so becoming Bob is `--sign-in`, and so is
+   being Alice again.
 
 ## What to look at
 
