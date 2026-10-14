@@ -2,8 +2,9 @@
 
 **9:00 to 9:15. Joint.** The agenda, the people, and a laptop that can run the rest.
 
-You leave with the agent on your laptop, pointed at the room's loan desk, and signed in to it
-as Alice. It stays on your laptop until [`01-build.md`](./01-build.md) deploys it. Everything after this is one of the two products doing its part on that build.
+You leave with the repository cloned, `agent/.env` filled in, and the room's loan desk app
+open in your browser, signed in as Alice. Nothing runs yet; [`01-build.md`](./01-build.md)
+starts the agent. Everything after this is one of the two products doing its part on that build.
 
 In the room, nobody registers anything. The workshop facilitators run one deployment of the whole repo: the
 loan desk app behind its tunnel, one Okta org as its identity provider, one Arcade project

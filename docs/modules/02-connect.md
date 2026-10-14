@@ -14,11 +14,13 @@ watched Bob, who has no approval authority, never see the approval tool at all.
    provider that signs in through the room's Okta app, the tool secrets, the custom verifier,
    the hooks, and the one `arcade deploy`. `auth-config/` holds the same bodies as JSON, and
    you can read them in your clone.
-2. Act as you. Ask the agent, as Alice: *"Read LN-2291 and tell me the borrower."* The first
-   loan desk call returns an authorization link instead of a result: Arcade has no token for
-   you at the loan API yet. Open it, sign in at the room's Okta org, allow it, ask again. The loan
-   API saw Alice's own token and recorded Alice as the actor, not a service account.
-3. Do it again for Slack and Gmail, as yourself. In the room the Okta sign-in is shared: you
+2. Act as Alice. Ask the agent: *"Read LN-2291 and tell me the borrower."* No authorization
+   link this time: Arcade already holds Alice's grant at the loan API from the first run in
+   [`01-build.md`](./01-build.md), and because the room shares her sign-in, one grant covers
+   everyone. The loan API saw Alice's own token and recorded Alice as the actor, not a
+   service account. Running this yourself after the day, the first loan desk call is where
+   that link appears.
+3. Now as yourself, for Slack and Gmail. This is the authorization you see with your own eyes. In the room the Okta sign-in is shared: you
    are one of four Alices. Your Gmail and Slack are not. Run `ask.py` with your own address,
 
        uv run --env-file .env python ask.py --as <your email> "Email me the summary of LN-2291"
@@ -54,8 +56,8 @@ watched Bob, who has no approval authority, never see the approval tool at all.
 
 ## Checkpoint
 
-Three providers authorized, the loan desk as Alice and Gmail and Slack as you, and Bob's agent
-with no approval tool.
+Gmail and Slack authorized as you, the loan desk running as Alice on the room's shared grant,
+and Bob's agent with no approval tool.
 
 ## If you are behind
 

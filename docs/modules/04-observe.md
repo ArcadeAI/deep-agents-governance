@@ -4,7 +4,7 @@
 insights, on the runs you just made.
 
 LangChain owns this block's content and slides. What this repo gives it is a deployment with
-real traces on it: every run from [`01-build.md`](./01-build.md) onward went through the agent
+real traces on it: every run since the deploy in [`01-build.md`](./01-build.md) went through the agent
 you deployed with `mda deploy`, and every governed tool call in it has a matching audit row.
 
 ## What you have to look at
