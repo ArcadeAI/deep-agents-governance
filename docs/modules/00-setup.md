@@ -2,58 +2,60 @@
 
 **9:00 to 9:15. Joint.** The agenda, the people, and a laptop that can run the rest.
 
-You leave with the app registered with Arcade, running on your laptop behind a tunnel, with you
-in it as the loan officer. Everything after this is one of the two products doing its part on
-that build.
+You leave with the agent on your laptop, pointed at the room's loan desk, and signed in to it
+as Alice. Everything after this is one of the two products doing its part on that build.
+
+In the room, nobody registers anything. The host runs one deployment of the whole repo: the
+loan desk app behind its tunnel, one Okta org as its identity provider, one Arcade project
+with the tools, the verifier and the hooks in it. You run only the agent, `agent/`, against
+that deployment, with the values the host hands out. The Okta sign-in is a shared persona:
+you are one of several Alices. Your Gmail and Slack are your own. Running the whole thing
+yourself, with your own Okta org and Arcade project, is the README's Quickstart, for after
+the day.
 
 ## Before the workshop
 
-Five signups, all with the **same email**:
+Three signups, all with the **same email**:
 
-- An [Arcade](https://api.arcade.dev/dashboard) account and one project in it, with an API key.
-  The project is yours; everything the workshop registers lands there.
-- An Okta Integrator org of your own ([`docs/okta.md`](../okta.md)): it is the loan desk's
-  identity provider, and each attendee runs one. Make an API token in it and keep it in 1Password.
+- An [Arcade](https://api.arcade.dev/dashboard) account. The host invites this email to the
+  room's project before the day, and it is the address you pass to `ask.py --as`: Gmail and
+  Slack are authorized as this account, in your name, not Alice's.
 - The Slack invite the host sent, to the workshop workspace. Accept it with the same email. The
   escalation in [`03-govern.md`](./03-govern.md) is sent from your own Slack account, so you
   have to be in the workspace.
-- An [ngrok](https://ngrok.com) account and its free static domain. Arcade reaches your laptop
-  through it.
 - A LangSmith workspace with Managed Deep Agents beta access, and its API key.
 
 No model key is needed to start: the agent runs a scripted model until you give it one. The
 host shares a model key in the room.
 
+## What you get from the host
+
+Four values for `agent/.env`, and two sign-ins:
+
+- `ARCADE_API_KEY`: a key of the room's Arcade project.
+- `IDP_ISSUER`, `IDP_CLIENT_ID`, `IDP_CLIENT_SECRET`: the room's Okta org and the loan desk's
+  app in it. `ask.py` signs in through this app, which is why it needs the secret.
+- Alice's and Bob's email and password at that Okta org. Alice is the loan officer you work
+  as; Bob is the credit analyst with no approval authority, for [`02-connect.md`](./02-connect.md).
+
+The key and the secret are shared with the room for the day, and the host rotates both after
+it. They go in `agent/.env`, which is gitignored, and nowhere else.
+
 ## What you build
 
-1. Clone and install: the README's Quickstart steps 1 and 2.
-2. Fill in `.env`: `ARCADE_API_KEY`, `APP_PUBLIC_HOST`, and one value for the room,
-   `SLACK_APPROVALS_CHANNEL=C0C83CW2CDN`, the workspace's `#deal-desk-approvals`, so every
-   approval request you raise is posted where everyone sees it.
-3. Make the Okta app, with the token through `op run` and never in the shell:
-
-       OKTA_ORG_URL=https://<org>.okta.com OKTA_API_TOKEN="op://<vault>/<item>/<field>" op run -- bun run okta-setup
-
-4. Register with Arcade: `bun run setup-arcade <APP_PUBLIC_HOST>`. It runs one `arcade deploy`
-   (`mcp`: the Loans and Approvals tools together), mints the OAuth clients, registers the
-   identity provider and the hooks, on. Read what it prints; every name it reports is a name a
-   rule is keyed on later.
-5. Start the app and the tunnel: `bun run dev` and the ngrok command it prints, or `bun run up`
-   for both.
-6. Run the `okta-setup` command from step 3 once more: `setup-arcade` wrote Arcade's callback to
-   `.env`, and this run adds it to the Okta app's redirect URIs.
-7. Add yourself, with the same `op run` prefix:
-
-       bun run users add <your-email> --name Alice --role loan_officer --clearance 50000
-
-   Keep the password it prints once. Open `https://<APP_PUBLIC_HOST>` and sign in as Alice to
-   check it.
+1. Clone and install: `git clone`, `git checkout start`, then `cd agent`, `cp .env.example
+   .env` and `uv sync`. Nothing in the root of the repo needs to run on your laptop.
+2. Fill in `agent/.env`: the four values from the host, your LangSmith key, and
+   `CONNECTED_APPS_USER=<your email>`, the Arcade email from the signups, so you do not have
+   to pass `--as` on every call.
+3. Check the sign-in: open the app's URL the host shared and sign in as Alice. The sign-in page
+   is the room's Okta org. The home page shows you signed in as Alice.
 
 ## Checkpoint
 
-`/health` answers `ok`, and the home page shows you signed in as Alice.
+The app's home page shows you as Alice, and `agent/.env` has six values in it.
 
 ## If you are behind
 
-`git checkout start` is the whole state; nothing here changes code. `okta-setup` and
-`setup-arcade` are idempotent, so run them again.
+`git checkout start` is the whole state; nothing here changes code. The values in `agent/.env`
+are all there is to set up: check them against the host's handout.

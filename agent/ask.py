@@ -7,7 +7,13 @@ Authorization code with PKCE against the loan desk's identity provider (`IDP_ISS
 as the Okta app, caught on loopback (`127.0.0.1:8765`, which `okta-setup` allowlists). The
 endpoints are the ones the issuer's discovery document names (`oidc.py`). The ID token
 goes straight into the run as `Authorization: Bearer` and is never printed. MDA verifies it
-(`identity.py`), and the agent makes every Arcade call as the email inside it.
+(`identity.py`), and the agent makes every loan desk call as the email inside it.
+
+`--as <your email>` (or `CONNECTED_APPS_USER` in `.env`) names the address the agent uses
+for Gmail and Slack instead. Sign in as the shared Alice, pass your own address, and Alice's
+loan clearance is shared while the mailbox the agent sends from is yours. Arcade's verifier
+binds that grant to the Arcade account that opens the link, so the address must be the one
+your Arcade account uses, invited to the project.
 
 `--agent` defaults to `mda dev`'s local server. Standard library only.
 """
@@ -96,8 +102,19 @@ def id_token(endpoint: str, client_id: str, client_secret: str, code: str, verif
         return json.load(response)["id_token"]
 
 
-def ask(agent: str, token: str, prompt: str) -> dict:
-    body = {"assistant_id": ASSISTANT, "input": {"messages": [{"role": "user", "content": prompt}]}}
+CONNECTED_APPS_USER_KEY = "connected_apps_user"
+
+
+def run_body(prompt: str, connected_apps_user: str | None = None) -> dict:
+    """The `/runs/wait` body: the question, and the connected-apps address when there is one."""
+    body: dict = {"assistant_id": ASSISTANT, "input": {"messages": [{"role": "user", "content": prompt}]}}
+    if connected_apps_user:
+        body["config"] = {"configurable": {CONNECTED_APPS_USER_KEY: connected_apps_user}}
+    return body
+
+
+def ask(agent: str, token: str, prompt: str, connected_apps_user: str | None = None) -> dict:
+    body = run_body(prompt, connected_apps_user)
     request = urllib.request.Request(
         f"{agent}/runs/wait",
         data=json.dumps(body).encode(),
@@ -126,7 +143,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("prompt")
     parser.add_argument("--agent", default=os.environ.get("AGENT_URL") or "http://127.0.0.1:2024")
+    parser.add_argument(
+        "--as",
+        dest="connected_apps_user",
+        metavar="EMAIL",
+        default=os.environ.get("CONNECTED_APPS_USER") or None,
+        help="your own address for Gmail and Slack, when the Okta sign-in is a shared persona",
+    )
     args = parser.parse_args()
+    if args.connected_apps_user and "@" not in args.connected_apps_user:
+        sys.exit(f"--as takes an email address, not {args.connected_apps_user!r}.")
 
     missing = [name for name in ("IDP_CLIENT_ID", "IDP_CLIENT_SECRET") if not os.environ.get(name)]
     if not (os.environ.get("IDP_ISSUER") or os.environ.get("LOAN_DESK_ISSUER")):
@@ -143,7 +169,7 @@ def main() -> None:
     code = catch_code(state)
     token = id_token(endpoints["token_endpoint"], os.environ["IDP_CLIENT_ID"], os.environ["IDP_CLIENT_SECRET"], code, verifier)
 
-    print("\n".join(transcript(ask(args.agent.rstrip("/"), token, args.prompt))))
+    print("\n".join(transcript(ask(args.agent.rstrip("/"), token, args.prompt, args.connected_apps_user))))
 
 
 if __name__ == "__main__":

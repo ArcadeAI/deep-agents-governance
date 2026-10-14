@@ -8,8 +8,8 @@ as yourself and read the tool calls it made, and a copy of it deployed on Manage
 
 ## What you build
 
-1. Set up the agent: `cd agent`, `cp .env.example .env`, fill it in from the root `.env` and
-   your LangSmith key, then `uv sync`.
+1. Set up the agent: `cd agent`, `cp .env.example .env`, fill it in from the host's handout
+   ([`00-setup.md`](./00-setup.md)) and your LangSmith key, then `uv sync`.
 2. Serve it locally: `uv run mda dev .`.
 3. Ask it, from a second terminal in `agent`:
 
@@ -29,7 +29,7 @@ as yourself and read the tool calls it made, and a copy of it deployed on Manage
 - `agent/agent.py`: the whole agent is `define_deep_agent` plus one middleware. No tools are
   listed in code; Tool Rec finds them in the project's catalog, which is not scoped to the
   loan desk, so it may offer an unrelated tool too. The hooks govern every call either way.
-- `agent/identity.py`: MDA accepts only ID tokens your Okta org issued for the app, and the
+- `agent/identity.py`: MDA accepts only ID tokens the room's Okta org issued for the app, and the
   `email` claim is who every tool call runs as.
 - `agent/instructions.md`: what the agent is told. It describes the tools and carries no
   limits; read [`docs/agent.md`](../agent.md) for why.

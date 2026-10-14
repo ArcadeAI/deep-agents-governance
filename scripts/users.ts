@@ -3,6 +3,7 @@
  * (#31). There is no open sign-up, so this is how somebody comes to exist.
  *
  *     bun run users add <email> --name <name> --role <role> [--clearance <n>] [--password <p>]
+ *     bun run users add <email> --name <name> --role <role> [--clearance <n>] --no-identity
  *     bun run users list
  *     bun run users set-role <email> <role>
  *     bun run users set-clearance <email> <n>
@@ -25,6 +26,13 @@
  * again. Okta is reached through its Management API (`scripts/okta/`), with
  * `OKTA_API_TOKEN` from the environment and the org from `OKTA_ORG_URL`, or
  * from `IDP_ISSUER`'s origin.
+ *
+ * `--no-identity` writes the subject half only, for somebody who signs in
+ * as a shared Okta persona and runs Gmail and Slack as themselves
+ * (`agent/ask.py --as`): the hooks then know that address, so the Gmail call
+ * made under it is a registered subject's and not denied. It creates nothing
+ * in Okta and takes no `--password`; `remove` takes the subject away and
+ * finds no identity to delete.
  *
  * Somebody already in the org, the admin who made it for one, is given a
  * subject and nothing else: they keep their own Okta password, and `remove`
@@ -130,13 +138,14 @@ const REQUEST_TOOL = "RequestApproval";
 const USAGE = `usage: bun run users <command>
 
   add <email> --name <name> --role <role> [--clearance <n>] [--password <p>]
+  add <email> --name <name> --role <role> [--clearance <n>] --no-identity
   list
   set-role <email> <role>
   set-clearance <email> <n>
   remove <email>
   seed-demo [--alice <email>] [--bob <email>] [--charlie <email>] [--michael <email>] [--password <p>]
 
-add, list, remove and seed-demo reach Okta, with OKTA_API_TOKEN from the environment:
+add, list, remove and seed-demo reach Okta (add --no-identity does not), with OKTA_API_TOKEN from the environment:
   OKTA_API_TOKEN="op://<vault>/<item>/<field>" op run -- bun run users <command>`;
 
 /** A refusal: said on stderr, exit 1, and nothing written. */
@@ -339,9 +348,14 @@ async function add(args: string[]): Promise<void> {
       role: { type: "string" },
       clearance: { type: "string" },
       password: { type: "string" },
+      "no-identity": { type: "boolean", default: false },
     },
   });
   if (positionals.length !== 1) throw new UsageError("add takes one email");
+  const subjectOnly = values["no-identity"] === true;
+  if (subjectOnly && values.password !== undefined) {
+    throw new UsageError("--no-identity creates nobody in Okta, so there is no password to set. Leave out --password");
+  }
   const email = parseEmail(positionals[0]);
   const name = values.name?.trim();
   if (!name) throw new UsageError("--name is required");
@@ -362,6 +376,19 @@ async function add(args: string[]): Promise<void> {
       clearance = 0;
     }
     const subject: NewSubject = { user_id: email, display_name: name, role, clearance };
+
+    if (subjectOnly) {
+      if (readSubject(governance, email) !== null) {
+        throw new Refusal(`${email} already exists; change them with set-role or set-clearance`);
+      }
+      const change = addSubject(governance, subject, actor);
+      console.log(`added ${email}: ${name}, role ${role}, clearance ${clearance}`);
+      console.log(describeChange(change));
+      console.log("  identity   none: signs in to Okta as a shared persona, and runs Gmail and Slack as this address (ask.py --as)");
+      const reminder = inviteReminder(governance, subject);
+      if (reminder) console.log(reminder);
+      return;
+    }
 
     const identity = openIdentity();
     const existing = await standing(identity, governance, email);
@@ -414,7 +441,7 @@ async function list(args: string[]): Promise<void> {
         person && !subject
           ? "in Okta, but has no subject: denied at every hook"
           : subject && !person
-            ? "has a subject, but no identity in Okta: cannot sign in"
+            ? "has a subject, but no identity in Okta: signs in as a shared persona, or not at all"
             : person && !active
               ? `Okta status ${person.status.toLowerCase()}: cannot sign in until it is active`
               : person && !person.ours
