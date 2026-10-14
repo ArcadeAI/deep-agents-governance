@@ -3,9 +3,10 @@
 **9:45 to 10:30. Owner: Arcade.** Who the agent is when it calls a tool, and how it gets
 permission at the moment it needs it.
 
-You leave knowing what the workshop facilitators' `setup-arcade` registered and why each piece is there,
-having authorized a provider as yourself at the moment a tool first needed it, and having
-watched Bob, who has no approval authority, never see the approval tool at all.
+By the end of this module you know what the workshop facilitators' `setup-arcade` registered
+and why each piece is there. You have authorized a provider as yourself at the moment a tool
+first needed it, and watched Bob, who has no approval authority, never see the approval tool
+at all.
 
 ## What you build
 

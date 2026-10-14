@@ -3,8 +3,8 @@
 **10:45 to 11:30. Owner: Arcade.** Acts 2 to 4: a refusal the model cannot argue with, a
 human in the loop, and data the model never sees.
 
-You leave with the four acts run from your agent against the room's deployment: a loan
-officer asks for a $95K loan and "double-check your work", four things go wrong, and the
+By the end of this module you have run the four acts from your agent against the room's
+deployment: a loan officer asks for a $95K loan and "double-check your work", four things go wrong, and the
 control plane catches all four while the model never gets a vote. The agent needs its real model from
 [`01-build.md`](./01-build.md).
 

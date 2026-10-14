@@ -2,7 +2,7 @@
 
 **9:00 to 9:15. Joint.** The agenda, the people, and a laptop that can run the rest.
 
-You leave with the repository cloned, `agent/.env` filled in, and the room's loan desk app
+By the end of this module you have the repository cloned, `agent/.env` filled in, and the room's loan desk app
 open in your browser, signed in as Alice. Nothing runs yet; [`01-build.md`](./01-build.md)
 starts the agent. Everything after this is one of the two products doing its part on that build.
 

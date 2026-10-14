@@ -2,10 +2,11 @@
 
 **9:15 to 9:45. Owner: LangChain.** The agent development lifecycle: build, test, deploy.
 
-You leave with your own Deep Agent deployed on Managed Deep Agents and `ask.py` pointed at
-it, having built it on your laptop under `mda dev` first, asked it one real question as Alice
-and read the tool calls it made. It calls Arcade's Engine directly for the loan desk's six
-tools plus Gmail and Slack. Every module after this runs against that deployment.
+By the end of this module your own Deep Agent is deployed on Managed Deep Agents and
+`ask.py` is pointed at it. You built it on your laptop under `mda dev` first, asked it one
+real question as Alice and read the tool calls it made. It calls Arcade's Engine directly for
+the loan desk's six tools plus Gmail and Slack. Every module after this runs against that
+deployment.
 
 ## What you build
 
