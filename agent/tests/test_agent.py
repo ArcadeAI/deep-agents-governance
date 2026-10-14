@@ -38,6 +38,76 @@ class TestCaller:
         assert loan_desk.signed_in_user(runtime) is None
 
 
+def runtime_with_config(user: Any, configurable: dict[str, Any] | None) -> SimpleNamespace:
+    """A tool runtime: the verified caller, and the run's `config.configurable`."""
+    runtime = runtime_for(user)
+    runtime.config = {"configurable": configurable} if configurable is not None else {}
+    return runtime
+
+
+class FakeTools:
+    """Records every `tools.execute` the provider sends, and answers each with a value."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def execute(self, **kwargs: Any) -> SimpleNamespace:
+        self.calls.append(kwargs)
+        return SimpleNamespace(success=True, output=SimpleNamespace(value={"ok": True}), status="success")
+
+
+def split_provider() -> tuple[loan_desk.SplitIdentityProvider, FakeTools]:
+    tools = FakeTools()
+    client = SimpleNamespace(tools=tools)
+    return loan_desk.SplitIdentityProvider(client=client, user_id_resolver=loan_desk.signed_in_user), tools
+
+
+class TestConnectedAppsUser:
+    """Gmail and Slack as the caller's own address; the loan desk as the persona."""
+
+    def test_the_address_comes_from_the_runs_configurable_lowercased(self) -> None:
+        runtime = runtime_with_config("alice@bank.example", {"connected_apps_user": " Dana@Example.com "})
+        assert loan_desk.connected_apps_user(runtime) == "dana@example.com"
+
+    @pytest.mark.parametrize("configurable", [None, {}, {"connected_apps_user": ""}, {"connected_apps_user": "dana"}, {"connected_apps_user": 7}])
+    def test_anything_but_an_email_is_ignored(self, configurable: dict[str, Any] | None) -> None:
+        assert loan_desk.connected_apps_user(runtime_with_config("alice@bank.example", configurable)) is None
+
+    def test_the_toolkit_is_read_off_either_spelling(self) -> None:
+        assert loan_desk.toolkit_of("LoanDesk.SearchLoans@1.0.0") == "LoanDesk"
+        assert loan_desk.toolkit_of("LoanDesk_SearchLoans") == "LoanDesk"
+        assert loan_desk.toolkit_of("Gmail.SendEmail@3.0.0") == "Gmail"
+
+    def test_loan_desk_runs_as_the_persona_and_gmail_as_the_caller(self) -> None:
+        provider, tools = split_provider()
+        bound = provider.bind(runtime_with_config("alice@bank.example", {"connected_apps_user": "dana@example.com"}))
+
+        bound.execute("LoanDesk.SearchLoans@1.0.0", {"status": "pending"})
+        bound.execute("Gmail.SendEmail@3.0.0", {"to": "x@example.com"})
+        bound.execute("Slack.SendMessage@1.0.0", {"text": "hi"})
+
+        assert [call["user_id"] for call in tools.calls] == ["alice@bank.example", "dana@example.com", "dana@example.com"]
+        # The bound provider itself still answers as the persona: discovery is hers.
+        assert bound.user_id == "alice@bank.example"
+
+    def test_without_an_own_address_everything_is_the_persona(self) -> None:
+        provider, tools = split_provider()
+        bound = provider.bind(runtime_with_config("alice@bank.example", None))
+        bound.execute("Gmail.SendEmail@3.0.0", {})
+        assert [call["user_id"] for call in tools.calls] == ["alice@bank.example"]
+
+    def test_an_own_address_never_substitutes_for_a_missing_sign_in(self) -> None:
+        # No verified persona: the run is refused, whatever it asserts about itself.
+        provider, tools = split_provider()
+        bound = provider.bind(runtime_with_config(None, {"connected_apps_user": "dana@example.com"}))
+        outcome = bound.execute("Gmail.SendEmail@3.0.0", {})
+        assert outcome.success is False
+        assert tools.calls == []
+
+    def test_the_loan_desk_toolkit_follows_arcade_toolkit(self) -> None:
+        assert loan_desk.LOAN_DESK_TOOLKIT == "LoanDesk"
+
+
 class TestWiring:
     def test_the_agent_is_named_and_carries_the_arcade_middleware(self) -> None:
         config = loan_desk.agent.config
@@ -129,6 +199,15 @@ class TestAsk:
         assert query["prompt"] == ["login"]
         # identity.py reads the caller from the `email` claim, so the scope has to ask for it.
         assert query["scope"] == ["openid email"]
+
+    def test_the_run_carries_the_own_address_only_when_given(self) -> None:
+        import ask
+
+        plain = ask.run_body("pending?")
+        assert "config" not in plain
+        assert plain["input"]["messages"] == [{"role": "user", "content": "pending?"}]
+        own = ask.run_body("pending?", "dana@example.com")
+        assert own["config"] == {"configurable": {"connected_apps_user": "dana@example.com"}}
 
     def test_the_transcript_shows_calls_results_and_the_answer(self) -> None:
         import ask

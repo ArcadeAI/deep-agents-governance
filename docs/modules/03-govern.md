@@ -3,39 +3,38 @@
 **10:45 to 11:30. Owner: Arcade.** Acts 2 to 4: a refusal the model cannot argue with, a
 human in the loop, and data the model never sees.
 
-You leave with the four acts running on your own build: a loan officer asks for a $95K loan
-and "double-check your work", four things go wrong, and the control plane catches all four
-while the model never gets a vote. The agent needs its real model from
+You leave with the four acts run from your agent against the room's deployment: a loan
+officer asks for a $95K loan and "double-check your work", four things go wrong, and the
+control plane catches all four while the model never gets a vote. The agent needs its real model from
 [`01-build.md`](./01-build.md).
 
 ## What you build
 
-1. Add the rest of the cast, with the `op run` prefix. Charlie is the VP Credit at $250,000
-   and Michael the chief credit officer at $5,000,000:
-
-       bun run users seed-demo --alice <your-email> --charlie <the approver email the host announces> --bob bob@example.com --michael michael@example.com
-
-   Charlie's email is the one thing that has to be real: the escalation finds the approver in
-   Slack by it. In the room, everyone's Charlie is the host's address, so every DM lands with
-   the host and every request is posted in `#deal-desk-approvals`. Approving is still yours:
-   Charlie signs in to *your* app at your Okta org, with the password the seed printed, in a
-   second browser profile. Nobody else's Charlie is involved.
-2. Confirm the hooks are on: `/hooks/health` reports `status: healthy` and `setup-arcade`
-   printed *hooks: … status active (read back)*. Hooks are created disabled and turned on
-   last, so if they are off, run `setup-arcade` once more.
+1. Meet the rest of the cast. The host seeded it on the room's deployment: Charlie, the VP
+   Credit at $250,000, and Michael, the chief credit officer at $5,000,000. Charlie's email is
+   the one thing that has to be real, because the escalation finds the approver in Slack by
+   it, so Charlie is the host: every request in the room DMs the host and is posted in
+   `#deal-desk-approvals`, and the host approves them from the signed-in approval page, one
+   by one. Running it yourself after the day, `bun run users seed-demo --alice <your-email>
+   --charlie <an email you can read>` puts you in both seats.
+2. Confirm the hooks are on: `/hooks/health` on the app's URL reports `status: healthy`. The
+   host's `setup-arcade` turns them on last, so if they are off, that is the host's one
+   command to rerun.
 3. Run the acts, in the words `README.md` → Try it out uses:
    - **Act 2.** As Alice: *"Approve the loan for Northwind at $95K and double-check your
      work."* `/hooks/pre` refuses, the denial names `LoanDesk_RequestApproval`, the agent
-     calls it, Charlie gets a Slack DM from Alice's own account and the request appears in
+     calls it, Charlie gets a Slack DM from your own Slack account (the `--as` address) and the
+     request appears in
      `#deal-desk-approvals` with the link and no buttons, Alice's turn ends. Charlie approves
      on the signed-in page; Alice asks again and her retry passes on a single-use grant. Then
-     the agent emails the borrower the outcome from Alice's own Gmail, under the same hooks.
+     the agent emails the borrower the outcome from your own Gmail, under the same hooks.
    - **Act 3.** As Alice: *"Read LN-2291 and quote its bank account number and tax ID."* Both
-     come back `[REDACTED]`. As Charlie they come through.
+     come back `[REDACTED]`. As Charlie, on the host's screen, they come through.
    - **Act 4.** Any read of LN-2291 strips the pasted instruction from `underwriter_notes`
-     before the model sees it, for everyone. `INJECTION_DETECTION=off` shows what was prevented.
-4. Edit a rule live. Raise Alice's clearance with `bun run users set-clearance` and watch the
-   same prompt pass within one policy poll, with no restart.
+     before the model sees it, for everyone. The host restarts the app with
+     `INJECTION_DETECTION=off` to show what was prevented.
+4. Edit a rule live. The host raises Alice's clearance with `bun run users set-clearance`, and
+   everyone's Alice watches the same prompt pass within one policy poll, with no restart.
 
 ## What to look at
 
@@ -64,7 +63,7 @@ key, and it never reads `ARCADE_GATEWAY_ID`.
 
        claude mcp add --transport http loan-desk https://api.arcade.dev/mcp/<slug>
 
-   Run `/mcp`, pick `loan-desk`, and sign in. The sign-in page is your Okta org's, because the
+   Run `/mcp`, pick `loan-desk`, and sign in. The sign-in page is the Okta org's, because the
    gateway authenticates through the User Source: you are yourself there, by the same email the
    hooks govern.
 4. Ask it, as Alice: *"Approve loan LN-2291 for 95000."* Claude Code calls
@@ -79,9 +78,10 @@ is, with a note.
 
 ## Checkpoint
 
-All four acts on your own deployment, and one rule edited live.
+All four acts from your agent, and one rule edited live on the room's deployment.
 
 ## If you are behind
 
 Still `git checkout start`. This block is Arcade state, not code: users, hooks on, Slack.
-`bun run reset` puts the loan book and the control plane back between attempts.
+The host's `bun run reset` puts the loan book and the control plane back between attempts,
+for everyone at once, so ask before you count on a pending request surviving it.
