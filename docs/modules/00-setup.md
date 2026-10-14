@@ -21,9 +21,11 @@ Three signups, all with the **same email**:
 - An [Arcade](https://api.arcade.dev/dashboard) account. The facilitators invite this email to the
   room's project before the day, and it is the address you pass to `ask.py --as`: Gmail and
   Slack are authorized as this account, in your name, not Alice's.
-- The Slack invite the facilitators sent, to the workshop workspace. Accept it with the same email. The
-  escalation in [`03-govern.md`](./03-govern.md) is sent from your own Slack account, so you
-  have to be in the workspace.
+- The Slack invite the facilitators sent, to the workshop workspace. Accept it with the same email.
+  The agent's own Slack calls in [`03-govern.md`](./03-govern.md) run as you, so you have to be
+  in the workspace. The escalation DM is the one exception: it goes out from Alice's Slack,
+  which the facilitators authorized once, because the approval grant it opens has to belong
+  to the same person who retries the approval.
 - A LangSmith workspace with Managed Deep Agents beta access, and its API key.
 
 No model key is needed to start: the agent runs a scripted model until you give it one. The

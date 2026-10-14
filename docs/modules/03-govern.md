@@ -23,9 +23,10 @@ control plane catches all four while the model never gets a vote. The agent need
 3. Run the acts, in the words `README.md` → Try it out uses:
    - **Act 2.** As Alice: *"Approve the loan for Northwind at $95K and double-check your
      work."* `/hooks/pre` refuses, the denial names `LoanDesk_RequestApproval`, the agent
-     calls it, Charlie gets a Slack DM from your own Slack account (the `--as` address) and the
-     request appears in
-     `#deal-desk-approvals` with the link and no buttons, Alice's turn ends. Charlie approves
+     calls it, Charlie gets a Slack DM from Alice's Slack account and the request appears in
+     `#deal-desk-approvals` with the link and no buttons, Alice's turn ends. The DM is Alice's,
+     not yours, because `LoanDesk_RequestApproval` is a loan desk tool and runs as the persona:
+     the grant it opens is keyed to the requester, and the retry comes from Alice. Charlie approves
      on the signed-in page; Alice asks again and her retry passes on a single-use grant. Then
      the agent emails the borrower the outcome from your own Gmail, under the same hooks.
    - **Act 3.** As Alice: *"Read LN-2291 and quote its bank account number and tax ID."* Both

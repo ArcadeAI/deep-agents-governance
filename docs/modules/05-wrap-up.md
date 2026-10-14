@@ -8,7 +8,7 @@ Run it from `ask.py`, as Alice, against the room's deployment:
 
 Watch the panel. Access hid a tool from Bob earlier; pre refuses Alice and routes to
 Charlie; post masks the identifiers and strips the note. Once Charlie approves and the
-retry lands, the agent emails the borrower the outcome from Alice's own Gmail, under the same
+retry lands, the agent emails the borrower the outcome from your own Gmail, under the same
 hooks. Then the facilitators edit one rule on stage, with `bun run users set-clearance`, and
 everyone runs the prompt again.
 
