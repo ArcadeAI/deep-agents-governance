@@ -5,7 +5,9 @@ One middleware does the Arcade work: Sam Partee's `ArcadeMiddleware` (vendored i
 Arcade engine directly, with the project key. There is no gateway, so Tool Rec is not
 scoped to the loan desk: it may also offer catalog tools such as Ashby or ClickUp. That is
 fine because nothing relies on search to hide a tool. The project's hooks govern every call,
-whichever tool the model picked.
+whichever tool the model picked. The loan desk's own tools do not wait for Tool Rec at all:
+every selection starts with them, read from the project's tool list (see
+`SplitIdentityProvider.select`).
 
 Two identities, one run. MDA verifies the caller's ID token from the app's identity
 provider (`identity.py`) and hands the verified email to the middleware as
@@ -33,7 +35,9 @@ import os
 from typing import Any
 
 from langchain_arcade import ArcadeMiddleware
-from langchain_arcade.provider import EngineProvider
+from langchain_arcade import SelectedTool
+from langchain_arcade._schema import parse_tools
+from langchain_arcade.provider import DEFAULT_SELECT_LIMIT, DiscoveryUnavailableError, EngineProvider
 from managed_deepagents import define_deep_agent
 
 from scripted import ScriptedModel
@@ -88,6 +92,59 @@ class SplitIdentityProvider(EngineProvider):
     """
 
     _connected_apps_user: str | None = None
+
+    def select(
+        self, tasks: Any, limit: int = DEFAULT_SELECT_LIMIT, *, user_id: str | None = None
+    ) -> list[SelectedTool]:
+        """Tool Rec's picks, with the loan desk's own tools ahead of them, every time.
+
+        Arcade indexes a freshly deployed server's tools for Tool Recommendation in the
+        background. Until that is done, a loan question gets payment and hiring tools from
+        the catalog instead (seen 2026-10-19 with a Loan Desk deployed that day; one deployed
+        two days earlier was indexed), and even once indexed, the loan desk's six tools compete
+        with the whole catalog for the top places. The loan desk is the one toolkit this agent
+        exists for, so its tools come from the project's tool list, which is immediate, and
+        selection adds the rest. A selector outage still leaves the loan desk callable.
+        """
+        pinned = self.loan_desk_tools()
+        try:
+            found = super().select(tasks, limit, user_id=user_id)
+        except DiscoveryUnavailableError:
+            if not pinned:
+                raise
+            found = []
+        names = {tool.name for tool in pinned}
+        return [*pinned, *(tool for tool in found if tool.name not in names)]
+
+    def loan_desk_tools(self) -> list[SelectedTool]:
+        """The loan desk toolkit as the project lists it now; empty when the list cannot be read."""
+        try:
+            payload = self._client.get(
+                "/v1/tools",
+                options={"params": {"toolkit": LOAN_DESK_TOOLKIT, "limit": 100}},
+                cast_to=object,
+            )
+        except Exception:  # noqa: BLE001 - a missing list only means no pinning this turn
+            return []
+        items = payload.get("items") if isinstance(payload, dict) else None
+        entries: list[dict[str, Any]] = []
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            params = item.get("input") if isinstance(item.get("input"), dict) else {}
+            toolkit = item.get("toolkit") if isinstance(item.get("toolkit"), dict) else {}
+            entries.append(
+                {
+                    "tool_name": item.get("fully_qualified_name") or item.get("qualified_name"),
+                    "description": item.get("description"),
+                    # The list carries Arcade parameter descriptors, the shape select uses too.
+                    "input_schema": params.get("parameters") or [],
+                    "requirements": item.get("requirements"),
+                    "toolkit": toolkit.get("name"),
+                }
+            )
+        tools, _ = parse_tools(entries)
+        return tools
 
     def bind(self, runtime: Any) -> EngineProvider:
         bound = super().bind(runtime)

@@ -71,13 +71,18 @@ With `MODEL_ID` unset the agent runs `ScriptedModel`: it selects the loan desk's
 calls `LoanDesk_SearchLoans` for pending requests and answers with what came back. That is
 enough to prove the sign-in and the hooks with no model key.
 
-## Tool Rec is unscoped
+## Tool Rec is unscoped, the loan desk is pinned
 
 With no gateway, Tool Rec searches the whole catalog, not just the loan desk. It may offer
-catalog tools such as Ashby or ClickUp alongside the six LoanDesk tools and Gmail and Slack.
-The project's hooks still govern every call the agent makes, so nothing here relies on
-search to hide a tool: a tool the hooks refuse is refused when it is called, whoever found
-it.
+catalog tools such as Ashby or ClickUp alongside Gmail and Slack. The project's hooks still
+govern every call the agent makes, so nothing here relies on search to hide a tool: a tool
+the hooks refuse is refused when it is called, whoever found it.
+
+The six LoanDesk tools never depend on Tool Rec. Arcade indexes a newly deployed server's
+tools in the background, and until then a loan question would get payment or hiring tools
+instead; so every selection starts with the loan desk toolkit as the project lists it
+(`GET /v1/tools?toolkit=LoanDesk`), and Tool Rec adds the rest. `ARCADE_TOOLKIT` renames the
+pinned toolkit.
 
 For a real model:
 

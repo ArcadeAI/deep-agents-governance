@@ -164,6 +164,92 @@ class TestIdentity:
             loan_desk_identity.required("IDP_CLIENT_ID")
 
 
+LISTED_LOAN_DESK = {
+    "items": [
+        {
+            "fully_qualified_name": "LoanDesk.SearchLoans@1.0.0",
+            "qualified_name": "LoanDesk.SearchLoans",
+            "name": "SearchLoans",
+            "description": "Loan applications by status.",
+            "toolkit": {"name": "LoanDesk", "version": "1.0.0"},
+            "input": {"parameters": [{"name": "status", "required": False, "value_schema": {"val_type": "string"}}]},
+            "requirements": {"authorization": {"provider_id": "loan-desk"}},
+        },
+        {
+            "fully_qualified_name": "LoanDesk.ApproveLoan@1.0.0",
+            "qualified_name": "LoanDesk.ApproveLoan",
+            "name": "ApproveLoan",
+            "description": "Approve one.",
+            "toolkit": {"name": "LoanDesk", "version": "1.0.0"},
+            "input": {"parameters": []},
+        },
+    ]
+}
+RECOMMENDED = {
+    "query_id": "q1",
+    "results": [
+        {
+            "task": "pending loans",
+            "suggestions": [
+                {"tool_name": "Ashby.ListApplications", "version": "1.0.0", "description": "Hiring."},
+                {"tool_name": "LoanDesk.SearchLoans", "version": "1.0.0", "description": "Loan applications by status."},
+            ],
+        }
+    ],
+}
+
+
+class ListingClient:
+    """A client whose tool list is the loan desk and whose selector answers as told."""
+
+    def __init__(self, listed: Any = LISTED_LOAN_DESK, selected: Any = RECOMMENDED) -> None:
+        self.listed, self.selected, self.tools = listed, selected, FakeTools()
+        self.gets: list[dict[str, Any]] = []
+
+    def get(self, path: str, *, options: dict[str, Any], cast_to: Any) -> Any:
+        self.gets.append({"path": path, **options})
+        if isinstance(self.listed, Exception):
+            raise self.listed
+        return self.listed
+
+    def post(self, path: str, *, body: dict[str, Any], cast_to: Any) -> Any:
+        if isinstance(self.selected, Exception):
+            raise self.selected
+        return self.selected
+
+
+class TestLoanDeskIsPinned:
+    """Selection starts with the loan desk as the project lists it, whatever Tool Rec says."""
+
+    def test_the_loan_desk_comes_first_and_is_not_repeated(self) -> None:
+        client = ListingClient()
+        provider = loan_desk.SplitIdentityProvider(client=client, user_id_resolver=loan_desk.signed_in_user)
+        names = [t.name for t in provider.select(["pending loans"])]
+        assert names == ["LoanDesk_SearchLoans", "LoanDesk_ApproveLoan", "Ashby_ListApplications"]
+        assert client.gets == [{"path": "/v1/tools", "params": {"toolkit": "LoanDesk", "limit": 100}}]
+
+    def test_the_listed_schema_is_translated(self) -> None:
+        provider = loan_desk.SplitIdentityProvider(client=ListingClient(), user_id_resolver=loan_desk.signed_in_user)
+        search = provider.loan_desk_tools()[0]
+        assert search.fqn == "LoanDesk.SearchLoans@1.0.0"
+        assert search.input_schema["properties"]["status"]["type"] == "string"
+        assert search.requires_auth is True
+
+    def test_a_selector_outage_still_leaves_the_loan_desk(self) -> None:
+        client = ListingClient(selected=RuntimeError("503"))
+        provider = loan_desk.SplitIdentityProvider(client=client, user_id_resolver=loan_desk.signed_in_user)
+        assert [t.name for t in provider.select(["pending loans"])] == ["LoanDesk_SearchLoans", "LoanDesk_ApproveLoan"]
+
+    def test_with_nothing_listed_the_selector_decides_and_its_outage_is_still_one(self) -> None:
+        from langchain_arcade.provider import DiscoveryUnavailableError
+
+        quiet = loan_desk.SplitIdentityProvider(client=ListingClient(listed={"items": []}), user_id_resolver=loan_desk.signed_in_user)
+        assert [t.name for t in quiet.select(["pending loans"])] == ["Ashby_ListApplications", "LoanDesk_SearchLoans"]
+        down = loan_desk.SplitIdentityProvider(client=ListingClient(listed=RuntimeError("no"), selected=RuntimeError("503")), user_id_resolver=loan_desk.signed_in_user)
+        with pytest.raises(DiscoveryUnavailableError):
+            down.select(["pending loans"])
+
+
 class TestScriptedRun:
     def test_select_then_search_then_answer(self) -> None:
         seen: list[dict[str, Any]] = []
