@@ -63,7 +63,7 @@ decoded result — so the host supplies whichever client it already runs.
 
 Because the hub speaks the envelope model, `execute` sends `query_id` — which
 promotion keeps out of the model's hands but the client still carries, so
-Condex selection logs correlate discovery with execution.
+Tool Recommendation's selection logs correlate discovery with execution.
 """
 
 from __future__ import annotations
@@ -581,7 +581,7 @@ class ArcadeCloudProvider:
         """Parse a hub discovery payload, distinguishing failure from zero-match.
 
         The hub proxies the Engine's selection response, which sets `query_id`
-        only from a task that reached Condex. An empty result with no
+        only from a task that reached Tool Recommendation. An empty result with no
         correlation id therefore means the call did not run, which is what a
         health-gated Engine returns on this path.
 

@@ -12,7 +12,7 @@ deployment.
 
 1. Set up the agent: `cd agent`, `cp .env.example .env`, fill it in from the facilitators' handout
    ([`00-setup.md`](./00-setup.md)) and your LangSmith key, then `uv sync`.
-2. Serve it locally: `uv run mda dev .`.
+2. Serve it locally: `uv run mda dev . --no-browser` (the agent takes only the identity provider's tokens, so LangGraph Studio could not connect; the flag keeps it from opening).
 3. Ask it, from a second terminal in `agent`:
 
        uv run --env-file .env python ask.py "Which loan applications are pending?"

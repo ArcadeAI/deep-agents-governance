@@ -4,7 +4,7 @@
 here:
 
 * `EngineProvider` — talks to an Arcade Engine (cloud or self-hosted). Semantic
-  selection goes to `POST /v1/tools/select`, which is Condex-backed and is the
+  selection goes to `POST /v1/tools/select`, Tool Recommendation's endpoint and the
   same path the `Arcade.SelectTools` builtin uses.
 * `StaticProvider` — an in-memory catalog with keyword scoring. Runs the whole
   discovery loop with no network, which is what the tests and the offline
@@ -52,7 +52,7 @@ class DiscoveryUnavailableError(RuntimeError):
     list is the only thing a provider can say — and it has to mean both "the
     catalog holds nothing for this" and "the call never happened". Those need
     opposite responses from a model: reword the task, versus stop and report an
-    outage. Conflating them is how a transient Condex failure becomes an agent
+    outage. Conflating them is how a transient Tool Recommendation failure becomes an agent
     telling a user that Slack integration does not exist.
 
     Providers raise this for the second case. `ArcadeMiddleware` catches it and
@@ -219,7 +219,7 @@ class ArcadeProvider(Protocol):
             user_id: Arcade user identity to execute as.
             query_id: Selection that surfaced this tool. Promotion keeps this
                 out of the model's hands, but passing it through preserves the
-                discovery-to-execution correlation Condex logs.
+                discovery-to-execution correlation Tool Recommendation logs.
 
         Returns:
             The execution outcome, including any authorization prompt.
@@ -402,8 +402,8 @@ class EngineProvider:
         """Parse a discovery payload, distinguishing failure from zero-match.
 
         The Engine sets `query_id` only from a task that actually reached
-        Condex, and the field is `omitempty`. So an empty result carrying a
-        `query_id` means Condex ran and matched nothing, while an empty result
+        Tool Recommendation, and the field is `omitempty`. So an empty result
+        carrying a `query_id` means the selector ran and matched nothing, while an empty result
         with no `query_id` means the call failed — the response shape a
         health-gated Engine returns on the MCP path, and the one that otherwise
         reaches the model as "no tools matched".
@@ -429,7 +429,7 @@ class EngineProvider:
         *,
         user_id: str | None = None,
     ) -> list[SelectedTool]:
-        """Select tools for `tasks` via the Engine's Condex-backed selector.
+        """Select tools for `tasks` via the Engine's Tool Recommendation selector.
 
         Args:
             tasks: Plain-English task descriptions.

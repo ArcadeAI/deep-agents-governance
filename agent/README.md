@@ -20,7 +20,7 @@ directory, the way MDA wants it:
 ```sh
 cp .env.example .env    # then fill it in; the file says where each value comes from
 uv sync
-uv run mda dev .
+uv run mda dev . --no-browser   # Studio cannot sign in with the workshop identity provider, so don't open it
 ```
 
 In another terminal, from this directory:
