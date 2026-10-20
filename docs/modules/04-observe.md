@@ -3,6 +3,8 @@
 **11:30 to 12:30. Owner: LangChain.** Tracing, dashboards, online evals, user feedback and
 insights, on the runs you just made.
 
+> **Note, October 20:** this page predates the attendee portal at https://arcadeworkshop.dev. On the day, every value in `agent/.env` comes from the portal's steps, each attendee has their own Arcade project, identity and loan book, and Alice and Bob are gone: the agent acts as you. LangChain is rewriting this page for the portal.
+
 LangChain owns this block's content and slides. What this repo gives it is a deployment with
 real traces on it: every run since the deploy in [`01-build.md`](./01-build.md) went through the agent
 you deployed with `mda deploy`, and every governed tool call in it has a matching audit row.

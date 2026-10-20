@@ -2,6 +2,8 @@
 
 **9:15 to 9:45. Owner: LangChain.** The agent development lifecycle: build, test, deploy.
 
+> **Note, October 20:** this page predates the attendee portal at https://arcadeworkshop.dev. On the day, every value in `agent/.env` comes from the portal's steps, each attendee has their own Arcade project, identity and loan book, and Alice and Bob are gone: the agent acts as you. LangChain is rewriting this page for the portal.
+
 By the end of this module your own Deep Agent is deployed on Managed Deep Agents and
 `ask.py` is pointed at it. You built it on your laptop under `mda dev` first, asked it one
 real question as Alice and read the tool calls it made. It calls Arcade's Engine directly for

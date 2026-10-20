@@ -1,49 +1,17 @@
 # Governing agent actions with policy hooks and human approval
 
-**10:45 to 11:30. Owner: Arcade.** Acts 2 to 4: a refusal the model cannot argue with, a
-human in the loop, and data the model never sees.
+**10:45 to 11:30. Owner: Arcade.**
 
-By the end of this module you have run the four acts from your agent against the room's
-deployment: a loan officer asks for a $95K loan and "double-check your work", four things go wrong, and the
-control plane catches all four while the model never gets a vote. The agent needs its real model from
-[`01-build.md`](./01-build.md).
+This block runs in the attendee portal at https://arcadeworkshop.dev. Sign in there with your email and the workshop code from your welcome mail; the portal provisions your own Arcade project, identity, loan book and policy, and walks you through the steps below. This page predates the portal and only says where its content went.
 
-## What you build
+## In the portal
 
-1. Meet the rest of the cast. The workshop facilitators seeded it on the room's deployment: Charlie, the VP
-   Credit at $250,000, and Michael, the chief credit officer at $5,000,000. Charlie's email is
-   the one thing that has to be real, because the escalation finds the approver in Slack by
-   it, so Charlie is a facilitator: every request in the room DMs that facilitator and is posted in
-   `#deal-desk-approvals`, and they approve them from the signed-in approval page, one
-   by one. Running it yourself after the day, `bun run users seed-demo --alice <your-email>
-   --charlie <an email you can read>` puts you in both seats.
-2. Confirm the hooks are on: `/hooks/health` on the app's URL reports `status: healthy`. The
-   facilitators' `setup-arcade` turns them on last, so if they are off, that is their one
-   command to rerun.
-3. Run the acts, in the words `README.md` → Try it out uses:
-   - **Act 2.** As Alice: *"Approve the loan for Northwind at $95K and double-check your
-     work."* `/hooks/pre` refuses, the denial names `LoanDesk_RequestApproval`, the agent
-     calls it, Charlie gets a Slack DM from Alice's Slack account and the request appears in
-     `#deal-desk-approvals` with the link and no buttons, Alice's turn ends. The DM is Alice's,
-     not yours, because `LoanDesk_RequestApproval` is a loan desk tool and runs as the persona:
-     the grant it opens is keyed to the requester, and the retry comes from Alice. Charlie approves
-     on the signed-in page; Alice asks again and her retry passes on a single-use grant. Then
-     the agent emails the borrower the outcome from your own Gmail, under the same hooks.
-   - **Act 3.** As Alice: *"Read LN-2291 and quote its bank account number and tax ID."* Both
-     come back `[REDACTED]`. As Charlie, on a facilitator's screen, they come through.
-   - **Act 4.** Any read of LN-2291 strips the pasted instruction from `underwriter_notes`
-     before the model sees it, for everyone. The facilitators restart the app with
-     `INJECTION_DETECTION=off` to show what was prevented.
-4. Edit a rule live. The facilitators raise Alice's clearance with `bun run users set-clearance`, and
-   everyone's Alice watches the same prompt pass within one policy poll, with no restart.
+- **Turn on contextual access**: your own tenant, and the extension with three hooks wired into your project.
+- **Set your policies**: the Loan Desk policy, where approval requests go, and the requests as they land.
+- **End to end**: one request, three tools: approve the $15,500 loan, tell the room, mail the borrower.
+- **Make it safer**: ask for the $95,000 approval, and your own policy refuses it, routes it to a human and logs every step.
 
-## What to look at
-
-- `gate/policies/governance.json`: every rule, keyed on `Toolkit.Tool` with
-  the model-facing sentence in `Toolkit_Tool` spelling. The catalogue is a closed world.
-- `gate/engine/src/policy-engine.ts` and `redaction-engine.ts`: pure, no
-  domain words, the same engine for every act.
-- `/panel`: one card per hook decision, with the audit row's reference on it.
+Loan ids are per attendee: your two-digit seat number, then the last two digits of the loan's id, so LN-2291 reads LN-1491 in seat 14. The borrowers and amounts are the same for everyone.
 
 ## Take it home: the same governance from an MCP client
 
@@ -77,12 +45,3 @@ dashboard; `components/identity/McpClientPanel.tsx` is the one surface that read
 `ARCADE_GATEWAY_ID`. `setup-arcade` without the flag leaves a gateway already in `.env` as it
 is, with a note.
 
-## Checkpoint
-
-All four acts from your agent, and one rule edited live on the room's deployment.
-
-## If you are behind
-
-Still `git checkout start`. This block is Arcade state, not code: users, hooks on, Slack.
-The facilitators' `bun run reset` puts the loan book and the control plane back between attempts,
-for everyone at once, so ask before you count on a pending request surviving it.
