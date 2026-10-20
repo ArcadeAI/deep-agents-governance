@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import TYPE_CHECKING, Annotated, Any, Literal, NotRequired
 
 from langchain.agents.middleware.types import AgentMiddleware, AgentState
@@ -63,6 +64,8 @@ if TYPE_CHECKING:
     from langchain_arcade.provider import ArcadeProvider, ToolExecution
 
 from langchain_arcade.provider import DiscoveryUnavailableError
+
+_log = logging.getLogger(__name__)
 
 REQUIRED_TEMPLATES = (
     "auth_caveat",
@@ -518,7 +521,7 @@ class ArcadeMiddleware(AgentMiddleware[ArcadeState, Any, Any]):
     # Role handlers
     # ------------------------------------------------------------------
 
-    def _unavailable(self, call_id: str, name: str) -> ToolMessage:
+    def _unavailable(self, call_id: str, name: str, reason: str) -> ToolMessage:
         """Report that discovery could not run, distinctly from finding nothing.
 
         The wording matters as much as the status. A model told "nothing
@@ -526,16 +529,24 @@ class ArcadeMiddleware(AgentMiddleware[ArcadeState, Any, Any]):
         to the user; a model told the service is down waits. Both are empty
         results — only the text separates them.
 
+        The reason (the Engine's status and body, as the provider raised it) goes
+        two places: the server log, where whoever runs the agent looks first, and
+        the end of the tool message, so the model can pass it on when asked. A
+        bare "temporarily unavailable" leaves a stale extension on the project, or
+        a dead hook URL, indistinguishable from an Arcade outage.
+
         Args:
             call_id: Tool call to answer.
             name: Advertised name of the meta-tool that was called.
+            reason: Why discovery did not run, from the raised error.
 
         Returns:
             An error `ToolMessage` carrying the profile's `discovery_unavailable`
-            text.
+            text and the reason.
         """
+        _log.warning("Tool discovery unavailable: %s", reason)
         return ToolMessage(
-            content=self._profile.render("discovery_unavailable"),
+            content=f"{self._profile.render('discovery_unavailable')}\n\nReason, for whoever runs this agent: {reason}",
             name=name,
             tool_call_id=call_id,
             status="error",
@@ -558,8 +569,8 @@ class ArcadeMiddleware(AgentMiddleware[ArcadeState, Any, Any]):
         limit = _int_or(args.get("limit"), self._select_limit)
         try:
             found = provider.select(tasks, limit, user_id=user_id)
-        except DiscoveryUnavailableError:
-            return self._unavailable(call_id, self._profile.name_of("select"))
+        except DiscoveryUnavailableError as exc:
+            return self._unavailable(call_id, self._profile.name_of("select"), str(exc))
         return self._promote(
             found,
             call_id,
@@ -575,8 +586,8 @@ class ArcadeMiddleware(AgentMiddleware[ArcadeState, Any, Any]):
         name = self._profile.name_of("search")
         try:
             found = provider.search(query, limit, user_id=user_id)
-        except DiscoveryUnavailableError:
-            return self._unavailable(call_id, name)
+        except DiscoveryUnavailableError as exc:
+            return self._unavailable(call_id, name, str(exc))
         if not found:
             content = self._profile.render("search_no_match", query=repr(query))
         else:

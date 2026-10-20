@@ -4,7 +4,8 @@
     uv run --env-file .env python ask.py --agent https://<deployment> "Approve LN-2291 at $95K"
 
 Authorization code with PKCE against the loan desk's identity provider (`IDP_ISSUER`, Okta),
-as the Okta app, caught on loopback (`127.0.0.1:8765`, which `okta-setup` allowlists). The
+as the Okta app, caught on loopback (`127.0.0.1:8765`, which `okta-setup` allowlists; the port
+is fixed by that allowlist, and a run that is not signed in within five minutes frees it). The
 endpoints are the ones the issuer's discovery document names (`oidc.py`). The ID token
 goes straight into the run as `Authorization: Bearer` and is never printed. MDA verifies it
 (`identity.py`), and the agent makes every loan desk call as the email inside it.
@@ -66,7 +67,32 @@ def authorize_url(endpoint: str, client_id: str, challenge: str, state: str) -> 
     })
 
 
-def catch_code(state: str) -> str:
+SIGN_IN_WAIT = 300  # seconds a sign-in may take before this run gives up and frees the port
+
+
+def listen() -> http.server.HTTPServer:
+    """Bind the loopback callback before the browser opens, so a taken port is a message, not a traceback.
+
+    The port cannot move: the identity provider sends the sign-in back only to the address
+    its app allows, and that is this one. What usually holds it is an earlier `ask.py` whose
+    sign-in was never finished, which `SIGN_IN_WAIT` now bounds.
+    """
+    try:
+        return http.server.HTTPServer(CALLBACK, _Callback)
+    except OSError as exc:
+        host, port = CALLBACK
+        sys.exit(
+            f"{host}:{port} is in use ({exc.strerror}). The identity provider sends the sign-in back only to this "
+            f"port, so ask.py cannot pick another. Usually an earlier ask.py is still waiting for a sign-in: "
+            f"free the port with `lsof -ti :{port} | xargs kill`, then ask again."
+        )
+
+
+class _Callback(http.server.BaseHTTPRequestHandler):
+    """Placeholder; `catch_code` installs the handler that knows this run's `state`."""
+
+
+def catch_code(server: http.server.HTTPServer, state: str) -> str:
     """Serve one request on loopback and return its `code`, refusing a foreign `state`."""
     caught: dict[str, str] = {}
 
@@ -86,10 +112,12 @@ def catch_code(state: str) -> str:
         def log_message(self, *_: object) -> None:
             pass
 
-    with http.server.HTTPServer(CALLBACK, Callback) as server:
+    with server:
+        server.RequestHandlerClass = Callback
+        server.timeout = SIGN_IN_WAIT
         server.handle_request()
     if "code" not in caught:
-        sys.exit("Sign-in did not come back with a code for this request.")
+        sys.exit(f"No sign-in came back within {SIGN_IN_WAIT // 60} minutes. Run ask.py again to retry.")
     return caught["code"]
 
 
@@ -206,9 +234,10 @@ def main() -> None:
         verifier, challenge = pkce()
         state = secrets.token_urlsafe(16)
         url = authorize_url(endpoints["authorization_endpoint"], os.environ["IDP_CLIENT_ID"], challenge, state)
+        server = listen()
         print(f"Sign in as the person asking: {url}", file=sys.stderr)
         webbrowser.open(url)
-        code = catch_code(state)
+        code = catch_code(server, state)
         token = id_token(endpoints["token_endpoint"], os.environ["IDP_CLIENT_ID"], os.environ["IDP_CLIENT_SECRET"], code, verifier)
         keep_session(kept, token)
     who = claims(token)
