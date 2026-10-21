@@ -8,14 +8,23 @@ dependencies = [
     "deepagents>=0.7.0,<0.8.0",
     "arcadepy>=1.0.0",
     "pyyaml>=6.0",
+    "langchain-openai>=1.0",
 ]
 
 [project.optional-dependencies]
-# Only for a real model. The scripted one needs none of these.
+# Only for a real model. The scripted one needs none of these. langchain-openai is in
+# the dependencies above instead, because `mda dev` and `mda deploy` build their venv from
+# the dependency list alone, and an extra never reaches the agent they run.
 anthropic = ["langchain-anthropic>=1.0"]
 
 [dependency-groups]
 dev = ["pytest>=8.0.0"]
+# Module 04: the notebook, the LangSmith client and the audit reader. `uv sync --group evals`.
+evals = [
+    "langsmith>=0.4",
+    "requests>=2.32",
+    "jupyterlab>=4.2",
+]
 
 [tool.uv]
 package = false

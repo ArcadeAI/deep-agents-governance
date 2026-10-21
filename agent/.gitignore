@@ -5,3 +5,4 @@
 .mda/
 .langgraph_api/
 __pycache__/
+.ipynb_checkpoints/
