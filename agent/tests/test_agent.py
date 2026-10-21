@@ -324,6 +324,15 @@ class TestAsk:
         own = ask.run_body("pending?", "dana@example.com")
         assert own["config"] == {"configurable": {"connected_apps_user": "dana@example.com"}}
 
+    def test_a_failed_run_is_named_not_silent(self) -> None:
+        """`/runs/wait` answers a crashed run with `__error__` and no messages; the user must hear why."""
+        import ask
+
+        failed = {"__error__": {"error": "ValueError", "message": "MODEL_ID names no provider"}}
+        assert ask.failure(failed) == "ValueError: MODEL_ID names no provider"
+        assert ask.transcript(failed) == []
+        assert ask.failure({"messages": []}) is None
+
     def test_the_transcript_shows_calls_results_and_the_answer(self) -> None:
         import ask
 

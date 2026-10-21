@@ -35,6 +35,7 @@ import os
 import secrets
 import sys
 import urllib.parse
+import urllib.error
 import urllib.request
 import webbrowser
 from datetime import datetime
@@ -201,6 +202,20 @@ def transcript(result: dict) -> list[str]:
     return lines
 
 
+def failure(result: dict) -> str | None:
+    """What went wrong, when the run ended in an error instead of messages, else None.
+
+    `/runs/wait` answers a failed run with `{"__error__": {"error": <class>, "message": <text>}}`
+    and no messages: a run that only printed the transcript would print nothing at all.
+    """
+    error = result.get("__error__")
+    if error is None:
+        return None
+    if isinstance(error, dict):
+        return f"{error.get('error', 'Error')}: {error.get('message', '')}".rstrip(": ")
+    return str(error)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("prompt")
@@ -244,7 +259,13 @@ def main() -> None:
     until = datetime.fromtimestamp(who.get("exp", 0)).strftime("%H:%M")
     print(f"Asking as {who.get('email', '?')}, signed in until {until}. --sign-in to be somebody else.", file=sys.stderr)
 
-    print("\n".join(transcript(ask(args.agent.rstrip("/"), token, args.prompt, args.connected_apps_user))))
+    try:
+        result = ask(args.agent.rstrip("/"), token, args.prompt, args.connected_apps_user)
+    except urllib.error.HTTPError as e:
+        sys.exit(f"The agent answered {e.code} {e.reason}: {e.read().decode(errors='replace')[:600]}")
+    if (why := failure(result)) is not None:
+        sys.exit(f"The run failed inside the agent, so there is no transcript. {why}\nThe agent's own terminal (mda dev) has the traceback.")
+    print("\n".join(transcript(result)))
 
 
 if __name__ == "__main__":
