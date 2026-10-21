@@ -14,6 +14,8 @@ directory, the way MDA wants it:
 | `ask.py` | Signs you in to the app and asks the agent a question from a terminal. |
 | `langchain_arcade/` | Arcade's LangChain middleware, vendored (MIT, see its `LICENSE`). |
 | `tests/` | `uv run --group dev pytest`, offline, no keys. CI runs them. |
+| `evals/` | Module 04: the dataset, the evaluators, the in-process target and the notebook. [`docs/modules/04-observe.md`](../docs/modules/04-observe.md). |
+| `skills/` | Skills the agent reads at `/skills/`, one directory with a `SKILL.md` each. Module 01 adds the first. |
 
 ## Run it
 
@@ -92,6 +94,9 @@ uv sync --extra anthropic
 
 then set `MODEL_ID=anthropic:claude-sonnet-5-5` and `ANTHROPIC_API_KEY` in `.env`. Any
 provider `init_chat_model` knows works the same way, with that provider's package and key.
+With no provider key, set `LANGSMITH_GATEWAY=true` and `LANGSMITH_GATEWAY_API_KEY` to a
+LangSmith key whose workspace holds the provider key as a secret: the call goes through the
+LangSmith LLM Gateway, and the spend lands on that workspace (`.env.example`).
 
 ## When a tool needs authorizing
 
