@@ -83,17 +83,25 @@ LangSmith: yours is there, with a tracing project named after it.
 
 YOU SHOULD SEE: The URL in the terminal, and the deployment in LangSmith.
 
-**Item 2: Give the judge its key.** The judge runs on LangSmith's side, so it cannot read
+**Item 2: Ask it once, as you.** The same `ask.py`, pointed at the deployment instead of your
+laptop. The sign-in from this morning is kept, so no browser unless it expired.
+
+    $ uv run --env-file .env python ask.py --agent <the deployment's URL> "Which loan applications are pending?"
+
+YOU SHOULD SEE: The answer in the terminal, and the run as a trace in the deployment's project,
+with the model call in the `gateway` project beside it.
+
+**Item 3: Give the judge its key.** The judge runs on LangSmith's side, so it cannot read
 `.env`. In LangSmith: Settings, Integrations, Provider Secrets, Add. Provider: Custom. Name:
 `LANGSMITH_GATEWAY_API_KEY`. Value: the room's gateway key from step 2.
 
 YOU SHOULD SEE: The secret listed under Provider Secrets.
 
-**Item 3: Score every run.**
+**Item 4: Score every run.**
 
     $ uv run --group evals --env-file .env python evals/production.py --agent <the deployment's URL>
 
-It asks the deployment once, as you, and finds its tracing project. It puts the judge on that
+It asks the deployment once more, as you, to find its tracing project. It puts the judge on that
 project as a rule named `loan-desk-honest-outcome`. Then, with your threshold back at $50,000,
 it asks the over-limit request for Meridian and waits for the score, up to three minutes. If your experiments already decided
 Meridian, the agent says so, and the judge scores that report.
