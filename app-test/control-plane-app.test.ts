@@ -246,8 +246,8 @@ describe("the control plane, on the app's own port", () => {
     const body = (await response.json()) as Record<string, unknown>;
     expect(HealthResponse.safeParse(body).success).toBe(true);
     expect(HealthResponse.shape.status.unwrap().options).toEqual(["healthy", "degraded", "unhealthy"]);
-    // 20 rows seeded: 4 subjects, 7 catalogue (Gmail.SendEmail since 8377f4a), 6 policy, 2 output, plus the version row.
-    expect(body).toMatchObject({ status: "healthy", service: "hooks", policy: { status: "ready", revision: 20 } });
+    // 23 rows seeded: 4 subjects, 10 catalogue (Gmail.SendEmail since 8377f4a, the rest of Gmail and Slack since fa0d915), 6 policy, 2 output, plus the version row.
+    expect(body).toMatchObject({ status: "healthy", service: "hooks", policy: { status: "ready", revision: 23 } });
   }, 60_000);
 
   test("the app's own /health keeps DESIGN.md's ok|degraded, which Arcade's enum does not have", async () => {
@@ -282,7 +282,7 @@ describe("the control plane, on the app's own port", () => {
     expect(body).toMatchObject({
       service: "web",
       panel_stream: "live",
-      policy: { status: "ready", revision: 20 },
+      policy: { status: "ready", revision: 23 },
       fixture_drift: null,
       // The six patterns over the loan book.
       injection_detection: { state: "armed", patterns: 6 },
@@ -300,7 +300,7 @@ describe("the control plane, on the app's own port", () => {
     expect(await response.json()).toMatchObject({
       reachable: true,
       status: "healthy",
-      policy: { status: "ready", revision: 20, error: null },
+      policy: { status: "ready", revision: 23, error: null },
       fixture_drift: null,
     });
   }, 60_000);

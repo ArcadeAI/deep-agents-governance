@@ -484,7 +484,7 @@ describe("users list", () => {
     const { stdout } = await ok(["list"]);
     expect(stdout).toMatch(/^xan@example\.com\s+Xan\s+vp_credit\s+250000\s+yes\s+yes$/m);
     expect(stdout).toMatch(/^yui@example\.com\s+Yui\s+-\s+-\s+yes\s+no\s+in Okta, but has no subject: denied at every hook$/m);
-    expect(stdout).toMatch(/^zed@example\.com\s+Zed\s+loan_officer\s+5\s+no\s+yes\s+has a subject, but no identity in Okta: cannot sign in$/m);
+    expect(stdout).toMatch(/^zed@example\.com\s+Zed\s+loan_officer\s+5\s+no\s+yes\s+has a subject, but no identity in Okta: signs in as a shared persona, or not at all$/m);
   });
 });
 

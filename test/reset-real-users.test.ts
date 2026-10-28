@@ -274,7 +274,7 @@ describe("drift, with a user `bun run users add` created (#32)", () => {
       [GHOST],
     );
     ghost.close();
-    expect(await listed(GHOST)).toContain("has a subject, but no identity in Okta: cannot sign in");
+    expect(await listed(GHOST)).toContain("has a subject, but no identity in Okta: signs in as a shared persona, or not at all");
     const gone = new Database(app.databases.governance);
     gone.run("DELETE FROM subjects WHERE user_id = ?", [GHOST]);
     gone.close();

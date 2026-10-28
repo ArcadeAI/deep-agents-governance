@@ -270,8 +270,8 @@ describe("a fresh database", () => {
       try {
         expect(counts(db)).toMatchObject({
           subjects: 0,
-          // The six LoanDesk tools, and Gmail.SendEmail.
-          catalogue: 7,
+          // The six LoanDesk tools, three Gmail tools and Slack.SendMessage.
+          catalogue: 10,
           // One access rule, one approve rule, four decide guards.
           policy_rules: 6,
           // Act 3 and act 4.

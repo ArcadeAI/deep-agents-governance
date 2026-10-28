@@ -2,8 +2,8 @@
  * The root `README.md` is what a new user reads first. Its outline is the one
  * Mastra's template guide set for the template it was built from (#10), kept
  * because it reads well, with Credits in place of About Mastra templates. These are the mechanical halves of its
- * acceptance criteria: Mastra's outline in order, the Demo placeholder word for
- * word, every environment variable it names present in `.env.example`, its
+ * acceptance criteria: Mastra's outline in order (the Demo section left with
+ * c69d186: the portal is the demo), every environment variable it names present in `.env.example`, its
  * Prerequisites naming exactly `.env.example`'s Required block, every relative
  * link and anchor resolving, every external link one somebody verified, no em
  * dash, and no ordinary paragraph indented.
@@ -25,13 +25,8 @@ const ENV_EXAMPLE = readFileSync(join(REPO, ".env.example"), "utf8");
 const AGENT_ENV_EXAMPLE = readFileSync(join(REPO, "agent", ".env.example"), "utf8");
 
 /** Mastra's required outline (`.orca/local/human/mastra-contributing-guide.md`), before any contributor section. */
-const REQUIRED_H2 = ["Why we built this", "Demo", "Prerequisites", "Quickstart 🚀", "Try it out", "Customization"];
+const REQUIRED_H2 = ["Why we built this", "Prerequisites", "Quickstart 🚀", "Try it out", "Customization"];
 const LAST_H2 = "Further reading";
-const DEMO_PLACEHOLDER = [
-  "<!-- TODO: REPLACE THIS PLACEHOLDER WITH THE CLOUDINARY DEMO VIDEO URL -->",
-  '<video controls width="640" height="360" src="CLOUDINARY_DEMO_VIDEO_URL_REQUIRED"></video>',
-];
-
 /**
  * Every external URL the README may link to, and where each was verified. A
  * new one fails here until somebody verifies it and adds it: the README never
@@ -226,11 +221,6 @@ describe("README.md follows the template's outline", () => {
     expect(boldTitles(README)).toEqual([]);
   });
 
-  test("Demo carries the guide's placeholder, word for word", () => {
-    const demo = section(README, "Demo");
-    for (const line of DEMO_PLACEHOLDER) expect(demo).toContain(line);
-  });
-
   test("Quickstart is numbered steps with bold labels, from git clone to ask.py", () => {
     const quickstart = section(README, "Quickstart 🚀");
     const steps = quickstart.split("\n").filter((line) => /^\S/.test(line));
@@ -240,7 +230,7 @@ describe("README.md follows the template's outline", () => {
     const clone = /`git clone [^`]+ (\S+)`/.exec(quickstart);
     expect(clone).not.toBeNull();
     expect(quickstart).toContain(`\`cd ${clone![1]}\``);
-    for (const command of ["`bun install`", "`cp .env.example .env`", "`bun run setup-arcade <APP_PUBLIC_HOST>`", "`bun run dev`", "`arcade deploy`", "`uv run mda dev .`", "python ask.py"]) {
+    for (const command of ["`bun install`", "`cp .env.example .env`", "`bun run setup-arcade <APP_PUBLIC_HOST>`", "`bun run dev`", "`arcade deploy`", "`uv run mda dev . --no-browser`", "python ask.py"]) {
       expect(quickstart).toContain(command);
     }
     expect(quickstart).toContain("https://<APP_PUBLIC_HOST>");
