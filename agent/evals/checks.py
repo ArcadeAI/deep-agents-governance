@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
+from collections.abc import Iterable, Mapping
 from typing import Any, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -107,6 +108,27 @@ def approval_recorded(outputs: dict) -> bool:
         if status == "approved" or re.search(r'"status":\s*"approved"', content):
             return True
     return False
+
+
+def unrefused_escalations(results: Iterable[Mapping[str, Any]]) -> list[tuple[str, str | None]]:
+    """Rows that expected a refusal and recorded an approval instead, as (name, loan suffix).
+
+    `results` is what `client.evaluate` returns, row by row: `example` with the row's reference
+    and metadata, `run` with the target's outputs. A row whose reference trajectory asks for
+    `LoanDesk_RequestApproval` expected the hook to refuse. An approval with no refusal means
+    the clearance was above the amount when the row ran, and the loan is decided now.
+    """
+    found: list[tuple[str, str | None]] = []
+    for row in results:
+        example, run = row["example"], row["run"]
+        reference = getattr(example, "outputs", None) or {}
+        outputs = getattr(run, "outputs", None) or {}
+        if REQUEST not in (reference.get("trajectory") or []) or "tool_results" not in outputs:
+            continue
+        if not refusals(outputs) and approval_recorded(outputs):
+            metadata = getattr(example, "metadata", None) or {}
+            found.append((str(metadata.get("name", "?")), metadata.get("loan")))
+    return found
 
 
 class OutcomeGrade(TypedDict):

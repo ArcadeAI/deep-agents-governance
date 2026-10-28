@@ -24,15 +24,18 @@ In `agent`:
     $ uv sync --group evals
     $ uv run --group evals --env-file .env jupyter lab evals/04_observe.ipynb
 
-YOU SHOULD SEE: JupyterLab open, and the first cell printing your keys as set and
-`loan-desk-local` as the project.
+YOU SHOULD SEE: JupyterLab open, and the first cell printing your keys as set,
+`loan-desk-local` as the project, and the org your links open in.
 
 **Item 2: Tracing.** Part 1. Every ask this morning is a trace: the question, each tool call
 and its result, the model calls with their cost. The cells pull them back by code: the refusal
 from step 17, which you match by its time to a row in live activity on step 8; the tools each
 run called, in order; and the `LoanDesk_GetLoan` results, redacted before the model saw them.
+The refusal also states your threshold, and the cell reads it off. If Northwind went through
+with no refusal, your threshold is above $95,000: set it to $50,000 on step 8 before item 5.
 
-YOU SHOULD SEE: The refusal in a trace, and the same call as a row in your live activity.
+YOU SHOULD SEE: The refusal in a trace, the same call as a row in your live activity, and the
+threshold the refusal states.
 
 **Item 3: Dataset.** Part 2. Eight requests as you, each with the tool calls a correct run
 makes and a one-sentence rubric: plain requests, three escalations the policy should stop, and
@@ -51,9 +54,10 @@ recorded so it cannot be talked into one. Score one run by hand.
 
 YOU SHOULD SEE: One transcript, and four scores with comments.
 
-**Item 5: Experiment A.** Part 4. On step 8, check your threshold is $50,000. Run the cell:
-every row, every evaluator, saved as an experiment. Two to three minutes. Nothing in the book
-changes.
+**Item 5: Experiment A.** Part 4. On step 8, read your threshold: it must be $50,000. Higher,
+and the escalations are approved instead of refused, which decides those loans for both
+experiments; the cell says so if it happens. Run the cell: every row, every evaluator, saved as
+an experiment. Two to three minutes. Nothing in the book changes.
 
 YOU SHOULD SEE: `clearance-50000-…` on the dataset, every row scored.
 
@@ -104,7 +108,8 @@ YOU SHOULD SEE: The secret listed under Provider Secrets.
 It asks the deployment once more, as you, to find its tracing project. It puts the judge on that
 project as a rule named `loan-desk-honest-outcome`. Then, with your threshold back at $50,000,
 it asks the over-limit request for Meridian and waits for the score, up to three minutes. If your experiments already decided
-Meridian, the agent says so, and the judge scores that report.
+Meridian, the agent says so, and the judge scores that report. If it says your shell's key is
+not the one in `.env`, run the `unset` line from step 18 in this terminal and run it again.
 
 YOU SHOULD SEE: The rule's link, then `honest_outcome` 1 with the judge's comment, and a link
 to the run.
