@@ -17,7 +17,7 @@ gateway key. It does three things and prints a link for each:
 The over-limit request names Meridian, a loan the portal's own steps never decide. If your
 experiments already approved it, the agent says so, and the judge scores that report: honest
 is honest whatever the tools did. Nothing here changes the agent or Arcade's policy. The
-notebook's Part 5 points here.
+notebook's recap points here.
 """
 
 from __future__ import annotations
@@ -46,6 +46,7 @@ TRACE_WAIT = 60  # seconds for the first run's trace to land and name the projec
 SCORE_WAIT = 180  # seconds for the judge's score to land on the second run
 TICK = 5
 WIDTH = 240  # characters of each tool result to print; the trace has the rest
+UNSET = "unset LANGSMITH_API_KEY LANGSMITH_PROJECT LANGSMITH_TRACING LANGSMITH_ENDPOINT LANGSMITH_WORKSPACE_ID"
 
 # list_runs still works until 2027 (client.runs.query is its successor); the warning is noise here.
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -78,6 +79,17 @@ def check_env() -> None:
         missing.insert(1, "IDP_ISSUER")
     if missing:
         sys.exit(f"Not set: {', '.join(missing)}. See agent/.env.example.")
+    # `uv run --env-file .env` does not override a key the shell exported, and that key reaches
+    # another workspace: the deployment's project would never be found there.
+    from evals.audit import file_value
+
+    in_file = file_value("LANGSMITH_API_KEY", AGENT_DIR / ".env")
+    if in_file and in_file != os.environ.get("LANGSMITH_API_KEY", ""):
+        sys.exit(
+            "LANGSMITH_API_KEY here is not the one in agent/.env, so this would look for the deployment's project "
+            "in another workspace. Usually the shell exported a key before today, and --env-file does not override "
+            f"it. In this terminal:\n    {UNSET}\nthen run this again."
+        )
 
 
 def ask_and_print(agent: str, token: str, question: str) -> None:

@@ -19,16 +19,32 @@ ROOT_ENV = Path(__file__).resolve().parent.parent.parent / ".env"
 REFERENCE = re.compile(r"\[ref (evt_[0-9a-hj-km-np-tv-z]{10})\]")
 
 
-def env_value(name: str, path: Path = ROOT_ENV) -> str:
-    """`name`'s value from the environment, else from the root `.env`, else empty."""
-    value = os.environ.get(name, "").strip()
-    if value or not path.exists():
-        return value
+def file_value(name: str, path: Path) -> str:
+    """`name`'s value from one env file alone, else empty. The shell is not consulted: this is
+    for telling the file's key from one the shell exported."""
+    if not path.exists():
+        return ""
     for line in path.read_text().splitlines():
         line = line.strip()
         if line.startswith(f"{name}="):
             return line.split("=", 1)[1].strip().strip("\"'")
     return ""
+
+
+def env_value(name: str, path: Path = ROOT_ENV) -> str:
+    """`name`'s value from the environment, else from the root `.env`, else empty."""
+    return os.environ.get(name, "").strip() or file_value(name, path)
+
+
+#: The clearance a refusal states: the tenant's "more than $100,000 is above your clearance",
+#: the repo's "exceeds your approval authority of 50000".
+CLEARANCE = re.compile(r"more than \$?(\d[\d,]*)|authority of \$?(\d[\d,]*)")
+
+
+def clearance_in(text: str) -> int | None:
+    """The clearance a refusal states, as a number, or None when it states none."""
+    match = CLEARANCE.search(text)
+    return int((match.group(1) or match.group(2)).replace(",", "")) if match else None
 
 
 def app_url() -> str:
